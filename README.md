@@ -120,7 +120,7 @@ ksp_editor_apply_craft(...)
 
 例如，模型可以先调用 `ksp_flight_transfer_plan(destination_body="Duna")`，核对相位角和推进剂余量，再根据用户确认调用节点工具，最后调用 `ksp_flight_maneuver_burn_start`。节点的 Δv 坐标使用 KSP 原生约定：`radial` 为径向外侧正、`normal` 为法向正、`prograde` 为顺行正，单位是 m/s。燃烧控制会根据节点 Δv、实时质量和可用推力估算对称点火时刻，并在游戏帧内对准燃烧向量；它仍然需要实时监控，不会把近似的有限燃烧误报成任务保证。规划器明确忽略了非共面修正、发射/转向损失、大气阻力、真实相位误差和目标星体地形。
 
-`ksp_flight_guidance_start(profile="orbit")` 会先完成上升，在远点等待并抬升近点，或在近点执行降轨修正，直到目标远点/近点容差内；`profile="landing"` 使用相对地表速度进行反向速度控制。两个 profile 仍属于可停止的基础闭环，用户应持续读取遥测，在进入 Duna 转移、捕获、再入和着陆前逐段确认。
+`ksp_flight_guidance_start(profile="orbit")` 会先完成上升，在远点等待并抬升近点，或在近点执行降轨修正，直到目标远点/近点容差内；`profile="landing"` 会先尝试把正近点降到与星体相交，再使用相对地表速度、制动距离和局部重力控制下降。两个 profile 仍属于可停止的基础闭环，用户应持续读取遥测，在进入 Duna 转移、捕获、再入和着陆前逐段确认。
 
 ### 分级和游戏规则检查
 
@@ -131,7 +131,7 @@ ksp_editor_apply_craft(...)
 - `stage 0` 可以作为最终载荷/分离动作，因此允许没有发动机；但 `stage > 0` 如果含有分离器却没有后续发动机，会被拒绝。
 - KSP 原生对舱体、适配器和油箱等被动零件使用 `inverseStage=-1` 是正常状态，不会被误判成非法分级；真正带发动机或分离动作的零件仍必须有有效阶段号。
 
-推荐的两级大型火箭参考结构采用：Mk1 指令舱、上级 Mainsail、下级 Mammoth、两组燃料箱和两个分离器。重新安装 0.2.3 后应先通过 `ksp_editor_validate`、`ksp_editor_analyze` 和 `ksp_realtime_state` 做游戏内烟测；当前工作区的运行实例仍是旧版桥，因此这里不把尚未重新验证的游戏内点火/分离结果写成已实测事实。
+推荐的两级大型火箭参考结构采用：Mk1 指令舱、上级 Mainsail、下级 Mammoth、两组燃料箱和两个分离器。重新安装 0.2.4 后应先通过 `ksp_editor_validate`、`ksp_editor_analyze` 和 `ksp_realtime_state` 做游戏内烟测；当前工作区的运行实例仍是旧版桥，因此这里不把尚未重新验证的游戏内点火/分离结果写成已实测事实。
 
 完整部件格式如下：
 
