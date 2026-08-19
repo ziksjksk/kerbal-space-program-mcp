@@ -130,11 +130,12 @@ class McpProtocolTests(unittest.TestCase):
                 "jsonrpc": "2.0",
                 "id": 5,
                 "method": "tools/call",
-                "params": {"name": "ksp_realtime_state", "arguments": {"since": 4, "limit": 3}},
+                "params": {"name": "ksp_realtime_state", "arguments": {"since": 4, "limit": 3, "wait_ms": 250}},
             },
         )
         self.assertFalse(response["result"]["isError"])
         self.assertEqual(response["result"]["structuredContent"]["kwargs"]["since"], 4)
+        self.assertEqual(response["result"]["structuredContent"]["kwargs"]["wait_ms"], 250)
 
     def test_watch_is_bounded_for_no_visual_clients(self):
         result = self.app.call_tool(
@@ -151,6 +152,7 @@ class McpProtocolTests(unittest.TestCase):
         self.assertTrue(result["triggered"])
         self.assertFalse(result["timed_out"])
         self.assertEqual(result["state"]["event_cursor"], 1)
+        self.assertGreater(result["last_bridge_wait_ms"], 0)
 
     def test_watch_follows_consumer_cursor_when_response_is_truncated(self):
         bridge = BurstBridge()
@@ -184,7 +186,7 @@ class McpProtocolTests(unittest.TestCase):
             self.app,
             {"jsonrpc": "2.0", "id": 12, "method": "initialize", "params": {}},
         )
-        self.assertEqual(response["result"]["serverInfo"]["version"], "0.3.0")
+        self.assertEqual(response["result"]["serverInfo"]["version"], "0.3.1")
 
     def test_live_build_can_be_cancelled(self):
         response = handle_message(

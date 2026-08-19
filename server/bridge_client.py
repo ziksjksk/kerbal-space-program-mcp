@@ -119,14 +119,21 @@ class BridgeClient:
         since: int = 0,
         limit: int = 64,
         include_events: bool = True,
+        wait_ms: int = 0,
     ) -> Any:
-        """Read the cached compact state without serialising the full craft tree."""
+        """Read compact cached state, optionally waiting for a new event.
+
+        ``wait_ms`` is a bounded server-side wait used by event-driven MCP
+        clients.  It avoids a tight client-side poll loop while preserving the
+        same event-cursor semantics as an ordinary telemetry request.
+        """
 
         query = urlencode(
             {
                 "since": max(0, int(since)),
                 "limit": max(1, min(256, int(limit))),
                 "include_events": "true" if include_events else "false",
+                "wait_ms": max(0, min(1000, int(wait_ms))),
             }
         )
         return self._request("GET", f"/api/v1/telemetry?{query}")

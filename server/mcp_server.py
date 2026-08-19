@@ -72,6 +72,7 @@ TOOLS: list[dict[str, Any]] = [
             "since": {"type": "integer", "minimum": 0},
             "limit": {"type": "integer", "minimum": 1, "maximum": 256},
             "include_events": {"type": "boolean"},
+            "wait_ms": {"type": "integer", "minimum": 0, "maximum": 1000},
         },
     ),
     _tool(
@@ -387,6 +388,7 @@ class KspMcpApplication:
                 since=int(args.get("since", 0)),
                 limit=int(args.get("limit", 64)),
                 include_events=bool(args.get("include_events", True)),
+                wait_ms=int(args.get("wait_ms", 0)),
             )
         if name == "ksp_wait_for_event":
             since = max(0, int(args.get("since", 0)))
@@ -397,8 +399,22 @@ class KspMcpApplication:
             deadline = time.monotonic() + timeout
             latest: Any = None
             triggered = False
+            last_wait_ms = 0
             while True:
-                latest = self.bridge.telemetry(since=since, limit=limit, include_events=include_events)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                # The bridge waits on its event condition, so a normal event
+                # arrival returns immediately while a quiet game costs one
+                # bounded request instead of a tight polling loop.
+                wait_ms = max(1, min(1000, int(remaining * 1000)))
+                last_wait_ms = wait_ms
+                latest = self.bridge.telemetry(
+                    since=since,
+                    limit=limit,
+                    include_events=include_events,
+                    wait_ms=wait_ms,
+                )
                 if isinstance(latest, dict):
                     cursor = latest.get("event_cursor")
                     lost = latest.get("events_lost", 0)
@@ -408,14 +424,14 @@ class KspMcpApplication:
                     if isinstance(lost, (int, float)) and int(lost) > 0:
                         triggered = True
                         break
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    break
-                time.sleep(min(poll_interval, remaining))
+                # Keep compatibility with bridges that do not implement the
+                # optional wait_ms query parameter and return immediately.
+                time.sleep(min(poll_interval, max(0.0, deadline - time.monotonic())))
             return {
                 "since": since,
                 "timeout_seconds": timeout,
                 "poll_interval_seconds": poll_interval,
+                "last_bridge_wait_ms": last_wait_ms,
                 "triggered": triggered,
                 "timed_out": not triggered,
                 "state": latest,
@@ -633,7 +649,7 @@ def handle_message(app: KspMcpApplication, message: dict[str, Any]) -> dict[str,
             {
                 "protocolVersion": str(params.get("protocolVersion", "2024-11-05")),
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "kerbal-space-program", "version": "0.3.0"},
+                "serverInfo": {"name": "kerbal-space-program", "version": "0.3.1"},
                 "instructions": (
                     "Use ksp_realtime_state for compact no-visual state. Build in VAB/SPH with "
                     "ksp_editor_new and live ksp_editor_apply_craft, then poll "

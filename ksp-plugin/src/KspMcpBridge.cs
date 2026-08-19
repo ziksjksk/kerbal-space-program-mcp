@@ -390,7 +390,7 @@ namespace KspMcp
             return new Dictionary<string, object>
             {
                 { "bridge", "ksp-mcp" },
-                { "bridge_version", "0.3.0" },
+                { "bridge_version", "0.3.1" },
                 { "scene", SceneName() },
                 { "endpoint", "http://" + _host + ":" + _port },
                 { "verbose_logging", _verboseLogging },
@@ -410,7 +410,12 @@ namespace KspMcp
         private Dictionary<string, object> Telemetry(Dictionary<string, object> args)
         {
             UpdateTelemetryCache(false);
-            return TelemetryFromCache(args);
+            // Command-dispatched telemetry runs on Unity's main thread. Do
+            // not let an optional HTTP long-poll wait stall that thread; the
+            // GET endpoint below is the event-waiting path.
+            var snapshotArgs = new Dictionary<string, object>(args ?? new Dictionary<string, object>());
+            snapshotArgs.Remove("wait_ms");
+            return TelemetryFromCache(snapshotArgs);
         }
 
         private Dictionary<string, object> TelemetryFromCache(Dictionary<string, object> args)
@@ -424,6 +429,15 @@ namespace KspMcp
                 long since = (long)Math.Max(0d, JsonUtil.Number(args, "since", 0d));
                 int limit = Math.Max(1, Math.Min(256, JsonUtil.Integer(args, "limit", 64)));
                 bool includeEvents = JsonUtil.Boolean(args, "include_events", true);
+                int waitMs = Math.Max(0, Math.Min(1000, JsonUtil.Integer(args, "wait_ms", 0)));
+                if (waitMs > 0 && since >= _eventSequence)
+                {
+                    // The listener thread may wait without touching Unity.
+                    // RecordEvent pulses this condition as soon as a build or
+                    // flight event is produced; a timeout simply returns the
+                    // latest compact cache.
+                    try { Monitor.Wait(_telemetryLock, waitMs); } catch (SynchronizationLockException) { }
+                }
                 var result = new Dictionary<string, object>();
                 foreach (KeyValuePair<string, object> item in cache) result[item.Key] = item.Value;
                 result["event_cursor"] = _eventSequence;
@@ -489,6 +503,7 @@ namespace KspMcp
                     { "data", data }
                 });
                 if (_events.Count > MaxTelemetryEvents) _events.RemoveAt(0);
+                Monitor.PulseAll(_telemetryLock);
             }
         }
 
@@ -501,7 +516,7 @@ namespace KspMcp
             Dictionary<string, object> nextCache = new Dictionary<string, object>
             {
                 { "sequence", _telemetrySequence },
-                { "bridge_version", "0.3.0" },
+                { "bridge_version", "0.3.1" },
                 { "captured_at", SafeUniversalTime() },
                 { "scene", SceneName() },
                 { "editor", _craft.CompactStatus() },
@@ -527,6 +542,8 @@ namespace KspMcp
             if (int.TryParse(query["limit"], out limit)) result["limit"] = limit;
             bool includeEvents;
             if (bool.TryParse(query["include_events"], out includeEvents)) result["include_events"] = includeEvents;
+            int waitMs;
+            if (int.TryParse(query["wait_ms"], out waitMs)) result["wait_ms"] = waitMs;
             return result;
         }
 

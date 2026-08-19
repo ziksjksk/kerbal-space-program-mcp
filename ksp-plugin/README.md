@@ -50,7 +50,7 @@ GET http://127.0.0.1:8765/api/v1/telemetry?since=0&limit=256&include_events=true
 
 遥测响应包含 `sequence`、`bridge_version`、`event_cursor`、`oldest_event_cursor`、`events_lost`、`events_returned`、`events_truncated`、`next_since`、场景、编辑器任务、紧凑飞行状态和增量 `events`。`event_cursor` 是生产者最新游标；如果 `events_truncated=true`，客户端应使用 `next_since` 而不是直接跳到 `event_cursor`，这样高速分帧建造时不会跳过中间零件；如果 `events_lost` 或 `resync_required` 大于零，则历史已经超出缓冲窗口，应以当前摘要和返回的 `next_since` 重新同步。
 
-如果客户端不需要固定时长采样，可以在 MCP 层使用 `ksp_wait_for_event`：它以短间隔读取同一个紧凑遥测接口，检测到 `event_cursor` 推进后立即返回，不会在 Unity 主线程中等待；`poll_interval` 可降到 20 ms。这样无视觉模型可以按“发出命令 -> 等待事件 -> 读取摘要 -> 再决定下一步”的节奏控制建造、点火和分级。
+如果客户端不需要固定时长采样，可以在 MCP 层使用 `ksp_wait_for_event`：它把 `wait_ms` 交给桥的后台监听线程，检测到 `event_cursor` 推进后立即返回，不会在 Unity 主线程中等待，也不会让客户端以固定间隔重复发请求；`poll_interval` 仍保留为旧桥的兼容性退避参数。`ksp_realtime_state` 也支持可选的 `wait_ms`（0–1000）。这样无视觉模型可以按“发出命令 -> 等待事件 -> 读取摘要 -> 再决定下一步”的节奏控制建造、点火和分级。
 
 多个安全命令可以通过一个请求批量提交：
 
