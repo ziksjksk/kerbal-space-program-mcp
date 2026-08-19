@@ -40,6 +40,8 @@ X-KSP-MCP-Token: <可选>
 
 HTTP 接收线程不会直接调用 Unity/KSP API；它把请求放进队列，主线程每帧最多处理 `maxRequestsPerFrame` 个请求。普通状态会缓存为约 10 Hz 的紧凑遥测，避免高频客户端反复遍历完整部件树。
 
+编辑器紧凑遥测只读取部件数和异步任务状态，不会在每次高频轮询时遍历完整部件映射或连接关系。默认关闭逐零件调试日志；需要排障时可以把 PluginData/config.cfg 中的 verboseLogging 临时设为 true，正常使用应保持 false。
+
 ### 低延迟和实时状态
 
 ```http
@@ -73,6 +75,8 @@ GET http://127.0.0.1:8765/api/v1/telemetry?since=0&limit=64&include_events=true
 ```
 
 这样 KSP 可以持续渲染，MCP 客户端也能在不读取屏幕的情况下知道已经生成了多少部件。`live=false` 仍保留旧的同步建造路径。
+
+实时任务可以通过 editor.cancel_job 停止，已经生成的部件会保留，便于无视觉客户端先检查当前结构再决定清空或继续。flight.maneuver_burn_start 是节点执行层：它根据原生节点的 Δv、实时质量和估算可用推力计算有限燃烧窗口，在 OnFlyByWire 中依次执行对准、点火和燃烧阶段；调用方应继续读取 telemetry，完成后使用 flight.guidance_stop 释放控制。
 
 ### 游戏帧内指导器
 

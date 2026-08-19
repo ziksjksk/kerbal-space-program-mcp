@@ -83,9 +83,11 @@ class McpProtocolTests(unittest.TestCase):
         self.assertIn("ksp_flight_set_controls", names)
         self.assertIn("ksp_realtime_state", names)
         self.assertIn("ksp_editor_job_status", names)
+        self.assertIn("ksp_editor_cancel_job", names)
         self.assertIn("ksp_flight_guidance_start", names)
         self.assertIn("ksp_flight_transfer_plan", names)
         self.assertIn("ksp_flight_maneuver_nodes", names)
+        self.assertIn("ksp_flight_maneuver_burn_start", names)
 
     def test_realtime_state_routes_to_compact_bridge(self):
         response = handle_message(
@@ -115,6 +117,19 @@ class McpProtocolTests(unittest.TestCase):
         )
         self.assertFalse(response["result"]["isError"])
         self.assertTrue(response["result"]["structuredContent"]["args"]["live"])
+
+    def test_live_build_can_be_cancelled(self):
+        response = handle_message(
+            self.app,
+            {
+                "jsonrpc": "2.0",
+                "id": 11,
+                "method": "tools/call",
+                "params": {"name": "ksp_editor_cancel_job", "arguments": {"job_id": "build-1"}},
+            },
+        )
+        self.assertFalse(response["result"]["isError"])
+        self.assertEqual(response["result"]["structuredContent"]["command"], "editor.cancel_job")
 
     def test_batch_rejects_irreversible_commands(self):
         response = handle_message(
@@ -196,6 +211,22 @@ class McpProtocolTests(unittest.TestCase):
                 "params": {
                     "name": "ksp_flight_add_maneuver_node",
                     "arguments": {"prograde": 100.0, "confirm": False},
+                },
+            },
+        )
+        self.assertTrue(response["result"]["isError"])
+        self.assertIn("confirm=true", response["result"]["content"][0]["text"])
+
+    def test_maneuver_burn_needs_confirmation(self):
+        response = handle_message(
+            self.app,
+            {
+                "jsonrpc": "2.0",
+                "id": 10,
+                "method": "tools/call",
+                "params": {
+                    "name": "ksp_flight_maneuver_burn_start",
+                    "arguments": {"node_index": 0, "confirm": False},
                 },
             },
         )

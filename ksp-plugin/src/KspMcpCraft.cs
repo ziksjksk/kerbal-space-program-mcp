@@ -27,6 +27,7 @@ namespace KspMcp
         private int _expectedLoadPartCount;
         private int _jobCounter;
         private BuildJob _buildJob;
+        private bool _deferStageRestoration;
 
         private sealed class BuildJob
         {
@@ -89,7 +90,15 @@ namespace KspMcp
                         Dictionary<string, object> part = _buildJob.Pending[index];
                         string parentId = JsonUtil.String(part, "parent_id", null);
                         if (!string.IsNullOrEmpty(parentId) && !_partsById.ContainsKey(parentId)) continue;
-                        AddPartInternal(part);
+                        _deferStageRestoration = true;
+                        try
+                        {
+                            AddPartInternal(part);
+                        }
+                        finally
+                        {
+                            _deferStageRestoration = false;
+                        }
                         _buildJob.Pending.RemoveAt(index);
                         _buildJob.Completed++;
                         progress = true;
@@ -117,6 +126,8 @@ namespace KspMcp
 
                 if (_buildJob.Pending.Count == 0)
                 {
+                    RestoreRequestedStages();
+                    FireEditorModified();
                     _buildJob.State = "completed";
                     _buildJob.Completed = _buildJob.Total;
                 }
@@ -156,6 +167,32 @@ namespace KspMcp
                 { "editor_mode", _editorMode },
                 { "part_count", EditorLogic.fetch.ship.parts.Count },
                 { "connected", SafeAreAllPartsConnected() },
+                { "build_job", JobStatus(null) }
+            };
+        }
+
+        /// <summary>
+        /// Cheap editor summary for high-rate telemetry. Status() is kept
+        /// detailed for explicit inspection, but it synchronises every part
+        /// map and checks connectivity; doing that ten times per second made
+        /// live construction needlessly expensive.
+        /// </summary>
+        public Dictionary<string, object> CompactStatus()
+        {
+            if (!IsEditorAvailable)
+            {
+                return new Dictionary<string, object>
+                {
+                    { "available", false },
+                    { "build_job", JobStatus(null) }
+                };
+            }
+            return new Dictionary<string, object>
+            {
+                { "available", true },
+                { "name", _craftName },
+                { "editor_mode", _editorMode },
+                { "part_count", EditorLogic.fetch.ship.parts == null ? 0 : EditorLogic.fetch.ship.parts.Count },
                 { "build_job", JobStatus(null) }
             };
         }
@@ -253,8 +290,9 @@ namespace KspMcp
             _craftDescription = JsonUtil.String(args, "description", "");
             _editorMode = NormaliseMode(JsonUtil.String(args, "editor_mode", "VAB"));
             SetShipMetadata();
+            FireEditorModified();
 
-            int partsPerFrame = Math.Max(1, Math.Min(16, JsonUtil.Integer(args, "parts_per_frame", 2)));
+            int partsPerFrame = Math.Max(1, Math.Min(16, JsonUtil.Integer(args, "parts_per_frame", 4)));
             _jobCounter++;
             _buildJob = new BuildJob
             {
@@ -306,6 +344,30 @@ namespace KspMcp
                 { "parts_per_frame", _buildJob.PartsPerFrame },
                 { "error", _buildJob.Error }
             };
+        }
+
+        public Dictionary<string, object> CancelJob(Dictionary<string, object> args)
+        {
+            if (_buildJob == null) return new Dictionary<string, object> { { "cancelled", false }, { "state", "idle" } };
+            string requested = JsonUtil.String(args, "job_id", null);
+            if (!string.IsNullOrEmpty(requested) && !string.Equals(requested, _buildJob.Id, StringComparison.Ordinal))
+            {
+                throw new KspMcpException("job_not_found", "editor job not found: " + requested, null);
+            }
+            bool active = _buildJob.State == "queued" || _buildJob.State == "running";
+            if (active)
+            {
+                _buildJob.Pending.Clear();
+                _buildJob.State = "cancelled";
+                KspMcpBridge bridge = KspMcpBridge.Instance;
+                if (bridge != null) bridge.RecordEvent("editor.build.cancelled", new Dictionary<string, object>
+                {
+                    { "job_id", _buildJob.Id },
+                    { "completed", _buildJob.Completed },
+                    { "total", _buildJob.Total }
+                });
+            }
+            return new Dictionary<string, object> { { "cancelled", active }, { "job", JobStatus(null) } };
         }
 
         public Dictionary<string, object> AddPart(Dictionary<string, object> args)
@@ -431,7 +493,7 @@ namespace KspMcp
             }
 
             SetStageInternal(instance, requestedStage);
-            RestoreRequestedStages();
+            if (!_deferStageRestoration) RestoreRequestedStages();
             KspMcpBridge.Log("add stage done id=" + id);
             ApplyActionGroups(instance, args);
             return;

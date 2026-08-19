@@ -31,6 +31,11 @@ namespace KspMcp
             public double LastPitch;
             public double LastYaw;
             public double LastTargetPitchDegrees;
+            public int BurnNodeIndex;
+            public double BurnUt;
+            public double BurnDuration;
+            public double BurnThrottle;
+            public double BurnDeltaV;
         }
 
         private sealed class ControlLease
@@ -197,7 +202,7 @@ namespace KspMcp
                 throw new KspMcpException("invalid_guidance_profile", "supported profiles are ascent, orbit, and landing", profile);
             }
             double now = Planetarium.GetUniversalTime();
-            double maxSeconds = Math.Max(5d, Math.Min(3600d, JsonUtil.Number(args, "max_seconds", profile == "landing" ? 600d : 240d)));
+            double maxSeconds = Math.Max(5d, Math.Min(3600d, JsonUtil.Number(args, "max_seconds", profile == "landing" || profile == "node_burn" ? 600d : 240d)));
             _guidance = new GuidancePlan
             {
                 Profile = profile,
@@ -210,6 +215,7 @@ namespace KspMcp
                 Phase = "initialising",
                 LastError = null
             };
+            if (profile == "node_burn") ConfigureNodeBurn(args, now);
             _lease.Clear();
             _leaseUntil = 0d;
             _sasEnabled = false;
@@ -245,6 +251,11 @@ namespace KspMcp
                 { "last_pitch", _guidance.LastPitch },
                 { "last_yaw", _guidance.LastYaw },
                 { "target_pitch_degrees", _guidance.LastTargetPitchDegrees },
+                { "burn_node_index", _guidance.BurnNodeIndex },
+                { "burn_ut", _guidance.BurnUt },
+                { "burn_duration", _guidance.BurnDuration },
+                { "burn_throttle", _guidance.BurnThrottle },
+                { "burn_delta_v", _guidance.BurnDeltaV },
                 { "last_error", _guidance.LastError }
             };
         }
@@ -256,6 +267,10 @@ namespace KspMcp
             if (_guidance.Profile == "landing")
             {
                 ApplyLandingGuidance(state, vessel);
+            }
+            else if (_guidance.Profile == "node_burn")
+            {
+                ApplyNodeBurnGuidance(state, vessel);
             }
             else if (_guidance.Profile == "orbit")
             {
@@ -295,6 +310,140 @@ namespace KspMcp
             else _guidance.Phase = "orbital_ascent";
 
             ApplyDirectionControl(state, vessel, target, throttle, targetPitch);
+        }
+
+        private void ConfigureNodeBurn(Dictionary<string, object> args, double now)
+        {
+            Vessel vessel = FlightGlobals.ActiveVessel;
+            ManeuverNode node = FindManeuverNode(vessel, Math.Max(0, JsonUtil.Integer(args, "node_index", 0)));
+            if (node == null) throw new KspMcpException("maneuver_not_found", "requested maneuver node does not exist", null);
+            double deltaV = node.DeltaV.magnitude;
+            if (deltaV < 0.01d) throw new KspMcpException("maneuver_empty", "requested maneuver node has near-zero delta-v", null);
+            double throttle = ClampDouble(JsonUtil.Number(args, "throttle", 1d), 0.1d, 1d);
+            double thrust = NumberMember(vessel, "availableThrust");
+            if (thrust <= 0d) thrust = EstimateActiveThrust(vessel);
+            double mass = vessel.GetTotalMass();
+            if (thrust <= 0d || mass <= 0d)
+            {
+                throw new KspMcpException("burn_engine_unavailable", "cannot estimate a burn without an active engine and positive vessel mass", null);
+            }
+            double acceleration = thrust / mass;
+            double duration = Math.Max(0.5d, Math.Min(600d, deltaV / Math.Max(0.01d, acceleration * throttle) * 1.15d));
+            if (node.UT < now - duration * 0.5d)
+            {
+                throw new KspMcpException("maneuver_in_past", "requested maneuver node is already too far in the past", new Dictionary<string, object> { { "ut", node.UT }, { "now", now } });
+            }
+            _guidance.BurnNodeIndex = Math.Max(0, JsonUtil.Integer(args, "node_index", 0));
+            _guidance.BurnUt = node.UT;
+            _guidance.BurnDuration = duration;
+            _guidance.BurnThrottle = throttle;
+            _guidance.BurnDeltaV = deltaV;
+            _guidance.AutoStage = false;
+            _guidance.Phase = "coast_to_node_burn";
+            KspMcpBridge bridge = KspMcpBridge.Instance;
+            if (bridge != null)
+            {
+                bridge.RecordEvent("flight.maneuver_burn.started", new Dictionary<string, object>
+                {
+                    { "node_index", _guidance.BurnNodeIndex },
+                    { "ut", _guidance.BurnUt },
+                    { "delta_v", _guidance.BurnDeltaV },
+                    { "duration", _guidance.BurnDuration }
+                });
+            }
+        }
+
+        private void ApplyNodeBurnGuidance(FlightCtrlState state, Vessel vessel)
+        {
+            ManeuverNode node = FindManeuverNode(vessel, _guidance.BurnNodeIndex);
+            if (node == null)
+            {
+                _guidance.LastError = "maneuver node disappeared before burn completion";
+                _guidance.Phase = "node_missing";
+                ApplyDirectionControl(state, vessel, vessel.obt_velocity, 0d, 0d);
+                return;
+            }
+            Vector3d burnVector = vessel.orbit == null ? node.DeltaV : node.GetBurnVector(vessel.orbit);
+            if (burnVector.sqrMagnitude < 0.0001d)
+            {
+                _guidance.LastError = "maneuver burn vector is empty";
+                _guidance.Phase = "node_empty";
+                ApplyDirectionControl(state, vessel, vessel.obt_velocity, 0d, 0d);
+                return;
+            }
+            double now = Planetarium.GetUniversalTime();
+            double start = _guidance.BurnUt - _guidance.BurnDuration * 0.5d;
+            double end = _guidance.BurnUt + _guidance.BurnDuration * 0.5d;
+            double throttle = 0d;
+            if (now < start)
+            {
+                _guidance.Phase = "aligning_for_node_burn";
+            }
+            else if (now <= end)
+            {
+                throttle = _guidance.BurnThrottle;
+                _guidance.Phase = "burning_node";
+            }
+            else
+            {
+                _guidance.Phase = "burn_complete";
+            }
+            ApplyDirectionControl(state, vessel, burnVector, throttle, 0d);
+        }
+
+        private static ManeuverNode FindManeuverNode(Vessel vessel, int index)
+        {
+            if (vessel == null || vessel.patchedConicSolver == null || vessel.patchedConicSolver.maneuverNodes == null) return null;
+            if (index < 0 || index >= vessel.patchedConicSolver.maneuverNodes.Count) return null;
+            return vessel.patchedConicSolver.maneuverNodes[index];
+        }
+
+        private static double EstimateActiveThrust(Vessel vessel)
+        {
+            if (vessel == null || vessel.parts == null) return 0d;
+            double total = SumStageThrust(vessel, vessel.currentStage);
+            if (total > 0d) return total;
+
+            // Some editor-created vessels expose a stale currentStage value
+            // immediately after launch. Fall back to the highest operational
+            // engine stage instead of reporting that a perfectly good burn
+            // has no engine.
+            int fallbackStage = -1;
+            foreach (Part part in vessel.parts)
+            {
+                if (part == null || part.Modules == null) continue;
+                foreach (PartModule module in part.Modules)
+                {
+                    if (module == null || module.GetType().Name.IndexOf("ModuleEngines", StringComparison.OrdinalIgnoreCase) < 0) continue;
+                    if (!BoolMember(module, "isOperational") && !BoolMember(module, "moduleIsEnabled")) continue;
+                    fallbackStage = Math.Max(fallbackStage, part.inverseStage);
+                }
+            }
+            return fallbackStage < 0 ? 0d : SumStageThrust(vessel, fallbackStage);
+        }
+
+        private static double SumStageThrust(Vessel vessel, int stage)
+        {
+            double total = 0d;
+            if (vessel == null || vessel.parts == null) return total;
+            foreach (Part part in vessel.parts)
+            {
+                if (part == null || part.inverseStage != stage || part.Modules == null) continue;
+                foreach (PartModule module in part.Modules)
+                {
+                    if (module == null || module.GetType().Name.IndexOf("ModuleEngines", StringComparison.OrdinalIgnoreCase) < 0) continue;
+                    if (!BoolMember(module, "isOperational") && !BoolMember(module, "moduleIsEnabled")) continue;
+                    total += Math.Max(0d, NumberMember(module, "maxThrust"));
+                }
+            }
+            return total;
+        }
+
+        public Dictionary<string, object> StartManeuverBurn(Dictionary<string, object> args)
+        {
+            var copy = new Dictionary<string, object>(args ?? new Dictionary<string, object>());
+            copy["profile"] = "node_burn";
+            return StartGuidance(copy);
         }
 
         private void ApplyOrbitGuidance(FlightCtrlState state, Vessel vessel)
@@ -415,22 +564,47 @@ namespace KspMcp
         private void TryAutomaticStage(Vessel vessel)
         {
             if (_guidance == null || vessel == null || vessel.currentStage <= 0) return;
-            if (vessel.missionTime < 5d && vessel.srfSpeed < 20d) return;
+            if (string.Equals(vessel.situation.ToString(), "PRELAUNCH", StringComparison.OrdinalIgnoreCase)) return;
             _lastGuidanceStageAt = Planetarium.GetUniversalTime();
             bool hasEngine = false;
             bool liveEngine = false;
+            bool ignitedEngine = false;
+            bool enabledEngine = false;
             foreach (Part part in vessel.parts)
             {
-                if (part == null || part.inverseStage != vessel.currentStage || part.Modules == null) continue;
+                if (part == null || part.Modules == null) continue;
                 foreach (PartModule module in part.Modules)
                 {
                     if (module == null || module.GetType().Name.IndexOf("ModuleEngines", StringComparison.OrdinalIgnoreCase) < 0) continue;
-                    hasEngine = true;
                     bool flameout = BoolMember(module, "flameout");
                     bool operational = BoolMember(module, "isOperational");
                     bool ignited = BoolMember(module, "engineIgnited");
+                    bool enabled = BoolMember(module, "moduleIsEnabled") || BoolMember(module, "isEnabled");
+                    if (part.inverseStage != vessel.currentStage)
+                    {
+                        if (ignited) ignitedEngine = true;
+                        if (enabled && !flameout) enabledEngine = true;
+                        continue;
+                    }
+                    hasEngine = true;
+                    if (ignited) ignitedEngine = true;
+                    if (enabled && !flameout) enabledEngine = true;
                     if (!flameout && (operational || ignited)) liveEngine = true;
                 }
+            }
+            // Do not gate ignition on speed.  A correctly staged vessel can
+            // still be at (or very near) zero surface speed immediately
+            // after launch, and waiting for motion here would leave the
+            // engines disabled forever.
+            if (!ignitedEngine && enabledEngine && _guidance.LastThrottle > 0.05d)
+            {
+                if (ActivateNextStageRaw())
+                {
+                    if (_guidance != null) _guidance.Phase = "automatic_ignition";
+                    KspMcpBridge bridge = KspMcpBridge.Instance;
+                    if (bridge != null) bridge.RecordEvent("flight.ignition.automatic", new Dictionary<string, object> { { "stage", vessel.currentStage } });
+                }
+                return;
             }
             if (hasEngine && liveEngine) return;
             try
@@ -443,6 +617,22 @@ namespace KspMcp
             catch (Exception exception)
             {
                 if (_guidance != null) _guidance.LastError = exception.Message;
+            }
+        }
+
+        private static bool ActivateNextStageRaw()
+        {
+            MethodInfo method = typeof(KSP.UI.Screens.StageManager).GetMethod("ActivateNextStage", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static);
+            if (method == null) return false;
+            try
+            {
+                method.Invoke(null, null);
+                return true;
+            }
+            catch (Exception exception)
+            {
+                KspMcpBridge.Log("automatic ignition failed: " + exception.Message);
+                return false;
             }
         }
 

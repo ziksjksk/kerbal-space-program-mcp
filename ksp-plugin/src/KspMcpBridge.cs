@@ -25,6 +25,7 @@ namespace KspMcp
         private int _port = 8765;
         private string _token = "";
         private int _maxRequestsPerFrame = 8;
+        private bool _verboseLogging;
         private bool _stopping;
         private float _lastTelemetryAt = -1f;
         private long _telemetrySequence;
@@ -55,7 +56,7 @@ namespace KspMcp
             _flight = new KspMcpFlight(_craft);
             _flight.Start();
             StartHttpServer();
-            UpdateTelemetryCache(true);
+            UpdateTelemetryCache(false);
             Log("started; endpoint http://" + _host + ":" + _port + "/api/v1");
         }
 
@@ -90,7 +91,7 @@ namespace KspMcp
                 }
                 WriteResponse(request.Context, envelope, 200);
             }
-            UpdateTelemetryCache(true);
+            UpdateTelemetryCache(false);
         }
 
         private PendingRequest DequeueRequest()
@@ -117,6 +118,8 @@ namespace KspMcp
                 if (int.TryParse(node.GetValue("port"), out port) && port > 0 && port < 65536) _port = port;
                 string token = node.GetValue("token");
                 if (token != null) _token = token.Trim();
+                bool verboseLogging;
+                if (bool.TryParse(node.GetValue("verboseLogging"), out verboseLogging)) _verboseLogging = verboseLogging;
                 int maxRequests;
                 if (int.TryParse(node.GetValue("maxRequestsPerFrame"), out maxRequests) && maxRequests > 0)
                 {
@@ -294,11 +297,13 @@ namespace KspMcp
                 case "editor.clear": return _craft.Clear();
                 case "editor.launch": return _craft.Launch(args);
                 case "editor.job_status": return _craft.JobStatus(args);
+                case "editor.cancel_job": return _craft.CancelJob(args);
                 case "flight.state": return _flight.Snapshot();
                 case "flight.bodies": return _flight.Bodies(args);
                 case "flight.maneuver_nodes": return _flight.ManeuverNodes();
                 case "flight.add_maneuver_node": return _flight.AddManeuverNode(args);
                 case "flight.clear_maneuver_nodes": return _flight.ClearManeuverNodes(args);
+                case "flight.maneuver_burn_start": return _flight.StartManeuverBurn(args);
                 case "flight.guidance_start": return _flight.StartGuidance(args);
                 case "flight.guidance_stop": return _flight.StopGuidance();
                 case "flight.guidance_status": return _flight.GuidanceStatus();
@@ -327,7 +332,7 @@ namespace KspMcp
                 Dictionary<string, object> item = JsonUtil.Object(raw);
                 if (item == null) throw new KspMcpException("invalid_batch", "each batch item must be an object", null);
                 string command = JsonUtil.RequiredString(item, "command");
-                if (command == "batch" || command == "editor.launch" || command == "flight.abort" || command == "flight.recover")
+                if (command == "batch" || command == "editor.launch" || command == "flight.abort" || command == "flight.recover" || command == "flight.maneuver_burn_start")
                 {
                     throw new KspMcpException("unsafe_batch_command", command + " must use its dedicated command", null);
                 }
@@ -359,15 +364,16 @@ namespace KspMcp
             return new Dictionary<string, object>
             {
                 { "bridge", "ksp-mcp" },
-                { "bridge_version", "0.2.1" },
+                { "bridge_version", "0.2.2" },
                 { "scene", SceneName() },
                 { "endpoint", "http://" + _host + ":" + _port },
+                { "verbose_logging", _verboseLogging },
                 { "editor", _craft.Status() },
                 { "flight", _flight.Snapshot() },
                 { "capabilities", new Dictionary<string, object>
                     {
-                        { "editor", new List<object> { "new", "snapshot", "apply", "add", "attach", "update", "remove", "stage", "action_group", "validate", "analyze", "save", "load", "launch", "job_status" } },
-                        { "flight", new List<object> { "state", "compact_telemetry", "bodies", "maneuver_nodes", "add_maneuver_node", "clear_maneuver_nodes", "guidance_start", "guidance_stop", "guidance_status", "stage", "controls", "sas", "rcs", "warp", "activate_part", "abort", "recover" } },
+                        { "editor", new List<object> { "new", "snapshot", "apply", "add", "attach", "update", "remove", "stage", "action_group", "validate", "analyze", "save", "load", "launch", "job_status", "cancel_job" } },
+                        { "flight", new List<object> { "state", "compact_telemetry", "bodies", "maneuver_nodes", "add_maneuver_node", "clear_maneuver_nodes", "maneuver_burn_start", "guidance_start", "guidance_stop", "guidance_status", "stage", "controls", "sas", "rcs", "warp", "activate_part", "abort", "recover" } },
                         { "bridge", new List<object> { "telemetry", "batch" } }
                     }
                 }
@@ -376,7 +382,7 @@ namespace KspMcp
 
         private Dictionary<string, object> Telemetry(Dictionary<string, object> args)
         {
-            UpdateTelemetryCache(true);
+            UpdateTelemetryCache(false);
             Dictionary<string, object> cache = _telemetryCache ?? new Dictionary<string, object>();
             long since = (long)Math.Max(0d, JsonUtil.Number(args, "since", 0d));
             int limit = Math.Max(1, Math.Min(256, JsonUtil.Integer(args, "limit", 64)));
@@ -426,7 +432,7 @@ namespace KspMcp
                 { "sequence", _telemetrySequence },
                 { "captured_at", SafeUniversalTime() },
                 { "scene", SceneName() },
-                { "editor", _craft.Status() },
+                { "editor", _craft.CompactStatus() },
                 { "flight", _flight.CompactSnapshot() }
             };
         }
@@ -503,6 +509,7 @@ namespace KspMcp
 
         internal static void Log(string message)
         {
+            if (Instance == null || !Instance._verboseLogging) return;
             Debug.Log("[KspMcp] " + message);
         }
     }

@@ -137,6 +137,12 @@ TOOLS: list[dict[str, Any]] = [
         ["job_id"],
     ),
     _tool(
+        "ksp_editor_cancel_job",
+        "Stop an active frame-sliced editor build and keep the parts already generated for inspection or cleanup.",
+        {"job_id": {"type": "string"}},
+        ["job_id"],
+    ),
+    _tool(
         "ksp_editor_add_part",
         "Add one real KSP part to the current editor craft, optionally attached to an existing part.",
         {
@@ -267,11 +273,22 @@ TOOLS: list[dict[str, Any]] = [
         "ksp_flight_guidance_start",
         "Start a game-side closed-loop guidance plan. It continuously refreshes controls in KSP frames; confirm=true is required. Profiles are ascent, orbit, and landing.",
         {
-            "profile": {"type": "string", "enum": ["ascent", "orbit", "landing"]},
+            "profile": {"type": "string", "enum": ["ascent", "orbit", "landing", "node_burn"]},
             "target_apoapsis": {"type": "number", "minimum": 1000},
             "target_periapsis": {"type": "number", "minimum": 0},
             "target_altitude": {"type": "number", "minimum": 10},
             "auto_stage": {"type": "boolean"},
+            "max_seconds": {"type": "number", "minimum": 5, "maximum": 3600},
+            "confirm": {"type": "boolean"},
+        },
+        ["confirm"],
+    ),
+    _tool(
+        "ksp_flight_maneuver_burn_start",
+        "Start a confirmed, game-side finite-burn controller for one native KSP maneuver node. It aligns to the node burn vector, estimates burn duration from active thrust and mass, and exposes ignite/burn/complete phases through realtime telemetry.",
+        {
+            "node_index": {"type": "integer", "minimum": 0},
+            "throttle": {"type": "number", "minimum": 0.1, "maximum": 1},
             "max_seconds": {"type": "number", "minimum": 5, "maximum": 3600},
             "confirm": {"type": "boolean"},
         },
@@ -372,7 +389,7 @@ class KspMcpApplication:
             if len(commands) > 32:
                 raise ValueError("ksp_batch accepts at most 32 commands")
             normalised: list[dict[str, Any]] = []
-            forbidden = {"editor.launch", "flight.abort", "flight.recover"}
+            forbidden = {"editor.launch", "flight.abort", "flight.recover", "flight.maneuver_burn_start"}
             for index, item in enumerate(commands):
                 if not isinstance(item, dict) or not isinstance(item.get("command"), str):
                     raise ValueError(f"commands[{index}] requires a command string")
@@ -402,6 +419,8 @@ class KspMcpApplication:
             return self.bridge.call("editor.apply_craft", craft)
         if name == "ksp_editor_job_status":
             return self.bridge.call("editor.job_status", args)
+        if name == "ksp_editor_cancel_job":
+            return self.bridge.call("editor.cancel_job", args)
         if name == "ksp_editor_add_part":
             return self.bridge.call("editor.add_part", normalise_part_spec(args))
         if name == "ksp_editor_attach_part":
@@ -468,6 +487,10 @@ class KspMcpApplication:
             if args.get("confirm") is not True:
                 raise ValueError("ksp_flight_clear_maneuver_nodes requires confirm=true")
             return self.bridge.call("flight.clear_maneuver_nodes", args)
+        if name == "ksp_flight_maneuver_burn_start":
+            if args.get("confirm") is not True:
+                raise ValueError("ksp_flight_maneuver_burn_start requires confirm=true")
+            return self.bridge.call("flight.maneuver_burn_start", args)
         if name == "ksp_flight_guidance_start":
             return self.bridge.call("flight.guidance_start", args)
         if name == "ksp_flight_guidance_stop":
@@ -530,7 +553,7 @@ def handle_message(app: KspMcpApplication, message: dict[str, Any]) -> dict[str,
             {
                 "protocolVersion": str(params.get("protocolVersion", "2024-11-05")),
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "kerbal-space-program", "version": "0.2.1"},
+                "serverInfo": {"name": "kerbal-space-program", "version": "0.2.2"},
                 "instructions": (
                     "Use ksp_realtime_state for compact no-visual state. Build in VAB/SPH with "
                     "ksp_editor_new and live ksp_editor_apply_craft, then poll "

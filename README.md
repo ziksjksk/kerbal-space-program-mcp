@@ -7,7 +7,7 @@
 
 建造链路支持从空白编辑器开始创建火箭，也支持一次性提交完整的部件树；粒度较细的工具可以继续增删零件、移动/旋转、重新连接、设置阶段和动作组。飞行链路支持发射后的状态读取、油门和姿态控制、SAS/RCS、分级、时间加速、单部件动作、紧急中止和回收。
 
-0.2.1 在 0.2.0 的低延迟 HTTP 复用、紧凑遥测和事件游标、单往返批处理、分帧异步建造、真实零件性能分析和游戏帧内指导器之上，加入星体模型、圆共面 Hohmann 转移估算、原生 patched-conic 节点读写，以及更明确的远点/近点圆化流程。它的目标是让没有视觉输入的模型也能通过状态序列完成建造和飞行；画面仍然可以由用户在 KSP 中实时观看，但 MCP 不依赖截图或 Computer Use 才能工作。
+0.2.2 在 0.2.1 的低延迟 HTTP 复用、紧凑遥测和事件游标、单往返批处理、分帧异步建造、真实零件性能分析、星体模型、原生轨道节点和有限燃烧控制之上，进一步减少编辑器遥测和逐零件日志造成的卡顿，并补上自动初级点火事件。无视觉模型可以更快地观察建造进度，而用户仍能在 KSP 中看到部件逐帧出现。
 
 当前目标平台是 KSP 1.12.x（KSP 1.x 的 `Assembly-CSharp.dll` API）。KSP 2 使用另一套 API，不能直接使用这个插件。
 
@@ -32,7 +32,13 @@ releases/               可直接下载的完整安装包
 Copy-Item -Recurse -Force .\ksp-plugin\GameData\KspMcp .\GameData\KspMcp
 ```
 
-如果还没有 DLL，需要先设置 KSP 根目录并编译：
+如果要从发布包安装，可以先正常退出 KSP，然后运行包根目录的安装脚本：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\install.ps1 -KspRoot 'D:\Games\Kerbal Space Program'
+```
+
+脚本会拒绝在 KSP 仍运行时覆盖 DLL，避免游戏继续使用旧版本插件。开发者如果还没有 DLL，需要先设置 KSP 根目录并编译：
 
 ```powershell
 $env:KSP_ROOT = 'D:\Games\Kerbal Space Program'
@@ -73,7 +79,7 @@ python -m server
 1. 调用 `ksp_status` 确认已经进入 VAB/SPH。
 2. 调用 `ksp_parts_list` 查看当前游戏实例实际加载的零件名称和连接节点。
 3. 调用 `ksp_editor_new` 清空编辑器。
-4. 用 `ksp_editor_apply_craft` 提交完整部件树。MCP 默认使用分帧 live 模式，立即返回 `job_id`，不会把几十个零件塞进同一个 Unity 帧。
+4. 用 `ksp_editor_apply_craft` 提交完整部件树。MCP 默认使用分帧 live 模式，立即返回 `job_id`，默认每个 Unity 帧生成 4 个部件；需要更明显的逐件展示时传 `parts_per_frame=1`，需要更快完成时可以提高到 8 或 16。
 5. 用 `ksp_editor_job_status` 和 `ksp_realtime_state` 读取 `completed/total`、事件和当前部件数，直到任务进入 `completed`。
 6. 调用 `ksp_editor_analyze` 读取真实零件质量、推力、TWR、近似 Δv、质心/推力中心和分级风险。
 7. 用 `ksp_editor_validate` 检查控制核心、发动机、连接关系、阶段和成本，再用 `ksp_editor_save` 保存 `.craft` 文件。
@@ -88,6 +94,8 @@ VAB 中插件会把生成的根零件自动放到安全高度（默认 `y=50`）
 `ksp_realtime_state` 返回缓存的紧凑状态，避免每次读取都序列化完整部件树。它包含场景、建造任务、当前飞船、位置/速度、海拔、地形高度、垂直速度、质量、级号、姿态、轨道根数和 MCP 控制租约；`events` 使用单调递增的 `event_cursor`，模型可以把上次游标传入 `since`，只接收增量事件。
 
 `ksp_watch` 会在一个有界时间段内连续采样这些状态，适合无视觉模型观察“部件逐个出现、加载稳定、发射、分级、远点/近点变化和着陆”。`ksp_batch` 把多个安全命令放在一次 HTTP 往返里；发射、Abort 和回收仍必须使用各自的确认工具，不能隐藏在批处理中。
+
+`ksp_realtime_state` 的编辑器摘要是轻量的：它只返回当前部件数、任务进度和事件，不遍历完整部件树；要检查连接节点、模块、资源和详细验证结果时再调用 `ksp_editor_get_craft`、`ksp_editor_validate` 或 `ksp_editor_analyze`。如果需要排查游戏侧问题，可以在 `GameData/KspMcp/PluginData/config.cfg` 中临时设置 `verboseLogging = true`，正常使用应保持 `false`。
 
 示例观察循环：
 
@@ -108,8 +116,9 @@ ksp_editor_apply_craft(...)
 - `ksp_flight_maneuver_nodes` 读取游戏原生节点；
 - `ksp_flight_add_maneuver_node` 在明确 `confirm=true` 后创建节点；
 - `ksp_flight_clear_maneuver_nodes` 在明确 `confirm=true` 后清除节点。
+- `ksp_flight_maneuver_burn_start` 在明确 `confirm=true` 后按原生节点执行一个有限燃烧控制计划，实时报告 `coast_to_node_burn`、`aligning_for_node_burn`、`burning_node` 和 `burn_complete` 阶段。
 
-例如，模型可以先调用 `ksp_flight_transfer_plan(destination_body="Duna")`，核对相位角和推进剂余量，再根据用户确认调用节点工具。节点的 Δv 坐标使用 KSP 原生约定：`radial` 为径向外侧正、`normal` 为法向正、`prograde` 为顺行正，单位是 m/s。规划器不会自动创建节点、点火或承诺到达；它明确忽略了非共面修正、有限燃烧、发射/转向损失、大气阻力、真实相位误差和目标星体地形。
+例如，模型可以先调用 `ksp_flight_transfer_plan(destination_body="Duna")`，核对相位角和推进剂余量，再根据用户确认调用节点工具，最后调用 `ksp_flight_maneuver_burn_start`。节点的 Δv 坐标使用 KSP 原生约定：`radial` 为径向外侧正、`normal` 为法向正、`prograde` 为顺行正，单位是 m/s。燃烧控制会根据节点 Δv、实时质量和可用推力估算对称点火时刻，并在游戏帧内对准燃烧向量；它仍然需要实时监控，不会把近似的有限燃烧误报成任务保证。规划器明确忽略了非共面修正、发射/转向损失、大气阻力、真实相位误差和目标星体地形。
 
 `ksp_flight_guidance_start(profile="orbit")` 会先完成上升，在远点等待并抬升近点，或在近点执行降轨修正，直到目标远点/近点容差内；`profile="landing"` 使用相对地表速度进行反向速度控制。两个 profile 仍属于可停止的基础闭环，用户应持续读取遥测，在进入 Duna 转移、捕获、再入和着陆前逐段确认。
 
