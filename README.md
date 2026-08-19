@@ -7,7 +7,7 @@
 
 建造链路支持从空白编辑器开始创建火箭，也支持一次性提交完整的部件树；粒度较细的工具可以继续增删零件、移动/旋转、重新连接、设置阶段和动作组。飞行链路支持发射后的状态读取、油门和姿态控制、SAS/RCS、分级、时间加速、单部件动作、紧急中止和回收。
 
-0.2.8 在 0.2.7 的低延迟 HTTP 复用、紧凑遥测和事件游标、单往返批处理、分帧异步建造、真实零件性能分析、星体模型、原生轨道节点和有限燃烧控制之上，进一步提高无视觉实时性：建造期间跳过重复部件表扫描、资源/发动机摘要低频缓存、`ksp_watch` 有界采样，并保留默认 20 Hz 的位置和事件遥测；同时扩大事件缓冲、报告丢失游标、提高 watch 的事件窗口，新增 `ksp_wait_for_event` 低延迟等待工具，以及发动机状态/点火、升空、着陆和失去控制能力事件；自动分级现在区分真实燃烧、未来级启用、纯分离级和空阶段，转移规划还会核对加载轨道的当前相位误差。无视觉模型可以通过事件游标观察“哪个零件刚生成、何时点火、何时分级、何时升空、当前是否进入燃烧/着陆阶段”，用户仍能在 KSP 中看到部件逐帧出现。
+0.2.9 在 0.2.8 的低延迟 HTTP 复用、紧凑遥测和事件游标、事件等待、单往返批处理、分帧异步建造、真实零件性能分析、星体模型、原生轨道节点和有限燃烧控制之上，进一步提高飞行成功率：指导启动前会检查控制能力、质量、当前可用分级推力和起飞 TWR；上升段按目标 TWR 调节油门，姿态回路加入角速度阻尼，指导状态和事件中会返回可审计的预检数据。无视觉模型可以通过事件游标观察“哪个零件刚生成、何时点火、何时分级、何时升空、当前是否进入燃烧/着陆阶段”，用户仍能在 KSP 中看到部件逐帧出现。
 
 当前目标平台是 KSP 1.12.x（KSP 1.x 的 `Assembly-CSharp.dll` API）。KSP 2 使用另一套 API，不能直接使用这个插件。
 
@@ -134,7 +134,7 @@ ksp_editor_apply_craft(...)
 - `stage 0` 可以作为最终载荷/分离动作，因此允许没有发动机；但 `stage > 0` 如果含有分离器却没有后续发动机，会被拒绝。
 - KSP 原生对舱体、适配器和油箱等被动零件使用 `inverseStage=-1` 是正常状态，不会被误判成非法分级；真正带发动机或分离动作的零件仍必须有有效阶段号。
 
-推荐的两级大型火箭参考结构采用：Mk1 指令舱、上级 Mainsail、下级 Mammoth、两组燃料箱和两个分离器。重新安装 0.2.8 后应先通过 `ksp_editor_validate`、`ksp_editor_analyze`、`ksp_wait_for_event` 和 `ksp_realtime_state` 做游戏内烟测；当前工作区的运行实例仍是旧版桥，因此这里不把尚未重新验证的游戏内点火/分离结果写成已实测事实。
+推荐的两级大型火箭参考结构采用：Mk1 指令舱、上级 Mainsail、下级 Mammoth、两组燃料箱和两个分离器。重新安装 0.2.9 后应先通过 `ksp_editor_validate`、`ksp_editor_analyze`、`ksp_wait_for_event` 和 `ksp_realtime_state` 做游戏内烟测；当前工作区的运行实例仍是旧版桥，因此这里不把尚未重新验证的游戏内点火/分离结果写成已实测事实。
 
 完整部件格式如下：
 
@@ -205,3 +205,4 @@ python -m server --self-test
 ## API 依据
 
 插件使用 KSP 1.x 的 `EditorLogic`、`ShipConstruct`、`Part`、`AttachNode`、`Vessel` 和 `FlightCtrlState` 接口。火箭设计和轨道流程参考 KSP 官方 [KSPedia 手册](https://www.kerbalspaceprogram.com/files/KSPedia-XB1.pdf)；控制器的“导航/制导/控制分层”和上升/着陆状态机参考 NASA 的 [Guidance, Navigation & Control](https://www.nasa.gov/reference/jsc-guidance-navigation-control-subsystems/) 以及 [Rocket Control](https://www1.grc.nasa.gov/beginners-guide-to-aeronautics/rocket-control/)。KSP API 的公开文档可参考 [KSPDocsSite](https://kspmoddinglibs.github.io/KSPDocsSite/) 以及 [XML Documentation for the KSP API](https://anatid.github.io/XML-Documentation-for-the-KSP-API/)。
+

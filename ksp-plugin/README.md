@@ -96,6 +96,8 @@ GET http://127.0.0.1:8765/api/v1/telemetry?since=0&limit=256&include_events=true
 
 指导器在 `OnFlyByWire` 回调中刷新杆量，`flight.guidance_status` 返回阶段和最后控制输出；`flight.guidance_stop` 会清除指导器和手动控制租约。它只使用 KSP 的状态和轨道数据，不需要截图。
 
+启动指导器时会先返回并记录 `preflight`：当前飞船是否可控、质量、可用分级推力、局部重力、TWR、当前阶段和发动机数量。`ascent`/`orbit` 在发射台或已着陆状态下如果估算 TWR 低于 1.02 会被拒绝，避免无视觉客户端把无法离地的飞船交给自动控制；上升段还会按约 1.35–1.75 的目标 TWR 调节油门，姿态回路会对角速度做阻尼。
+
 ### 星体、转移和原生节点
 
 `flight.bodies` 读取 KSP 的星体参数和 patched-conic 轨道；MCP 端的 `ksp_flight_transfer_plan` 会用这些数据计算透明的圆共面 Hohmann 估算。`flight.maneuver_nodes` 读取原生节点，`flight.add_maneuver_node` 和 `flight.clear_maneuver_nodes` 都要求确认参数，避免把规划误变成执行。节点 Δv 使用 radial-plus、normal-plus、prograde 坐标，单位为 m/s。
@@ -103,3 +105,4 @@ GET http://127.0.0.1:8765/api/v1/telemetry?since=0&limit=256&include_events=true
 `profile=orbit` 会在尚未入轨时使用上升制导，获得目标远点后在远点抬升近点；若近点高于目标，则在近点执行逆行降轨。`profile=landing` 会先执行简单脱轨决策，再使用相对地表速度对准反向速度，并根据制动距离、局部重力、地形高度和垂直速度调节油门。两者是可停止的基础闭环，不包含完整的 Duna 转移窗口搜索、再入气动模型或地形避障。
 
 编辑器建造请求支持 `snap_to_node`。默认值为 `true`，会按父子 AttachNode 自动对齐位置和方向；若要保留传入的世界坐标和四元数，可以显式传 `false`。对称复制不依赖游戏当前的 UI 对称模式：MCP 文档中的每个零件都是显式实例，因此插件会在生成单个零件时暂时关闭 UI 对称，避免多出未登记的零件。
+

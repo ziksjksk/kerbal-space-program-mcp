@@ -53,6 +53,7 @@ namespace KspMcp
             public double BurnThrottle;
             public double BurnDeltaV;
             public bool BurnCompletionRecorded;
+            public Dictionary<string, object> Preflight;
         }
 
         private sealed class ControlLease
@@ -436,6 +437,7 @@ namespace KspMcp
             {
                 throw new KspMcpException("invalid_guidance_profile", "supported profiles are ascent, orbit, landing, and node_burn", profile);
             }
+            Dictionary<string, object> preflight = GuidancePreflight(profile);
             double now = Planetarium.GetUniversalTime();
             double maxSeconds = Math.Max(5d, Math.Min(3600d, JsonUtil.Number(args, "max_seconds", profile == "landing" || profile == "node_burn" ? 600d : 240d)));
             _guidance = new GuidancePlan
@@ -449,7 +451,8 @@ namespace KspMcp
                 AutoStage = JsonUtil.Boolean(args, "auto_stage", true),
                 Phase = "initialising",
                 LastError = null,
-                BurnCompletionRecorded = false
+                BurnCompletionRecorded = false,
+                Preflight = preflight
             };
             try
             {
@@ -467,7 +470,65 @@ namespace KspMcp
             _sasEnabled = false;
             try { FireGroup("SAS", false); } catch (Exception) { }
             _lastGuidanceStageAt = now;
+            KspMcpBridge bridge = KspMcpBridge.Instance;
+            if (bridge != null) bridge.RecordEvent("flight.guidance.started", new Dictionary<string, object>
+            {
+                { "profile", profile },
+                { "preflight", preflight }
+            });
             return GuidanceStatus();
+        }
+
+        private static Dictionary<string, object> GuidancePreflight(string profile)
+        {
+            Vessel vessel = FlightGlobals.ActiveVessel;
+            if (vessel == null) throw new KspMcpException("no_active_vessel", "KSP has no active vessel", null);
+            if (!vessel.isCommandable)
+            {
+                throw new KspMcpException("not_commandable", "the active vessel is not commandable; guidance is unsafe", vessel.vesselName);
+            }
+
+            double mass = Math.Max(0d, vessel.GetTotalMass());
+            double thrust = AvailableGuidanceThrust(vessel);
+            double altitude = Math.Max(0d, vessel.altitude);
+            double gravity = SurfaceGravity(vessel, altitude);
+            double twr = mass <= 0d || gravity <= 0d ? 0d : thrust / (mass * gravity);
+            string situation = vessel.situation.ToString();
+            bool onPad = string.Equals(situation, "PRELAUNCH", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(situation, "LANDED", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(situation, "SPLASHED", StringComparison.OrdinalIgnoreCase);
+            if (thrust <= 0d || mass <= 0d)
+            {
+                throw new KspMcpException("guidance_engine_unavailable", "guidance requires a positive vessel mass and usable staged engine thrust", null);
+            }
+            if ((profile == "ascent" || profile == "orbit") && onPad && twr < 1.02d)
+            {
+                throw new KspMcpException("guidance_twr_too_low", "the active vessel cannot safely lift off at the current staging/throttle configuration", new Dictionary<string, object>
+                {
+                    { "twr", twr },
+                    { "mass_tonnes", mass },
+                    { "thrust_kN", thrust },
+                    { "gravity_mps2", gravity },
+                    { "current_stage", vessel.currentStage },
+                    { "next_stage", Math.Max(0, vessel.currentStage - 1) }
+                });
+            }
+
+            Dictionary<string, object> engines = EngineSummary(vessel);
+            return new Dictionary<string, object>
+            {
+                { "profile", profile },
+                { "vessel_name", vessel.vesselName },
+                { "situation", situation },
+                { "commandable", vessel.isCommandable },
+                { "mass_tonnes", mass },
+                { "available_thrust_kN", thrust },
+                { "local_gravity_mps2", gravity },
+                { "twr", twr },
+                { "current_stage", vessel.currentStage },
+                { "next_stage", Math.Max(0, vessel.currentStage - 1) },
+                { "engine_count", engines["count"] }
+            };
         }
 
         public Dictionary<string, object> StopGuidance()
@@ -502,7 +563,8 @@ namespace KspMcp
                 { "burn_duration", _guidance.BurnDuration },
                 { "burn_throttle", _guidance.BurnThrottle },
                 { "burn_delta_v", _guidance.BurnDeltaV },
-                { "last_error", _guidance.LastError }
+                { "last_error", _guidance.LastError },
+                { "preflight", _guidance.Preflight }
             };
         }
 
@@ -556,6 +618,23 @@ namespace KspMcp
             else if (altitude < 35000d) _guidance.Phase = "gravity_turn";
             else _guidance.Phase = "orbital_ascent";
 
+            if (throttle > 0d)
+            {
+                double mass = Math.Max(0.001d, vessel.GetTotalMass());
+                double thrust = AvailableGuidanceThrust(vessel);
+                double gravity = SurfaceGravity(vessel, altitude);
+                if (thrust > 0d && gravity > 0d)
+                {
+                    // Hold a realistic early-ascent TWR instead of applying
+                    // full throttle to an unusually high-TWR stack. The
+                    // apoapsis error above remains the stricter limiter near
+                    // the target orbit.
+                    double targetTwr = altitude < 1000d ? 1.35d : (altitude < 10000d ? 1.55d : 1.75d);
+                    double twrThrottle = targetTwr * mass * gravity / thrust;
+                    throttle = Math.Min(throttle, ClampDouble(twrThrottle, 0.15d, 1d));
+                }
+            }
+
             ApplyDirectionControl(state, vessel, target, throttle, targetPitch);
         }
 
@@ -567,8 +646,7 @@ namespace KspMcp
             double deltaV = node.DeltaV.magnitude;
             if (deltaV < 0.01d) throw new KspMcpException("maneuver_empty", "requested maneuver node has near-zero delta-v", null);
             double throttle = ClampDouble(JsonUtil.Number(args, "throttle", 1d), 0.1d, 1d);
-            double thrust = NumberMember(vessel, "availableThrust");
-            if (thrust <= 0d) thrust = EstimateActiveThrust(vessel);
+            double thrust = AvailableGuidanceThrust(vessel);
             double mass = vessel.GetTotalMass();
             if (thrust <= 0d || mass <= 0d)
             {
@@ -655,6 +733,14 @@ namespace KspMcp
             if (vessel == null || vessel.patchedConicSolver == null || vessel.patchedConicSolver.maneuverNodes == null) return null;
             if (index < 0 || index >= vessel.patchedConicSolver.maneuverNodes.Count) return null;
             return vessel.patchedConicSolver.maneuverNodes[index];
+        }
+
+        private static double AvailableGuidanceThrust(Vessel vessel)
+        {
+            if (vessel == null) return 0d;
+            double thrust = NumberMember(vessel, "availableThrust");
+            if (thrust > 0d) return thrust;
+            return EstimateActiveThrust(vessel);
         }
 
         private static double EstimateActiveThrust(Vessel vessel)
@@ -825,8 +911,7 @@ namespace KspMcp
             }
 
             double mass = Math.Max(0.001d, vessel.GetTotalMass());
-            double thrust = NumberMember(vessel, "availableThrust");
-            if (thrust <= 0d) thrust = EstimateActiveThrust(vessel);
+            double thrust = AvailableGuidanceThrust(vessel);
             double maxAcceleration = thrust <= 0d ? 0d : thrust / mass;
             double gravity = SurfaceGravity(vessel, altitude);
             double netBrakingAcceleration = Math.Max(0.1d, maxAcceleration - gravity);
@@ -863,15 +948,16 @@ namespace KspMcp
             if (target.sqrMagnitude < 0.0001d) target = vessel.transform.forward;
             target.Normalize();
             Vector3 local = vessel.transform.InverseTransformDirection((Vector3)target);
+            Vector3 localAngularVelocity = vessel.transform.InverseTransformDirection((Vector3)VectorMember(vessel, "angularVelocity"));
             double forward = Math.Max(0.1d, local.z);
             double pitchError = Math.Atan2(local.y, forward);
             double yawError = Math.Atan2(local.x, forward);
-            float pitch = Clamp((float)(pitchError * 2.2d), -1f, 1f);
-            float yaw = Clamp((float)(yawError * 2.2d), -1f, 1f);
+            float pitch = Clamp((float)(pitchError * 2.2d - localAngularVelocity.x * 0.35d), -1f, 1f);
+            float yaw = Clamp((float)(yawError * 2.2d - localAngularVelocity.y * 0.35d), -1f, 1f);
             state.mainThrottle = Clamp((float)throttle, 0f, 1f);
             state.pitch = pitch;
             state.yaw = yaw;
-            state.roll = 0f;
+            state.roll = Clamp(-localAngularVelocity.z * 0.25f, -1f, 1f);
             _guidance.LastThrottle = state.mainThrottle;
             _guidance.LastPitch = state.pitch;
             _guidance.LastYaw = state.yaw;
@@ -1821,6 +1907,26 @@ namespace KspMcp
             return 0d;
         }
 
+        private static Vector3d VectorMember(object target, string name)
+        {
+            if (target == null) return Vector3d.zero;
+            try
+            {
+                Type type = target.GetType();
+                FieldInfo field = type.GetField(name, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                object value = field == null ? null : field.GetValue(target);
+                if (value == null)
+                {
+                    PropertyInfo property = type.GetProperty(name, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                    value = property == null ? null : property.GetValue(target, null);
+                }
+                if (value is Vector3d) return (Vector3d)value;
+                if (value is Vector3) return (Vector3d)(Vector3)value;
+            }
+            catch (Exception) { }
+            return Vector3d.zero;
+        }
+
         private static bool BoolMember(object target, string name)
         {
             try
@@ -1871,3 +1977,4 @@ namespace KspMcp
         }
     }
 }
+

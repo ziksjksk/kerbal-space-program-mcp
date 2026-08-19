@@ -1,3 +1,8 @@
+Import-Clixml: Unexpected end of file has occurred. The following elements are not closed: S, En, DCT, Obj, En, DCT, Obj, En, DCT,
+Obj, En, DCT, Obj, Objs. Line 1516, position 46.
+InvalidOperation: Index operation failed; the array index evaluated to null.
+Import-Clixml: Unexpected end of file has occurred. The following elements are not closed: DCT, Obj, En, DCT, Obj, En, DCT, Obj, En,
+DCT, Obj, Objs. Line 107, position 13.
 """A dependency-free MCP stdio server for the KSP bridge."""
 
 from __future__ import annotations
@@ -611,7 +616,7 @@ def handle_message(app: KspMcpApplication, message: dict[str, Any]) -> dict[str,
             {
                 "protocolVersion": str(params.get("protocolVersion", "2024-11-05")),
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "kerbal-space-program", "version": "0.2.8"},
+                "serverInfo": {"name": "kerbal-space-program", "version": "0.2.9"},
                 "instructions": (
                     "Use ksp_realtime_state for compact no-visual state. Build in VAB/SPH with "
                     "ksp_editor_new and live ksp_editor_apply_craft, then poll "
