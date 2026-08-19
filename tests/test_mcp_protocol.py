@@ -132,7 +132,7 @@ class McpProtocolTests(unittest.TestCase):
             self.app,
             {"jsonrpc": "2.0", "id": 12, "method": "initialize", "params": {}},
         )
-        self.assertEqual(response["result"]["serverInfo"]["version"], "0.2.4")
+        self.assertEqual(response["result"]["serverInfo"]["version"], "0.2.5")
 
     def test_live_build_can_be_cancelled(self):
         response = handle_message(

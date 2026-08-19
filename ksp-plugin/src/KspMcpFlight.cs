@@ -539,7 +539,8 @@ namespace KspMcp
         private static double EstimateActiveThrust(Vessel vessel)
         {
             if (vessel == null || vessel.parts == null) return 0d;
-            double total = SumStageThrust(vessel, vessel.currentStage);
+            int nextStage = Math.Max(0, vessel.currentStage - 1);
+            double total = SumStageThrust(vessel, nextStage);
             if (total > 0d) return total;
 
             // Some editor-created vessels expose a stale currentStage value
@@ -760,6 +761,10 @@ namespace KspMcp
         {
             if (_guidance == null || vessel == null || vessel.currentStage <= 0) return;
             _lastGuidanceStageAt = Planetarium.GetUniversalTime();
+            // KSP exposes currentStage as the staging cursor. The action
+            // that Space/StageManager will trigger next is one lower, and
+            // parts carry that lower number in inverseStage.
+            int nextStage = Math.Max(0, vessel.currentStage - 1);
             bool currentStageHasEngine = false;
             bool currentStageLiveEngine = false;
             bool currentStageIgnited = false;
@@ -777,7 +782,7 @@ namespace KspMcp
                     bool enabled = BoolMember(module, "moduleIsEnabled") || BoolMember(module, "isEnabled");
                     if (ignited) anyIgnitedEngine = true;
                     if (!flameout && (operational || ignited || enabled)) anyLiveEngine = true;
-                    if (part.inverseStage != vessel.currentStage) continue;
+                    if (part.inverseStage != nextStage) continue;
                     currentStageHasEngine = true;
                     if (ignited) currentStageIgnited = true;
                     if (!flameout && (operational || ignited || enabled)) currentStageLiveEngine = true;
@@ -793,7 +798,11 @@ namespace KspMcp
                 {
                     if (_guidance != null) _guidance.Phase = "automatic_ignition";
                     KspMcpBridge bridge = KspMcpBridge.Instance;
-                    if (bridge != null) bridge.RecordEvent("flight.ignition.automatic", new Dictionary<string, object> { { "stage", vessel.currentStage } });
+                    if (bridge != null) bridge.RecordEvent("flight.ignition.automatic", new Dictionary<string, object>
+                    {
+                        { "stage", nextStage },
+                        { "staging_cursor", vessel.currentStage }
+                    });
                 }
                 return;
             }
@@ -810,7 +819,11 @@ namespace KspMcp
                 Stage();
                 if (_guidance != null) _guidance.Phase = "automatic_stage";
                 KspMcpBridge bridge = KspMcpBridge.Instance;
-                if (bridge != null) bridge.RecordEvent("flight.stage.automatic", new Dictionary<string, object> { { "stage", vessel.currentStage } });
+                if (bridge != null) bridge.RecordEvent("flight.stage.automatic", new Dictionary<string, object>
+                {
+                    { "stage", Math.Max(0, vessel.currentStage - 1) },
+                    { "staging_cursor", vessel.currentStage }
+                });
             }
             catch (Exception exception)
             {
@@ -1283,6 +1296,7 @@ namespace KspMcp
                 { "longitude", vessel.longitude },
                 { "mass_tonnes", vessel.GetTotalMass() },
                 { "current_stage", vessel.currentStage },
+                { "next_stage", Math.Max(0, vessel.currentStage - 1) },
                 { "position", JsonUtil.Vector3dObject(vessel.GetWorldPos3D()) },
                 { "velocity", JsonUtil.Vector3dObject(vessel.obt_velocity) },
                 { "orientation", JsonUtil.QuaternionObject(vessel.transform.rotation) },
@@ -1349,6 +1363,7 @@ namespace KspMcp
                 { "longitude", vessel.longitude },
                 { "mass_tonnes", vessel.GetTotalMass() },
                 { "current_stage", vessel.currentStage },
+                { "next_stage", Math.Max(0, vessel.currentStage - 1) },
                 { "position", JsonUtil.Vector3dObject(vessel.GetWorldPos3D()) },
                 { "velocity", JsonUtil.Vector3dObject(vessel.obt_velocity) },
                 { "orientation", JsonUtil.QuaternionObject(vessel.transform.rotation) },
@@ -1540,6 +1555,7 @@ namespace KspMcp
                     result.Add(new Dictionary<string, object>
                     {
                         { "part_flight_id", part.flightID },
+                        { "stage", part.inverseStage },
                         { "module", module.GetType().Name },
                         { "max_thrust", NumberMember(module, "maxThrust") },
                         { "final_thrust", NumberMember(module, "finalThrust") },
@@ -1589,6 +1605,8 @@ namespace KspMcp
             }
             return new Dictionary<string, object>
             {
+                { "staging_cursor", vessel == null ? -1 : vessel.currentStage },
+                { "next_stage", vessel == null ? -1 : Math.Max(0, vessel.currentStage - 1) },
                 { "count", count },
                 { "ignited", ignited },
                 { "operational", operational },
