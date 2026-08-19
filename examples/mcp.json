@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "kerbal-space-program": {
+      "command": "python",
+      "args": [
+        "-m",
+        "server"
+      ],
+      "cwd": "C:\\path\\to\\kerbal-space-program-mcp-6",
+      "env": {
+        "KSP_MCP_URL": "http://127.0.0.1:8765",
+        "KSP_MCP_TOKEN": ""
+      }
+    }
+  }
+}

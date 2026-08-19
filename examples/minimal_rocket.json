@@ -1,0 +1,32 @@
+{
+  "name": "MCP Minimal Rocket",
+  "description": "A three-part stock KSP test rocket built entirely through the MCP.",
+  "editor_mode": "VAB",
+  "parts": [
+    {
+      "id": "pod",
+      "part": "mk1pod.v2",
+      "position": [0, 0, 0],
+      "rotation": [0, 0, 0, 1],
+      "stage": 0
+    },
+    {
+      "id": "tank",
+      "part": "fuelTankSmall",
+      "parent_id": "pod",
+      "parent_attach_node": "bottom",
+      "attach_node": "top",
+      "snap_to_node": true,
+      "stage": 1
+    },
+    {
+      "id": "engine",
+      "part": "liquidEngine3.v2",
+      "parent_id": "tank",
+      "parent_attach_node": "bottom",
+      "attach_node": "top",
+      "snap_to_node": true,
+      "stage": 0
+    }
+  ]
+}
