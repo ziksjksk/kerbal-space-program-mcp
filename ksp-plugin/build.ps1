@@ -44,6 +44,7 @@ $references = @(
     (Join-Path $managed 'Assembly-CSharp.dll'),
     (Join-Path $managed 'UnityEngine.dll'),
     (Join-Path $managed 'UnityEngine.CoreModule.dll'),
+    (Join-Path $managed 'UnityEngine.PhysicsModule.dll'),
     (Join-Path $managed 'UnityEngine.UI.dll')
 ) | Where-Object { Test-Path $_ }
 

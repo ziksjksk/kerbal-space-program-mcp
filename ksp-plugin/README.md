@@ -45,10 +45,10 @@ HTTP 接收线程不会直接调用 Unity/KSP API；它把请求放进队列，�
 ### 低延迟和实时状态
 
 ```http
-GET http://127.0.0.1:8765/api/v1/telemetry?since=0&limit=64&include_events=true
+GET http://127.0.0.1:8765/api/v1/telemetry?since=0&limit=256&include_events=true
 ```
 
-遥测响应包含 `sequence`、`bridge_version`、`event_cursor`、场景、编辑器任务、紧凑飞行状态和增量 `events`。客户端保存 `event_cursor`，下一次请求把它作为 `since`，即可只读取新增的逐零件建造进度、命令完成、点火、分级、星体/飞行状态和指导器阶段事件。
+遥测响应包含 `sequence`、`bridge_version`、`event_cursor`、`oldest_event_cursor`、`events_lost`、场景、编辑器任务、紧凑飞行状态和增量 `events`。客户端保存 `event_cursor`，下一次请求把它作为 `since`，即可只读取新增的逐零件建造进度、命令完成、点火、发动机状态、升空、分级、着陆、星体/飞行状态和指导器阶段事件；如果 `events_lost` 大于 0，说明客户端轮询已经落后，需要立即读取当前摘要并重新建立游标。
 
 多个安全命令可以通过一个请求批量提交：
 

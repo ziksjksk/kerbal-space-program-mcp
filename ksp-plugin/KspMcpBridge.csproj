@@ -24,6 +24,10 @@
       <HintPath>$(KSP_ROOT)\KSP_x64_Data\Managed\UnityEngine.CoreModule.dll</HintPath>
       <Private>false</Private>
     </Reference>
+    <Reference Include="UnityEngine.PhysicsModule">
+      <HintPath>$(KSP_ROOT)\KSP_x64_Data\Managed\UnityEngine.PhysicsModule.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
     <Reference Include="UnityEngine.UI">
       <HintPath>$(KSP_ROOT)\KSP_x64_Data\Managed\UnityEngine.UI.dll</HintPath>
       <Private>false</Private>

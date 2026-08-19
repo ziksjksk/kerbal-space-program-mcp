@@ -22,6 +22,9 @@ namespace KspMcp
         private int _lastTelemetryStage = int.MinValue;
         private bool _lastTelemetryCommandable;
         private string _lastTelemetryGuidancePhase;
+        private int _lastTelemetryIgnitedEngines = -1;
+        private int _lastTelemetryOperationalEngines = -1;
+        private int _lastTelemetryFlameoutEngines = -1;
         private float _lastCompactSummaryAt = -1f;
         private string _compactSummaryVesselId;
         private Dictionary<string, object> _compactEngineSummary;
@@ -113,6 +116,16 @@ namespace KspMcp
             }
             if (_guidance != null)
             {
+                if (active == null || !active.isCommandable)
+                {
+                    _guidance.LastError = active == null
+                        ? "active vessel disappeared; guidance output is suspended"
+                        : "active vessel is no longer commandable; guidance output is suspended";
+                    _guidance.Phase = "commandability_lost";
+                    _guidance.AutoStage = false;
+                    _lease.Clear();
+                    _leaseUntil = 0d;
+                }
                 if (Planetarium.GetUniversalTime() > _guidance.EndsAt)
                 {
                     _guidance.LastError = "guidance time limit reached";
@@ -138,7 +151,11 @@ namespace KspMcp
             _lastTelemetrySituation = null;
             _lastTelemetryBody = null;
             _lastTelemetryStage = int.MinValue;
+            _lastTelemetryCommandable = false;
             _lastTelemetryGuidancePhase = null;
+            _lastTelemetryIgnitedEngines = -1;
+            _lastTelemetryOperationalEngines = -1;
+            _lastTelemetryFlameoutEngines = -1;
             _lastCompactSummaryAt = -1f;
             _compactSummaryVesselId = null;
             _compactEngineSummary = null;
@@ -163,7 +180,11 @@ namespace KspMcp
                 _lastTelemetrySituation = null;
                 _lastTelemetryBody = null;
                 _lastTelemetryStage = int.MinValue;
+                _lastTelemetryCommandable = false;
                 _lastTelemetryGuidancePhase = null;
+                _lastTelemetryIgnitedEngines = -1;
+                _lastTelemetryOperationalEngines = -1;
+                _lastTelemetryFlameoutEngines = -1;
                 return;
             }
 
@@ -185,7 +206,12 @@ namespace KspMcp
                 _lastTelemetrySituation = null;
                 _lastTelemetryBody = null;
                 _lastTelemetryStage = int.MinValue;
+                _lastTelemetryCommandable = false;
+                _lastTelemetryIgnitedEngines = -1;
+                _lastTelemetryOperationalEngines = -1;
+                _lastTelemetryFlameoutEngines = -1;
             }
+            string previousSituation = _lastTelemetrySituation;
             if (!string.Equals(_lastTelemetrySituation, situation, StringComparison.Ordinal))
             {
                 bridge.RecordEvent("flight.situation.changed", new Dictionary<string, object>
@@ -211,7 +237,8 @@ namespace KspMcp
                 bridge.RecordEvent("flight.stage.changed", new Dictionary<string, object>
                 {
                     { "vessel_id", vesselId },
-                    { "stage", stage }
+                    { "stage", stage },
+                    { "next_stage", Math.Max(0, stage - 1) }
                 });
                 _lastTelemetryStage = stage;
             }
@@ -234,6 +261,63 @@ namespace KspMcp
                     { "profile", _guidance == null ? null : _guidance.Profile }
                 });
                 _lastTelemetryGuidancePhase = guidancePhase;
+            }
+
+            // The compact engine cache is deliberately sampled at a lower
+            // rate than the position/attitude fields, but it gives a
+            // visionless client reliable edge events for ignition and
+            // flameout without walking every module on every Unity frame.
+            RefreshCompactSummary(vessel);
+            if (_compactEngineSummary != null)
+            {
+                int ignited = JsonUtil.Integer(_compactEngineSummary, "ignited", 0);
+                int operational = JsonUtil.Integer(_compactEngineSummary, "operational", 0);
+                int flameout = JsonUtil.Integer(_compactEngineSummary, "flameout", 0);
+                if (_lastTelemetryIgnitedEngines >= 0 &&
+                    (ignited != _lastTelemetryIgnitedEngines || operational != _lastTelemetryOperationalEngines || flameout != _lastTelemetryFlameoutEngines))
+                {
+                    bridge.RecordEvent("flight.engine.state.changed", new Dictionary<string, object>
+                    {
+                        { "vessel_id", vesselId },
+                        { "ignited", ignited },
+                        { "operational", operational },
+                        { "flameout", flameout },
+                        { "staging_cursor", vessel.currentStage },
+                        { "next_stage", Math.Max(0, vessel.currentStage - 1) }
+                    });
+                }
+                _lastTelemetryIgnitedEngines = ignited;
+                _lastTelemetryOperationalEngines = operational;
+                _lastTelemetryFlameoutEngines = flameout;
+            }
+
+            if (string.Equals(previousSituation, "PRELAUNCH", StringComparison.OrdinalIgnoreCase) &&
+                !string.Equals(situation, "PRELAUNCH", StringComparison.OrdinalIgnoreCase))
+            {
+                bridge.RecordEvent("flight.liftoff", new Dictionary<string, object>
+                {
+                    { "vessel_id", vesselId },
+                    { "from", previousSituation },
+                    { "to", situation },
+                    { "altitude", vessel.altitude },
+                    { "surface_speed", vessel.srfSpeed }
+                });
+            }
+            bool touchdown = string.Equals(situation, "LANDED", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(situation, "SPLASHED", StringComparison.OrdinalIgnoreCase);
+            bool wasTouchdown = string.Equals(previousSituation, "LANDED", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(previousSituation, "SPLASHED", StringComparison.OrdinalIgnoreCase);
+            if (touchdown && !wasTouchdown && previousSituation != null)
+            {
+                bridge.RecordEvent("flight.touchdown", new Dictionary<string, object>
+                {
+                    { "vessel_id", vesselId },
+                    { "from", previousSituation },
+                    { "to", situation },
+                    { "terrain_altitude", vessel.terrainAltitude },
+                    { "vertical_speed", vessel.verticalSpeed },
+                    { "surface_speed", vessel.srfSpeed }
+                });
             }
         }
 
@@ -390,6 +474,7 @@ namespace KspMcp
         {
             Vessel vessel = _hookedVessel;
             if (vessel == null) return;
+            if (!vessel.isCommandable) return;
             if (_guidance.Profile == "landing")
             {
                 ApplyLandingGuidance(state, vessel);

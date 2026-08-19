@@ -66,7 +66,7 @@ namespace KspMcp
 
             SyncPartMap();
             RestoreRequestedStages();
-            EnsureEditorRootPlacement();
+            EnsureEditorRootPlacement(true);
             FireEditorModified();
             if (!reachedExpectedCount)
             {
@@ -143,6 +143,7 @@ namespace KspMcp
                 if (_buildJob.Pending.Count == 0)
                 {
                     RestoreRequestedStages();
+                    EnsureEditorRootPlacement(true);
                     FireEditorModified();
                     _buildJob.State = "completed";
                     _buildJob.Completed = _buildJob.Total;
@@ -280,7 +281,7 @@ namespace KspMcp
                     }
                 }
 
-                EnsureEditorRootPlacement();
+                EnsureEditorRootPlacement(true);
                 FireEditorModified();
                 return new Dictionary<string, object>
                 {
@@ -751,7 +752,7 @@ namespace KspMcp
             }
             ApplyActionGroups(part, args);
             if (JsonUtil.Has(args, "custom_data")) part.customPartData = BuildCustomPartData(PartId(part), JsonUtil.Get(args, "custom_data"));
-            EnsureEditorRootPlacement();
+            EnsureEditorRootPlacement(true);
             FireEditorModified();
             return Snapshot();
         }
@@ -1338,7 +1339,7 @@ namespace KspMcp
                 throw new KspMcpException("file_exists", "craft file already exists; pass overwrite=true", path);
             }
 
-            EnsureEditorRootPlacement();
+            EnsureEditorRootPlacement(true);
             RestoreRequestedStages();
             SetShipMetadata();
             ConfigNode root = EditorLogic.fetch.ship.SaveShip();
@@ -1390,8 +1391,25 @@ namespace KspMcp
             {
                 throw new KspMcpException("craft_invalid", "refusing to launch an invalid craft", validation);
             }
+            // Validation checks the game-rule invariants. Analyze() adds the
+            // launch-facing physics gate so a commandable craft with an
+            // engine that cannot actually lift off is not sent into flight.
+            Dictionary<string, object> analysis = Analyze(new Dictionary<string, object>());
+            if (!(analysis["launch_safe_estimate"] is bool) || !(bool)analysis["launch_safe_estimate"])
+            {
+                throw new KspMcpException("launch_unsafe", "refusing to launch a craft that fails the estimated liftoff/TWR/geometry preflight", new Dictionary<string, object>
+                {
+                    { "validation", validation },
+                    { "analysis", analysis }
+                });
+            }
             if (!InvokeLaunchButton()) throw new KspMcpException("launch_failed", "could not invoke the KSP editor launch button", null);
-            return new Dictionary<string, object> { { "launch_requested", true }, { "scene", KspMcpBridge.SceneName() } };
+            return new Dictionary<string, object>
+            {
+                { "launch_requested", true },
+                { "scene", KspMcpBridge.SceneName() },
+                { "preflight", new Dictionary<string, object> { { "validation", validation }, { "analysis", analysis } } }
+            };
         }
 
         public Dictionary<string, object> Snapshot()
@@ -1602,6 +1620,11 @@ namespace KspMcp
 
         private void EnsureEditorRootPlacement()
         {
+            EnsureEditorRootPlacement(false);
+        }
+
+        private void EnsureEditorRootPlacement(bool inspectBounds)
+        {
             if (!IsEditorAvailable || !string.Equals(_editorMode, "VAB", StringComparison.OrdinalIgnoreCase)) return;
 
             Part root = null;
@@ -1618,6 +1641,34 @@ namespace KspMcp
             {
                 position.y = EditorRootHeight;
                 root.transform.position = position;
+            }
+
+            // The fixed root-height guard prevents the common underground
+            // placement case while a build is in progress. At a completed
+            // build/load boundary, inspect actual renderer/collider bounds as
+            // well: tall or rotated assemblies can extend below the editor
+            // floor even when the root transform itself is above it.
+            if (!inspectBounds) return;
+            float lowestY = float.PositiveInfinity;
+            foreach (Part part in EditorLogic.fetch.ship.parts)
+            {
+                if (part == null) continue;
+                lowestY = Math.Min(lowestY, part.transform.position.y - 0.5f);
+                Collider[] colliders = part.GetComponentsInChildren<Collider>(true);
+                foreach (Collider collider in colliders)
+                {
+                    if (collider != null) lowestY = Math.Min(lowestY, collider.bounds.min.y);
+                }
+                Renderer[] renderers = part.GetComponentsInChildren<Renderer>(true);
+                foreach (Renderer renderer in renderers)
+                {
+                    if (renderer != null) lowestY = Math.Min(lowestY, renderer.bounds.min.y);
+                }
+            }
+            const float floorClearance = 0.5f;
+            if (!float.IsPositiveInfinity(lowestY) && lowestY < floorClearance)
+            {
+                root.transform.position += Vector3.up * (floorClearance - lowestY);
             }
         }
 

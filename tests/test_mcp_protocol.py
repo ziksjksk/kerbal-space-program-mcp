@@ -105,10 +105,11 @@ class McpProtocolTests(unittest.TestCase):
     def test_watch_is_bounded_for_no_visual_clients(self):
         result = self.app.call_tool(
             "ksp_watch",
-            {"duration": 0.1, "interval": 0.05, "max_samples": 2, "include_events": False},
+            {"duration": 0.1, "interval": 0.05, "max_samples": 2, "event_limit": 256, "include_events": False},
         )
         self.assertLessEqual(result["sample_count"], 2)
         self.assertEqual(result["max_samples"], 2)
+        self.assertEqual(result["event_limit"], 256)
 
     def test_live_craft_defaults_to_frame_sliced_job(self):
         response = handle_message(
@@ -132,7 +133,7 @@ class McpProtocolTests(unittest.TestCase):
             self.app,
             {"jsonrpc": "2.0", "id": 12, "method": "initialize", "params": {}},
         )
-        self.assertEqual(response["result"]["serverInfo"]["version"], "0.2.5")
+        self.assertEqual(response["result"]["serverInfo"]["version"], "0.2.6")
 
     def test_live_build_can_be_cancelled(self):
         response = handle_message(

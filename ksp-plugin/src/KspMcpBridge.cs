@@ -33,7 +33,10 @@ namespace KspMcp
         private long _eventSequence;
         private readonly List<Dictionary<string, object>> _events = new List<Dictionary<string, object>>();
         private Dictionary<string, object> _telemetryCache;
-        private const int MaxTelemetryEvents = 256;
+        // Keep enough history for a no-visual client that polls at a normal
+        // MCP cadence while a fast, frame-sliced build is running. The
+        // response also reports when a cursor has fallen behind this window.
+        private const int MaxTelemetryEvents = 2048;
 
         private sealed class PendingRequest
         {
@@ -370,7 +373,7 @@ namespace KspMcp
             return new Dictionary<string, object>
             {
                 { "bridge", "ksp-mcp" },
-                { "bridge_version", "0.2.5" },
+                { "bridge_version", "0.2.6" },
                 { "scene", SceneName() },
                 { "endpoint", "http://" + _host + ":" + _port },
                 { "verbose_logging", _verboseLogging },
@@ -397,6 +400,9 @@ namespace KspMcp
             var result = new Dictionary<string, object>();
             foreach (KeyValuePair<string, object> item in cache) result[item.Key] = item.Value;
             result["event_cursor"] = _eventSequence;
+            long oldestEventCursor = _events.Count == 0 ? _eventSequence + 1 : (long)_events[0]["event_id"];
+            result["oldest_event_cursor"] = oldestEventCursor;
+            result["events_lost"] = since < oldestEventCursor - 1 ? oldestEventCursor - 1 - since : 0;
             result["events"] = includeEvents ? EventsSince(since, limit) : new List<object>();
             return result;
         }
@@ -437,7 +443,7 @@ namespace KspMcp
             _telemetryCache = new Dictionary<string, object>
             {
                 { "sequence", _telemetrySequence },
-                { "bridge_version", "0.2.5" },
+                { "bridge_version", "0.2.6" },
                 { "captured_at", SafeUniversalTime() },
                 { "scene", SceneName() },
                 { "editor", _craft.CompactStatus() },
