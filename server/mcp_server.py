@@ -313,8 +313,8 @@ class KspMcpApplication:
             while True:
                 sample = self.bridge.telemetry(since=since, limit=64, include_events=include_events)
                 samples.append(sample)
-                if isinstance(sample, dict) and isinstance(sample.get("sequence"), (int, float)):
-                    since = int(sample["sequence"])
+                if isinstance(sample, dict) and isinstance(sample.get("event_cursor"), (int, float)):
+                    since = int(sample["event_cursor"])
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     break
