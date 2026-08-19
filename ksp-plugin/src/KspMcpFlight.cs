@@ -22,6 +22,10 @@ namespace KspMcp
         private int _lastTelemetryStage = int.MinValue;
         private bool _lastTelemetryCommandable;
         private string _lastTelemetryGuidancePhase;
+        private float _lastCompactSummaryAt = -1f;
+        private string _compactSummaryVesselId;
+        private Dictionary<string, object> _compactEngineSummary;
+        private List<object> _compactResources;
 
         private sealed class GuidancePlan
         {
@@ -135,6 +139,10 @@ namespace KspMcp
             _lastTelemetryBody = null;
             _lastTelemetryStage = int.MinValue;
             _lastTelemetryGuidancePhase = null;
+            _lastCompactSummaryAt = -1f;
+            _compactSummaryVesselId = null;
+            _compactEngineSummary = null;
+            _compactResources = null;
         }
 
         private void RecordTelemetryTransitions(Vessel vessel)
@@ -1347,8 +1355,8 @@ namespace KspMcp
                 { "controls", CurrentControlState(vessel.ctrlState) },
                 { "control_lease", ControlSnapshot() },
                 { "guidance", GuidanceStatus() },
-                { "engine_summary", EngineSummary(vessel) },
-                { "resources", AggregateResources(vessel) }
+                { "engine_summary", CompactEngineSummary(vessel) },
+                { "resources", CompactResourceSummary(vessel) }
             };
 
             if (vessel.orbit != null)
@@ -1365,6 +1373,32 @@ namespace KspMcp
                 };
             }
             return result;
+        }
+
+        private Dictionary<string, object> CompactEngineSummary(Vessel vessel)
+        {
+            RefreshCompactSummary(vessel);
+            return _compactEngineSummary ?? EngineSummary(vessel);
+        }
+
+        private List<object> CompactResourceSummary(Vessel vessel)
+        {
+            RefreshCompactSummary(vessel);
+            return _compactResources ?? AggregateResources(vessel);
+        }
+
+        private void RefreshCompactSummary(Vessel vessel)
+        {
+            if (vessel == null) return;
+            float now = Time.realtimeSinceStartup;
+            string vesselId = vessel.id.ToString();
+            if (_compactEngineSummary != null &&
+                string.Equals(_compactSummaryVesselId, vesselId, StringComparison.Ordinal) &&
+                _lastCompactSummaryAt >= 0f && now - _lastCompactSummaryAt < 0.25f) return;
+            _compactSummaryVesselId = vesselId;
+            _lastCompactSummaryAt = now;
+            _compactEngineSummary = EngineSummary(vessel);
+            _compactResources = AggregateResources(vessel);
         }
 
         private void EnsureFlight()

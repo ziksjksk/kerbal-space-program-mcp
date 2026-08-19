@@ -1,4 +1,4 @@
-"jh®Ğ¥‹¥Rw±¥ç-y×§v‡ßŠW¡jÊrêëyÔáyú%–Œ"¥zg§¶Æ«zz-rZ,yÔ„œ0“9¸Äœ0“9¸Äœ0“9¸În;Šw¶ãŠh²+b¢}ú"{Ú–'N¥êÚ¶*'"w^ÆŠ^­«b¢wÚŠW¶š®¶²Šw^ÅëÚ–æ­yÛhée"{Ú–'N¥êÚ¶*'"w^ÆŠ^­«b¢wÚŠW¶š®¶²Šw^ÅëÚ–æ­yÛhée"""A dependency-free MCP stdio server for the KSP bridge."""
+"""A dependency-free MCP stdio server for the KSP bridge."""
 
 from __future__ import annotations
 
@@ -80,6 +80,7 @@ TOOLS: list[dict[str, Any]] = [
         {
             "duration": {"type": "number", "minimum": 0.1, "maximum": 60},
             "interval": {"type": "number", "minimum": 0.05, "maximum": 2},
+            "max_samples": {"type": "integer", "minimum": 1, "maximum": 240},
             "since": {"type": "integer", "minimum": 0},
             "include_events": {"type": "boolean"},
         },
@@ -363,22 +364,28 @@ class KspMcpApplication:
         if name == "ksp_watch":
             duration = max(0.1, min(60.0, float(args.get("duration", 5.0))))
             interval = max(0.05, min(2.0, float(args.get("interval", 0.2))))
+            max_samples = max(1, min(240, int(args.get("max_samples", 120))))
             since = max(0, int(args.get("since", 0)))
             include_events = bool(args.get("include_events", True))
             samples: list[Any] = []
             deadline = time.monotonic() + duration
+            effective_interval = duration if max_samples <= 1 else max(interval, duration / float(max_samples - 1))
             while True:
                 sample = self.bridge.telemetry(since=since, limit=64, include_events=include_events)
                 samples.append(sample)
                 if isinstance(sample, dict) and isinstance(sample.get("event_cursor"), (int, float)):
                     since = int(sample["event_cursor"])
+                if len(samples) >= max_samples:
+                    break
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     break
-                time.sleep(min(interval, remaining))
+                time.sleep(min(effective_interval, remaining))
             return {
                 "duration_seconds": duration,
                 "interval_seconds": interval,
+                "effective_interval_seconds": effective_interval,
+                "max_samples": max_samples,
                 "sample_count": len(samples),
                 "samples": samples,
             }
@@ -557,7 +564,7 @@ def handle_message(app: KspMcpApplication, message: dict[str, Any]) -> dict[str,
             {
                 "protocolVersion": str(params.get("protocolVersion", "2024-11-05")),
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "kerbal-space-program", "version": "0.2.3"},
+                "serverInfo": {"name": "kerbal-space-program", "version": "0.2.4"},
                 "instructions": (
                     "Use ksp_realtime_state for compact no-visual state. Build in VAB/SPH with "
                     "ksp_editor_new and live ksp_editor_apply_craft, then poll "

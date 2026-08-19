@@ -1,4 +1,4 @@
-"jh®Ð¥‹¥FŠ-zW¦z{b²h¬²)àusing System;
+using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.IO;
@@ -427,7 +427,11 @@ namespace KspMcp
             string id = JsonUtil.RequiredString(args, "id");
             string partName = JsonUtil.RequiredString(args, "part");
             KspMcpBridge.Log("add begin id=" + id + " part=" + partName);
-            SyncPartMap();
+            // The frame-sliced builder owns the editor for the duration of
+            // the job and updates both maps as it creates each part. A full
+            // ShipConstruct scan before every part made large rockets
+            // quadratic; keep the scan for interactive/incremental calls.
+            if (!_deferStageRestoration) SyncPartMap();
             if (_partsById.ContainsKey(id)) throw new KspMcpException("duplicate_part_id", "part id already exists: " + id, null);
             int requestedStage = JsonUtil.Integer(args, "stage", 0);
             if (requestedStage < 0) throw new KspMcpException("invalid_stage", "stage must be non-negative", requestedStage);
