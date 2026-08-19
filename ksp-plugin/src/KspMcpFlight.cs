@@ -13,6 +13,25 @@ namespace KspMcp
         private double _leaseUntil;
         private bool _sasEnabled;
         private bool _rcsEnabled;
+        private GuidancePlan _guidance;
+        private double _lastGuidanceStageAt;
+
+        private sealed class GuidancePlan
+        {
+            public string Profile;
+            public double TargetApoapsis;
+            public double TargetPeriapsis;
+            public double TargetAltitude;
+            public double StartedAt;
+            public double EndsAt;
+            public bool AutoStage;
+            public string Phase;
+            public string LastError;
+            public double LastThrottle;
+            public double LastPitch;
+            public double LastYaw;
+            public double LastTargetPitchDegrees;
+        }
 
         private sealed class ControlLease
         {
@@ -75,6 +94,18 @@ namespace KspMcp
                 _lease.Clear();
                 _leaseUntil = 0d;
             }
+            if (_guidance != null)
+            {
+                if (Planetarium.GetUniversalTime() > _guidance.EndsAt)
+                {
+                    _guidance.LastError = "guidance time limit reached";
+                    _guidance = null;
+                }
+                else if (_guidance.AutoStage && Planetarium.GetUniversalTime() - _lastGuidanceStageAt > 0.25d)
+                {
+                    TryAutomaticStage(active);
+                }
+            }
         }
 
         public void Stop()
@@ -83,10 +114,16 @@ namespace KspMcp
             _hookedVessel = null;
             _lease.Clear();
             _leaseUntil = 0d;
+            _guidance = null;
         }
 
         private void OnFlyByWire(FlightCtrlState state)
         {
+            if (_guidance != null)
+            {
+                ApplyGuidance(state);
+                return;
+            }
             if (_leaseUntil <= 0d || Planetarium.GetUniversalTime() > _leaseUntil) return;
 
             if (_lease.HasThrottle) state.mainThrottle = _lease.Throttle;
@@ -115,6 +152,7 @@ namespace KspMcp
         public Dictionary<string, object> SetControls(Dictionary<string, object> args)
         {
             EnsureFlight();
+            if (_guidance != null) throw new KspMcpException("guidance_active", "manual controls are locked while a guidance plan is active; stop guidance first", GuidanceStatus());
             if (JsonUtil.Has(args, "throttle")) { _lease.HasThrottle = true; _lease.Throttle = Clamp(JsonUtil.ToFloat(JsonUtil.Get(args, "throttle")), 0f, 1f); }
             if (JsonUtil.Has(args, "pitch")) { _lease.HasPitch = true; _lease.Pitch = Clamp(JsonUtil.ToFloat(JsonUtil.Get(args, "pitch")), -1f, 1f); }
             if (JsonUtil.Has(args, "yaw")) { _lease.HasYaw = true; _lease.Yaw = Clamp(JsonUtil.ToFloat(JsonUtil.Get(args, "yaw")), -1f, 1f); }
@@ -147,6 +185,234 @@ namespace KspMcp
             double seconds = Math.Max(0.1, Math.Min(30.0, JsonUtil.Number(args, "lease_seconds", 1.5)));
             _leaseUntil = Planetarium.GetUniversalTime() + seconds;
             return new Dictionary<string, object> { { "control_lease_seconds", seconds }, { "controls", ControlSnapshot() } };
+        }
+
+        public Dictionary<string, object> StartGuidance(Dictionary<string, object> args)
+        {
+            EnsureFlight();
+            if (!JsonUtil.Boolean(args, "confirm", false)) throw new KspMcpException("confirmation_required", "guidance start requires confirm=true", null);
+            string profile = JsonUtil.String(args, "profile", "ascent").ToLowerInvariant();
+            if (profile != "ascent" && profile != "landing" && profile != "orbit")
+            {
+                throw new KspMcpException("invalid_guidance_profile", "supported profiles are ascent, orbit, and landing", profile);
+            }
+            double now = Planetarium.GetUniversalTime();
+            double maxSeconds = Math.Max(5d, Math.Min(3600d, JsonUtil.Number(args, "max_seconds", profile == "landing" ? 600d : 240d)));
+            _guidance = new GuidancePlan
+            {
+                Profile = profile,
+                TargetApoapsis = Math.Max(1000d, JsonUtil.Number(args, "target_apoapsis", 80000d)),
+                TargetPeriapsis = JsonUtil.Number(args, "target_periapsis", 75000d),
+                TargetAltitude = Math.Max(10d, JsonUtil.Number(args, "target_altitude", 0d)),
+                StartedAt = now,
+                EndsAt = now + maxSeconds,
+                AutoStage = JsonUtil.Boolean(args, "auto_stage", true),
+                Phase = "initialising",
+                LastError = null
+            };
+            _lease.Clear();
+            _leaseUntil = 0d;
+            _sasEnabled = false;
+            try { FireGroup("SAS", false); } catch (Exception) { }
+            _lastGuidanceStageAt = now;
+            return GuidanceStatus();
+        }
+
+        public Dictionary<string, object> StopGuidance()
+        {
+            bool wasActive = _guidance != null;
+            _guidance = null;
+            _lease.Clear();
+            _leaseUntil = 0d;
+            return new Dictionary<string, object> { { "stopped", wasActive }, { "guidance", GuidanceStatus() } };
+        }
+
+        public Dictionary<string, object> GuidanceStatus()
+        {
+            if (_guidance == null) return new Dictionary<string, object> { { "active", false } };
+            double now = Planetarium.GetUniversalTime();
+            return new Dictionary<string, object>
+            {
+                { "active", true },
+                { "profile", _guidance.Profile },
+                { "phase", _guidance.Phase },
+                { "target_apoapsis", _guidance.TargetApoapsis },
+                { "target_periapsis", _guidance.TargetPeriapsis },
+                { "target_altitude", _guidance.TargetAltitude },
+                { "auto_stage", _guidance.AutoStage },
+                { "seconds_remaining", Math.Max(0d, _guidance.EndsAt - now) },
+                { "last_throttle", _guidance.LastThrottle },
+                { "last_pitch", _guidance.LastPitch },
+                { "last_yaw", _guidance.LastYaw },
+                { "target_pitch_degrees", _guidance.LastTargetPitchDegrees },
+                { "last_error", _guidance.LastError }
+            };
+        }
+
+        private void ApplyGuidance(FlightCtrlState state)
+        {
+            Vessel vessel = _hookedVessel;
+            if (vessel == null) return;
+            if (_guidance.Profile == "landing")
+            {
+                ApplyLandingGuidance(state, vessel);
+            }
+            else
+            {
+                ApplyAscentGuidance(state, vessel);
+            }
+        }
+
+        private void ApplyAscentGuidance(FlightCtrlState state, Vessel vessel)
+        {
+            double altitude = Math.Max(0d, vessel.altitude);
+            double apoapsis = vessel.orbit == null ? 0d : NumberMember(vessel.orbit, "ApA");
+            double targetPitch = 90d;
+            if (altitude >= 500d && altitude < 5000d) targetPitch = 90d - (altitude - 500d) / 4500d * 20d;
+            else if (altitude >= 5000d && altitude < 20000d) targetPitch = 70d - (altitude - 5000d) / 15000d * 35d;
+            else if (altitude >= 20000d && altitude < 35000d) targetPitch = 35d - (altitude - 20000d) / 15000d * 25d;
+            else if (altitude >= 35000d) targetPitch = 10d;
+
+            Vector3d target = AscentTargetVector(vessel, targetPitch);
+            double throttle = 1d;
+            if (apoapsis >= _guidance.TargetApoapsis)
+            {
+                throttle = 0d;
+                _guidance.Phase = "coast_to_apoapsis";
+                target = vessel.obt_velocity.sqrMagnitude > 0.01d ? vessel.obt_velocity.normalized : target;
+            }
+            else if (apoapsis > _guidance.TargetApoapsis * 0.85d)
+            {
+                throttle = ClampDouble((_guidance.TargetApoapsis - apoapsis) / Math.Max(1d, _guidance.TargetApoapsis * 0.15d), 0.15d, 1d);
+                _guidance.Phase = "apoapsis_trim";
+            }
+            else if (altitude < 500d) _guidance.Phase = "vertical_rise";
+            else if (altitude < 35000d) _guidance.Phase = "gravity_turn";
+            else _guidance.Phase = "orbital_ascent";
+
+            ApplyDirectionControl(state, vessel, target, throttle, targetPitch);
+        }
+
+        private void ApplyLandingGuidance(FlightCtrlState state, Vessel vessel)
+        {
+            double altitude = Math.Max(0d, vessel.terrainAltitude);
+            double verticalSpeed = vessel.verticalSpeed;
+            double surfaceSpeed = vessel.srfSpeed;
+            Vector3d velocity = vessel.obt_velocity;
+            Vector3d target = velocity.sqrMagnitude > 0.01d ? -velocity.normalized : SurfaceNormal(vessel);
+            double desiredVerticalSpeed = altitude > 1000d ? -25d : (altitude > 200d ? -8d : -2d);
+            double throttle = ClampDouble(0.5d + (desiredVerticalSpeed - verticalSpeed) * 0.035d, 0d, 1d);
+            if (altitude <= 5d && Math.Abs(verticalSpeed) < 2.5d && surfaceSpeed < 3d)
+            {
+                throttle = 0d;
+                _guidance.Phase = "landed_or_hovering";
+            }
+            else if (altitude > 1000d) _guidance.Phase = "retrograde_braking";
+            else if (altitude > 200d) _guidance.Phase = "powered_descent";
+            else _guidance.Phase = "final_hover_and_touchdown";
+            ApplyDirectionControl(state, vessel, target, throttle, 0d);
+        }
+
+        private void ApplyDirectionControl(FlightCtrlState state, Vessel vessel, Vector3d target, double throttle, double targetPitch)
+        {
+            if (target.sqrMagnitude < 0.0001d) target = vessel.transform.forward;
+            target.Normalize();
+            Vector3 local = vessel.transform.InverseTransformDirection((Vector3)target);
+            double forward = Math.Max(0.1d, local.z);
+            double pitchError = Math.Atan2(local.y, forward);
+            double yawError = Math.Atan2(local.x, forward);
+            float pitch = Clamp((float)(pitchError * 2.2d), -1f, 1f);
+            float yaw = Clamp((float)(yawError * 2.2d), -1f, 1f);
+            state.mainThrottle = Clamp((float)throttle, 0f, 1f);
+            state.pitch = pitch;
+            state.yaw = yaw;
+            state.roll = 0f;
+            _guidance.LastThrottle = state.mainThrottle;
+            _guidance.LastPitch = state.pitch;
+            _guidance.LastYaw = state.yaw;
+            _guidance.LastTargetPitchDegrees = targetPitch;
+        }
+
+        private void TryAutomaticStage(Vessel vessel)
+        {
+            if (_guidance == null || vessel == null || vessel.currentStage <= 0) return;
+            if (vessel.missionTime < 5d && vessel.srfSpeed < 20d) return;
+            _lastGuidanceStageAt = Planetarium.GetUniversalTime();
+            bool hasEngine = false;
+            bool liveEngine = false;
+            foreach (Part part in vessel.parts)
+            {
+                if (part == null || part.inverseStage != vessel.currentStage || part.Modules == null) continue;
+                foreach (PartModule module in part.Modules)
+                {
+                    if (module == null || module.GetType().Name.IndexOf("ModuleEngines", StringComparison.OrdinalIgnoreCase) < 0) continue;
+                    hasEngine = true;
+                    bool flameout = BoolMember(module, "flameout");
+                    bool operational = BoolMember(module, "isOperational");
+                    bool ignited = BoolMember(module, "engineIgnited");
+                    if (!flameout && (operational || ignited)) liveEngine = true;
+                }
+            }
+            if (hasEngine && liveEngine) return;
+            try
+            {
+                Stage();
+                if (_guidance != null) _guidance.Phase = "automatic_stage";
+                KspMcpBridge bridge = KspMcpBridge.Instance;
+                if (bridge != null) bridge.RecordEvent("flight.stage.automatic", new Dictionary<string, object> { { "stage", vessel.currentStage } });
+            }
+            catch (Exception exception)
+            {
+                if (_guidance != null) _guidance.LastError = exception.Message;
+            }
+        }
+
+        private static Vector3d AscentTargetVector(Vessel vessel, double pitchDegrees)
+        {
+            Vector3d up = SurfaceNormal(vessel);
+            Vector3d east = SurfaceEasting(vessel);
+            double radians = pitchDegrees * Math.PI / 180d;
+            Vector3d result = up * Math.Sin(radians) + east * Math.Cos(radians);
+            if (result.sqrMagnitude < 0.0001d) return up;
+            result.Normalize();
+            return result;
+        }
+
+        private static Vector3d SurfaceNormal(Vessel vessel)
+        {
+            Vector3d fallback = vessel.GetWorldPos3D();
+            if (vessel.mainBody != null) fallback -= (Vector3d)vessel.mainBody.transform.position;
+            if (fallback.sqrMagnitude < 0.0001d) fallback = new Vector3d(0d, 1d, 0d);
+            fallback.Normalize();
+            return InvokeBodyVector(vessel, "GetSurfaceNVector", fallback);
+        }
+
+        private static Vector3d SurfaceEasting(Vessel vessel)
+        {
+            Vector3d fallback = Vector3d.Cross(new Vector3d(0d, 1d, 0d), SurfaceNormal(vessel));
+            if (fallback.sqrMagnitude < 0.0001d) fallback = new Vector3d(1d, 0d, 0d);
+            fallback.Normalize();
+            return InvokeBodyVector(vessel, "GetSurfaceEasting", fallback);
+        }
+
+        private static Vector3d InvokeBodyVector(Vessel vessel, string methodName, Vector3d fallback)
+        {
+            if (vessel == null || vessel.mainBody == null) return fallback;
+            try
+            {
+                MethodInfo method = vessel.mainBody.GetType().GetMethod(methodName, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                if (method != null)
+                {
+                    object value = method.Invoke(vessel.mainBody, new object[] { vessel.latitude, vessel.longitude });
+                    if (value is Vector3d)
+                    {
+                        Vector3d result = (Vector3d)value;
+                        if (result.sqrMagnitude > 0.0001d) { result.Normalize(); return result; }
+                    }
+                }
+            }
+            catch (Exception) { }
+            return fallback;
         }
 
         public Dictionary<string, object> SetSas(Dictionary<string, object> args)
@@ -454,6 +720,69 @@ namespace KspMcp
             return result;
         }
 
+        /// <summary>
+        /// A deliberately small telemetry record for high-rate polling.
+        /// Snapshot() is intentionally detailed for inspection, but it walks
+        /// every resource and engine module. Sending that payload every frame
+        /// made a visionless MCP client both slow and unnecessarily noisy.
+        /// </summary>
+        public Dictionary<string, object> CompactSnapshot()
+        {
+            Vessel vessel = null;
+            try { vessel = FlightGlobals.ActiveVessel; } catch (Exception) { }
+            if (vessel == null)
+            {
+                return new Dictionary<string, object>
+                {
+                    { "available", false },
+                    { "control_lease", ControlSnapshot() }
+                };
+            }
+
+            var result = new Dictionary<string, object>
+            {
+                { "available", true },
+                { "vessel_name", vessel.vesselName },
+                { "vessel_id", vessel.id.ToString() },
+                { "active", vessel.isActiveVessel },
+                { "loaded", vessel.loaded },
+                { "commandable", vessel.isCommandable },
+                { "situation", vessel.situation.ToString() },
+                { "body", vessel.mainBody == null ? null : vessel.mainBody.bodyName },
+                { "universal_time", Planetarium.GetUniversalTime() },
+                { "mission_time", vessel.missionTime },
+                { "altitude", vessel.altitude },
+                { "terrain_altitude", vessel.terrainAltitude },
+                { "surface_speed", vessel.srfSpeed },
+                { "orbital_speed", vessel.obt_speed },
+                { "vertical_speed", vessel.verticalSpeed },
+                { "latitude", vessel.latitude },
+                { "longitude", vessel.longitude },
+                { "mass_tonnes", vessel.GetTotalMass() },
+                { "current_stage", vessel.currentStage },
+                { "position", JsonUtil.Vector3dObject(vessel.GetWorldPos3D()) },
+                { "velocity", JsonUtil.Vector3dObject(vessel.obt_velocity) },
+                { "orientation", JsonUtil.QuaternionObject(vessel.transform.rotation) },
+                { "controls", CurrentControlState(vessel.ctrlState) },
+                { "control_lease", ControlSnapshot() }
+            };
+
+            if (vessel.orbit != null)
+            {
+                result["orbit"] = new Dictionary<string, object>
+                {
+                    { "apoapsis", NumberMember(vessel.orbit, "ApA") },
+                    { "periapsis", NumberMember(vessel.orbit, "PeA") },
+                    { "eccentricity", NumberMember(vessel.orbit, "eccentricity") },
+                    { "inclination", NumberMember(vessel.orbit, "inclination") },
+                    { "period", NumberMember(vessel.orbit, "period") },
+                    { "time_to_apoapsis", NumberMember(vessel.orbit, "timeToAp") },
+                    { "time_to_periapsis", NumberMember(vessel.orbit, "timeToPe") }
+                };
+            }
+            return result;
+        }
+
         private void EnsureFlight()
         {
             if (FlightGlobals.ActiveVessel == null) throw new KspMcpException("no_active_vessel", "KSP has no active vessel", KspMcpBridge.SceneName());
@@ -649,6 +978,11 @@ namespace KspMcp
         }
 
         private static float Clamp(float value, float min, float max)
+        {
+            return Math.Max(min, Math.Min(max, value));
+        }
+
+        private static double ClampDouble(double value, double min, double max)
         {
             return Math.Max(min, Math.Min(max, value));
         }

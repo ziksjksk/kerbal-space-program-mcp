@@ -7,6 +7,8 @@
 
 建造链路支持从空白编辑器开始创建火箭，也支持一次性提交完整的部件树；粒度较细的工具可以继续增删零件、移动/旋转、重新连接、设置阶段和动作组。飞行链路支持发射后的状态读取、油门和姿态控制、SAS/RCS、分级、时间加速、单部件动作、紧急中止和回收。
 
+0.2.0 增加了低延迟 HTTP 复用、紧凑遥测和事件游标、单往返批处理、分帧异步建造任务、基于实际 KSP 零件的性能分析，以及游戏帧内运行的上升/轨道/着陆指导器。它的目标是让没有视觉输入的模型也能通过状态序列完成建造和飞行；画面仍然可以由用户在 KSP 中实时观看，但 MCP 不依赖截图或 Computer Use 才能工作。
+
 当前目标平台是 KSP 1.12.x（KSP 1.x 的 `Assembly-CSharp.dll` API）。KSP 2 使用另一套 API，不能直接使用这个插件。
 
 ## 目录
@@ -17,6 +19,7 @@ tests/                  不需要启动 KSP 的协议和数据模型测试
 ksp-plugin/src/         KSP 游戏侧 C# 插件源码
 ksp-plugin/GameData/    可直接复制到 KSP 根目录的插件目录和配置
 examples/               MCP 客户端配置示例
+releases/               可直接下载的完整安装包
 ```
 
 ## 安装
@@ -70,12 +73,31 @@ python -m server
 1. 调用 `ksp_status` 确认已经进入 VAB/SPH。
 2. 调用 `ksp_parts_list` 查看当前游戏实例实际加载的零件名称和连接节点。
 3. 调用 `ksp_editor_new` 清空编辑器。
-4. 用 `ksp_editor_apply_craft` 一次提交完整的部件树，或者反复调用 `ksp_editor_add_part` 增量建造。
-5. 用 `ksp_editor_validate` 检查控制核心、发动机、连接关系、阶段和成本。
-6. 用 `ksp_editor_save` 保存 `.craft` 文件。
-7. 用户明确允许后，才调用 `ksp_editor_launch`。
+4. 用 `ksp_editor_apply_craft` 提交完整部件树。MCP 默认使用分帧 live 模式，立即返回 `job_id`，不会把几十个零件塞进同一个 Unity 帧。
+5. 用 `ksp_editor_job_status` 和 `ksp_realtime_state` 读取 `completed/total`、事件和当前部件数，直到任务进入 `completed`。
+6. 调用 `ksp_editor_analyze` 读取真实零件质量、推力、TWR、近似 Δv、质心/推力中心和分级风险。
+7. 用 `ksp_editor_validate` 检查控制核心、发动机、连接关系、阶段和成本，再用 `ksp_editor_save` 保存 `.craft` 文件。
+8. 用户明确允许后，才调用 `ksp_editor_launch`。
+
+如果必须兼容旧的同步调用方，可以传 `wait_for_completion=true`；对于模型调用，推荐保留默认 live 模式，并通过事件游标观察过程。
 
 VAB 中插件会把生成的根零件自动放到安全高度（默认 `y=50`），避免高大的火箭穿过编辑器地板。`ksp_editor_load` 是异步的；插件会等待 KSP 的部件树稳定后再恢复保存的阶段号并重新检查根部位置。调用方仍应在加载后再次调用 `ksp_editor_get_craft` 和 `ksp_editor_validate`，确认部件数量、发动机和连接关系。
+
+### 无视觉实时状态
+
+`ksp_realtime_state` 返回缓存的紧凑状态，避免每次读取都序列化完整部件树。它包含场景、建造任务、当前飞船、位置/速度、海拔、地形高度、垂直速度、质量、级号、姿态、轨道根数和 MCP 控制租约；`events` 使用单调递增的 `event_cursor`，模型可以把上次游标传入 `since`，只接收增量事件。
+
+`ksp_watch` 会在一个有界时间段内连续采样这些状态，适合无视觉模型观察“部件逐个出现、加载稳定、发射、分级、远点/近点变化和着陆”。`ksp_batch` 把多个安全命令放在一次 HTTP 往返里；发射、Abort 和回收仍必须使用各自的确认工具，不能隐藏在批处理中。
+
+示例观察循环：
+
+```text
+ksp_editor_apply_craft(...)
+  -> ksp_editor_job_status(job_id)
+  -> ksp_realtime_state(since=event_cursor)
+  -> ksp_editor_analyze()
+  -> ksp_editor_validate()
+```
 
 ### 分级和游戏规则检查
 
@@ -118,12 +140,31 @@ VAB 中插件会把生成的根零件自动放到安全高度（默认 `y=50`）
 
 `position` 是 KSP 世界坐标，`rotation` 是 Unity 四元数 `[x, y, z, w]`。部件树中的 `parent_attach_node` 和 `attach_node` 必须是实际零件配置里的节点名称；先调用 `ksp_parts_list` 可以直接查看它们。默认 `snap_to_node=true`，插件会把子零件的节点对齐到父零件节点；要保留自定义的世界坐标/姿态时才设为 `false`。对于表面连接，仍然使用同一字段，只需选择对应的 `srfAttach` 节点。一个可直接提交的三件套火箭见 `examples/minimal_rocket.json`。
 
+### 结构和性能分析
+
+`ksp_editor_analyze` 不猜测零件名称，而是读取当前 KSP 实例的实际 `Part`、资源密度、发动机大气曲线和分级。它会返回：
+
+- 总质量、推进剂质量、发动机总推力、海平面/真空 TWR、加权 Isp；
+- 按 `inverseStage` 分组的发动机、质量、剩余质量、TWR 和近似 Δv；
+- 质心、推力中心和“质心是否位于推力中心上方”的几何检查；
+- 不能起飞、可能严重下沉或容易翻滚等错误/警告。
+
+Δv 是工程估算，不是完整的飞行仿真：它明确排除了阻力、转向损失、节流曲线、跨级供料变化和大气变化。真正发射前仍要同时通过 `ksp_editor_analyze` 和 `ksp_editor_validate`，并用遥测观察实际 TWR、垂直速度、燃料和级号。
+
+### 实时飞行指导
+
+新增的 `ksp_flight_guidance_start` 在游戏帧内运行闭环指导，支持 `ascent`、`orbit` 和 `landing` 三种基础 profile；`ksp_flight_guidance_stop` 立即释放控制，`ksp_flight_guidance_status` 返回当前阶段、目标、控制输出和剩余时间。启动必须传 `confirm=true`，默认允许自动分级，但不会绕过发射工具的确认门槛。
+
+当前指导器的职责是提供可观测、可停止的基础闭环：上升阶段按海拔执行重力转弯并以目标远点收油，轨道阶段继续使用轨道遥测修正，着陆阶段按反向速度和垂直速度控制下降。它不是全任务级别的“保证成功”黑盒；去 Duna 的转移窗口、节点建立、捕获、再入和地形避障还需要在后续版本中加入显式的轨道节点和目标体模型。模型应持续调用 `ksp_realtime_state`，发现燃料、姿态或垂直速度异常时先停止指导或 Abort。
+
 ## 重要边界
 
 - 游戏侧操作严格在 KSP 主线程执行，HTTP 线程只负责接收请求，避免从后台线程触碰 Unity 对象。
 - 默认只监听回环地址，不把游戏控制端口暴露到局域网。
 - `ksp_editor_launch` 要求 `confirm: true`，防止模型在校验前误发射。
+- `ksp_flight_guidance_start` 要求 `confirm: true`；`ksp_flight_set_controls` 与指导器互斥，避免两个控制回路互相抢杆。
 - 工具不会替模型猜测不存在的零件名称；零件名、节点名和已解锁状态来自当前运行的游戏实例。
+- 更新 `GameData/KspMcp/Plugins/KspMcpBridge.dll` 后必须重启 KSP，已经运行的 Unity 进程不会热加载新 DLL。
 - 本地没有 KSP 安装时，可以运行全部 Python 测试，但无法在这里替你启动真实游戏验证 Unity 行为；编译和游戏内烟测需要在安装了 KSP 的机器上完成。
 
 ## 验证
@@ -137,5 +178,4 @@ python -m server --self-test
 
 ## API 依据
 
-插件使用 KSP 1.x 的 `EditorLogic`、`ShipConstruct`、`Part`、`AttachNode`、`Vessel` 和 `FlightCtrlState` 接口。KSP API 的公开文档可参考 [KSPDocsSite](https://kspmoddinglibs.github.io/KSPDocsSite/) 以及 [XML Documentation for the KSP API](https://anatid.github.io/XML-Documentation-for-the-KSP-API/)。
-
+插件使用 KSP 1.x 的 `EditorLogic`、`ShipConstruct`、`Part`、`AttachNode`、`Vessel` 和 `FlightCtrlState` 接口。火箭设计和轨道流程参考 KSP 官方 [KSPedia 手册](https://www.kerbalspaceprogram.com/files/KSPedia-XB1.pdf)；控制器的“导航/制导/控制分层”和上升/着陆状态机参考 NASA 的 [Guidance, Navigation & Control](https://www.nasa.gov/reference/jsc-guidance-navigation-control-subsystems/) 以及 [Rocket Control](https://www1.grc.nasa.gov/beginners-guide-to-aeronautics/rocket-control/)。KSP API 的公开文档可参考 [KSPDocsSite](https://kspmoddinglibs.github.io/KSPDocsSite/) 以及 [XML Documentation for the KSP API](https://anatid.github.io/XML-Documentation-for-the-KSP-API/)。

@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import json
+import http.client
 import os
 import time
-import urllib.error
-import urllib.request
+import threading
+from urllib.parse import urlsplit, urlencode
 from typing import Any
 
 
@@ -29,36 +30,67 @@ class BridgeClient:
         self.base_url = (base_url or os.environ.get("KSP_MCP_URL", "http://127.0.0.1:8765")).rstrip("/")
         self.token = token if token is not None else os.environ.get("KSP_MCP_TOKEN", "")
         self.timeout = timeout
+        self._url = urlsplit(self.base_url)
+        self._connection: http.client.HTTPConnection | http.client.HTTPSConnection | None = None
+        self._connection_lock = threading.RLock()
 
-    def _request(self, method: str, path: str, payload: dict[str, Any] | None = None) -> Any:
-        url = f"{self.base_url}{path}"
-        data = None
-        headers = {"Accept": "application/json"}
+    def close(self) -> None:
+        """Close the reusable bridge connection, if one exists."""
+
+        with self._connection_lock:
+            if self._connection is not None:
+                try:
+                    self._connection.close()
+                finally:
+                    self._connection = None
+
+    def _get_connection(self) -> http.client.HTTPConnection | http.client.HTTPSConnection:
+        if self._connection is not None:
+            return self._connection
+        if self._url.scheme == "https":
+            self._connection = http.client.HTTPSConnection(self._url.netloc, timeout=self.timeout)
+        else:
+            self._connection = http.client.HTTPConnection(self._url.netloc, timeout=self.timeout)
+        return self._connection
+
+    def _path(self, path: str) -> str:
+        prefix = self._url.path.rstrip("/")
+        if not path.startswith("/"):
+            path = "/" + path
+        return (prefix + path) or "/"
+
+    def _request(self, method: str, path: str, payload: Any = None) -> Any:
+        data = None if payload is None else json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        headers = {"Accept": "application/json", "Connection": "keep-alive"}
         if self.token:
             headers["X-KSP-MCP-Token"] = self.token
-        if payload is not None:
-            data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        if data is not None:
             headers["Content-Type"] = "application/json; charset=utf-8"
-        request = urllib.request.Request(url, data=data, headers=headers, method=method)
-        try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                raw = response.read().decode("utf-8")
-        except urllib.error.HTTPError as exc:
-            body = exc.read().decode("utf-8", errors="replace")
+
+        with self._connection_lock:
             try:
-                decoded = json.loads(body)
+                connection = self._get_connection()
+                connection.request(method, self._path(path), body=data, headers=headers)
+                response = connection.getresponse()
+                raw = response.read().decode("utf-8", errors="replace")
+                status = response.status
+            except (TimeoutError, OSError, http.client.HTTPException) as exc:
+                self.close()
+                raise BridgeError(
+                    f"cannot reach KSP bridge at {self.base_url}: {exc}",
+                    code="not_connected",
+                ) from exc
+
+        if status >= 400:
+            try:
+                decoded = json.loads(raw)
             except json.JSONDecodeError:
-                decoded = body
+                decoded = raw
             raise BridgeError(
-                f"KSP bridge returned HTTP {exc.code}",
+                f"KSP bridge returned HTTP {status}",
                 code="http_error",
                 details=decoded,
-            ) from exc
-        except (urllib.error.URLError, TimeoutError, OSError) as exc:
-            raise BridgeError(
-                f"cannot reach KSP bridge at {self.base_url}: {exc}",
-                code="not_connected",
-            ) from exc
+            )
 
         try:
             envelope = json.loads(raw)
@@ -81,12 +113,35 @@ class BridgeClient:
     def status(self) -> Any:
         return self._request("GET", "/api/v1/status")
 
+    def telemetry(
+        self,
+        *,
+        since: int = 0,
+        limit: int = 64,
+        include_events: bool = True,
+    ) -> Any:
+        """Read the cached compact state without serialising the full craft tree."""
+
+        query = urlencode(
+            {
+                "since": max(0, int(since)),
+                "limit": max(1, min(256, int(limit))),
+                "include_events": "true" if include_events else "false",
+            }
+        )
+        return self._request("GET", f"/api/v1/telemetry?{query}")
+
     def call(self, command: str, args: dict[str, Any] | None = None) -> Any:
         return self._request(
             "POST",
             "/api/v1/command",
             {"command": command, "args": args or {}},
         )
+
+    def call_batch(self, commands: list[dict[str, Any]]) -> Any:
+        """Send several safe commands in one HTTP round trip."""
+
+        return self.call("batch", {"commands": commands})
 
     def wait_for_scene(self, scene: str, timeout: float = 30.0, poll_interval: float = 0.25) -> Any:
         deadline = time.monotonic() + max(0.1, timeout)

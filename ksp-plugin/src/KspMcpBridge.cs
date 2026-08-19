@@ -5,6 +5,7 @@ using System.Net;
 using System.Reflection;
 using System.Text;
 using System.Threading;
+using System.Collections.Specialized;
 using UnityEngine;
 
 namespace KspMcp
@@ -23,8 +24,14 @@ namespace KspMcp
         private string _host = "127.0.0.1";
         private int _port = 8765;
         private string _token = "";
-        private int _maxRequestsPerFrame = 4;
+        private int _maxRequestsPerFrame = 8;
         private bool _stopping;
+        private float _lastTelemetryAt = -1f;
+        private long _telemetrySequence;
+        private long _eventSequence;
+        private readonly List<Dictionary<string, object>> _events = new List<Dictionary<string, object>>();
+        private Dictionary<string, object> _telemetryCache;
+        private const int MaxTelemetryEvents = 256;
 
         private sealed class PendingRequest
         {
@@ -48,6 +55,7 @@ namespace KspMcp
             _flight = new KspMcpFlight(_craft);
             _flight.Start();
             StartHttpServer();
+            UpdateTelemetryCache(true);
             Log("started; endpoint http://" + _host + ":" + _port + "/api/v1");
         }
 
@@ -55,6 +63,7 @@ namespace KspMcp
         {
             _craft.Tick();
             _flight.Tick();
+            UpdateTelemetryCache(false);
 
             for (int index = 0; index < _maxRequestsPerFrame; index++)
             {
@@ -66,18 +75,22 @@ namespace KspMcp
                 {
                     object result = Dispatch(request.Command, request.Args);
                     envelope = Success(result);
+                    RecordEvent("command.completed", new Dictionary<string, object> { { "command", request.Command } });
                 }
                 catch (KspMcpException exception)
                 {
                     envelope = Failure(exception.Code, exception.Message, exception.Details);
+                    RecordEvent("command.failed", new Dictionary<string, object> { { "command", request.Command }, { "code", exception.Code } });
                 }
                 catch (Exception exception)
                 {
                     Debug.LogException(exception);
                     envelope = Failure("game_exception", exception.Message, null);
+                    RecordEvent("command.failed", new Dictionary<string, object> { { "command", request.Command }, { "code", "game_exception" } });
                 }
                 WriteResponse(request.Context, envelope, 200);
             }
+            UpdateTelemetryCache(true);
         }
 
         private PendingRequest DequeueRequest()
@@ -164,6 +177,11 @@ namespace KspMcp
                     (path == "/api/v1/status" || path == "/api/v1/health"))
                 {
                     Enqueue(context, "status", new Dictionary<string, object>());
+                    continue;
+                }
+                if (context.Request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase) && path == "/api/v1/telemetry")
+                {
+                    Enqueue(context, "telemetry", QueryArguments(context.Request));
                     continue;
                 }
                 if (context.Request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase) && path == "/api/v1/parts")
@@ -257,6 +275,8 @@ namespace KspMcp
             switch (command)
             {
                 case "status": return Status();
+                case "telemetry": return Telemetry(args);
+                case "batch": return Batch(args);
                 case "parts.list": return _craft.ListAvailableParts(args);
                 case "editor.new": return _craft.NewCraft(args);
                 case "editor.snapshot": return _craft.Snapshot();
@@ -268,11 +288,16 @@ namespace KspMcp
                 case "editor.set_stage": return _craft.SetStage(args);
                 case "editor.set_action_group": return _craft.SetActionGroup(args);
                 case "editor.validate": return _craft.Validate();
+                case "editor.analyze": return _craft.Analyze(args);
                 case "editor.save": return _craft.Save(args);
                 case "editor.load": return _craft.Load(args);
                 case "editor.clear": return _craft.Clear();
                 case "editor.launch": return _craft.Launch(args);
+                case "editor.job_status": return _craft.JobStatus(args);
                 case "flight.state": return _flight.Snapshot();
+                case "flight.guidance_start": return _flight.StartGuidance(args);
+                case "flight.guidance_stop": return _flight.StopGuidance();
+                case "flight.guidance_status": return _flight.GuidanceStatus();
                 case "flight.stage": return _flight.Stage();
                 case "flight.set_controls": return _flight.SetControls(args);
                 case "flight.set_sas": return _flight.SetSas(args);
@@ -286,23 +311,140 @@ namespace KspMcp
             }
         }
 
+        private object Batch(Dictionary<string, object> args)
+        {
+            List<object> commands = JsonUtil.Array(args, "commands");
+            if (commands == null || commands.Count == 0) throw new KspMcpException("invalid_batch", "batch requires at least one command", null);
+            if (commands.Count > 32) throw new KspMcpException("invalid_batch", "batch accepts at most 32 commands", null);
+
+            var results = new List<object>();
+            foreach (object raw in commands)
+            {
+                Dictionary<string, object> item = JsonUtil.Object(raw);
+                if (item == null) throw new KspMcpException("invalid_batch", "each batch item must be an object", null);
+                string command = JsonUtil.RequiredString(item, "command");
+                if (command == "batch" || command == "editor.launch" || command == "flight.abort" || command == "flight.recover")
+                {
+                    throw new KspMcpException("unsafe_batch_command", command + " must use its dedicated command", null);
+                }
+                Dictionary<string, object> commandArgs = JsonUtil.Object(JsonUtil.Get(item, "args")) ?? new Dictionary<string, object>();
+                try
+                {
+                    results.Add(new Dictionary<string, object>
+                    {
+                        { "command", command },
+                        { "ok", true },
+                        { "result", Dispatch(command, commandArgs) }
+                    });
+                }
+                catch (KspMcpException exception)
+                {
+                    results.Add(new Dictionary<string, object>
+                    {
+                        { "command", command },
+                        { "ok", false },
+                        { "error", new Dictionary<string, object> { { "code", exception.Code }, { "message", exception.Message } } }
+                    });
+                }
+            }
+            return new Dictionary<string, object> { { "count", results.Count }, { "results", results } };
+        }
+
         private Dictionary<string, object> Status()
         {
             return new Dictionary<string, object>
             {
                 { "bridge", "ksp-mcp" },
-                { "bridge_version", "0.1.0" },
+                { "bridge_version", "0.2.0" },
                 { "scene", SceneName() },
                 { "endpoint", "http://" + _host + ":" + _port },
                 { "editor", _craft.Status() },
                 { "flight", _flight.Snapshot() },
                 { "capabilities", new Dictionary<string, object>
                     {
-                        { "editor", new List<object> { "new", "snapshot", "apply", "add", "attach", "update", "remove", "stage", "action_group", "validate", "save", "load", "launch" } },
-                        { "flight", new List<object> { "state", "stage", "controls", "sas", "rcs", "warp", "activate_part", "abort", "recover" } }
+                        { "editor", new List<object> { "new", "snapshot", "apply", "add", "attach", "update", "remove", "stage", "action_group", "validate", "analyze", "save", "load", "launch", "job_status" } },
+                        { "flight", new List<object> { "state", "compact_telemetry", "guidance_start", "guidance_stop", "guidance_status", "stage", "controls", "sas", "rcs", "warp", "activate_part", "abort", "recover" } },
+                        { "bridge", new List<object> { "telemetry", "batch" } }
                     }
                 }
             };
+        }
+
+        private Dictionary<string, object> Telemetry(Dictionary<string, object> args)
+        {
+            UpdateTelemetryCache(true);
+            Dictionary<string, object> cache = _telemetryCache ?? new Dictionary<string, object>();
+            long since = (long)Math.Max(0d, JsonUtil.Number(args, "since", 0d));
+            int limit = Math.Max(1, Math.Min(256, JsonUtil.Integer(args, "limit", 64)));
+            bool includeEvents = JsonUtil.Boolean(args, "include_events", true);
+            var result = new Dictionary<string, object>();
+            foreach (KeyValuePair<string, object> item in cache) result[item.Key] = item.Value;
+            result["event_cursor"] = _eventSequence;
+            result["events"] = includeEvents ? EventsSince(since, limit) : new List<object>();
+            return result;
+        }
+
+        private List<object> EventsSince(long since, int limit)
+        {
+            var result = new List<object>();
+            for (int index = 0; index < _events.Count; index++)
+            {
+                Dictionary<string, object> item = _events[index];
+                long eventId = (long)item["event_id"];
+                if (eventId <= since) continue;
+                result.Add(item);
+                if (result.Count >= limit) break;
+            }
+            return result;
+        }
+
+        internal void RecordEvent(string type, object data)
+        {
+            _eventSequence++;
+            _events.Add(new Dictionary<string, object>
+            {
+                { "event_id", _eventSequence },
+                { "universal_time", SafeUniversalTime() },
+                { "type", type },
+                { "data", data }
+            });
+            if (_events.Count > MaxTelemetryEvents) _events.RemoveAt(0);
+        }
+
+        private void UpdateTelemetryCache(bool force)
+        {
+            float now = Time.realtimeSinceStartup;
+            if (!force && _lastTelemetryAt >= 0f && now - _lastTelemetryAt < 0.1f) return;
+            _lastTelemetryAt = now;
+            _telemetrySequence++;
+            _telemetryCache = new Dictionary<string, object>
+            {
+                { "sequence", _telemetrySequence },
+                { "captured_at", SafeUniversalTime() },
+                { "scene", SceneName() },
+                { "editor", _craft.Status() },
+                { "flight", _flight.CompactSnapshot() }
+            };
+        }
+
+        private static double SafeUniversalTime()
+        {
+            try { return Planetarium.GetUniversalTime(); }
+            catch (Exception) { return 0d; }
+        }
+
+        private static Dictionary<string, object> QueryArguments(HttpListenerRequest request)
+        {
+            var result = new Dictionary<string, object>();
+            NameValueCollection query = request == null ? null : request.QueryString;
+            if (query == null) return result;
+            double number;
+            if (double.TryParse(query["since"], out number)) result["since"] = number;
+            int limit;
+            if (int.TryParse(query["limit"], out limit)) result["limit"] = limit;
+            bool includeEvents;
+            if (bool.TryParse(query["include_events"], out includeEvents)) result["include_events"] = includeEvents;
+            return result;
         }
 
         public static string SceneName()

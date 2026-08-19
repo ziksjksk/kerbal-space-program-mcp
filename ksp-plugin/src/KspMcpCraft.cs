@@ -25,6 +25,19 @@ namespace KspMcp
         private int _loadLastPartCount = -1;
         private int _loadStableFrames;
         private int _expectedLoadPartCount;
+        private int _jobCounter;
+        private BuildJob _buildJob;
+
+        private sealed class BuildJob
+        {
+            public string Id;
+            public List<Dictionary<string, object>> Pending;
+            public int Total;
+            public int PartsPerFrame;
+            public string State;
+            public string Error;
+            public int Completed;
+        }
 
         public bool IsEditorAvailable
         {
@@ -33,6 +46,7 @@ namespace KspMcp
 
         public void Tick()
         {
+            TickBuildJob();
             if (!_loadPending) return;
 
             _loadFrames++;
@@ -58,6 +72,74 @@ namespace KspMcp
             _loadPending = false;
         }
 
+        private void TickBuildJob()
+        {
+            if (_buildJob == null || (_buildJob.State != "queued" && _buildJob.State != "running")) return;
+            if (!IsEditorAvailable) return;
+
+            _buildJob.State = "running";
+            int budget = Math.Max(1, Math.Min(16, _buildJob.PartsPerFrame));
+            try
+            {
+                for (int step = 0; step < budget && _buildJob.Pending.Count > 0; step++)
+                {
+                    bool progress = false;
+                    for (int index = _buildJob.Pending.Count - 1; index >= 0; index--)
+                    {
+                        Dictionary<string, object> part = _buildJob.Pending[index];
+                        string parentId = JsonUtil.String(part, "parent_id", null);
+                        if (!string.IsNullOrEmpty(parentId) && !_partsById.ContainsKey(parentId)) continue;
+                        AddPartInternal(part);
+                        _buildJob.Pending.RemoveAt(index);
+                        _buildJob.Completed++;
+                        progress = true;
+                        break;
+                    }
+                    if (!progress)
+                    {
+                        throw new KspMcpException("invalid_craft", "could not resolve parent order; check parent_id values and cycles", null);
+                    }
+                }
+
+                EnsureEditorRootPlacement();
+                FireEditorModified();
+                KspMcpBridge bridge = KspMcpBridge.Instance;
+                if (bridge != null)
+                {
+                    bridge.RecordEvent("editor.build.progress", new Dictionary<string, object>
+                    {
+                        { "job_id", _buildJob.Id },
+                        { "completed", _buildJob.Completed },
+                        { "total", _buildJob.Total },
+                        { "state", _buildJob.Pending.Count == 0 ? "completed" : "running" }
+                    });
+                }
+
+                if (_buildJob.Pending.Count == 0)
+                {
+                    _buildJob.State = "completed";
+                    _buildJob.Completed = _buildJob.Total;
+                }
+            }
+            catch (Exception exception)
+            {
+                try { ClearInternal(); } catch (Exception) { }
+                _buildJob.State = "error";
+                _buildJob.Error = exception.Message;
+                KspMcpBridge bridge = KspMcpBridge.Instance;
+                if (bridge != null)
+                {
+                    bridge.RecordEvent("editor.build.failed", new Dictionary<string, object>
+                    {
+                        { "job_id", _buildJob.Id },
+                        { "completed", _buildJob.Completed },
+                        { "total", _buildJob.Total },
+                        { "error", exception.Message }
+                    });
+                }
+            }
+        }
+
         public Dictionary<string, object> Status()
         {
             if (!IsEditorAvailable)
@@ -73,13 +155,15 @@ namespace KspMcp
                 { "description", _craftDescription },
                 { "editor_mode", _editorMode },
                 { "part_count", EditorLogic.fetch.ship.parts.Count },
-                { "connected", SafeAreAllPartsConnected() }
+                { "connected", SafeAreAllPartsConnected() },
+                { "build_job", JobStatus(null) }
             };
         }
 
         public Dictionary<string, object> NewCraft(Dictionary<string, object> args)
         {
             EnsureEditor();
+            _buildJob = null;
             ClearInternal();
             _craftName = JsonUtil.String(args, "name", "MCP Craft");
             _craftDescription = JsonUtil.String(args, "description", "");
@@ -91,6 +175,7 @@ namespace KspMcp
         public Dictionary<string, object> Clear()
         {
             EnsureEditor();
+            _buildJob = null;
             ClearInternal();
             return Snapshot();
         }
@@ -112,6 +197,10 @@ namespace KspMcp
                 pending.Add(part);
             }
 
+            bool live = JsonUtil.Boolean(args, "live", false);
+            if (live) return StartBuildJob(args, pending);
+
+            _buildJob = null;
             ClearInternal();
             _craftName = JsonUtil.String(args, "name", "MCP Craft");
             _craftDescription = JsonUtil.String(args, "description", "");
@@ -156,9 +245,76 @@ namespace KspMcp
             }
         }
 
+        private Dictionary<string, object> StartBuildJob(Dictionary<string, object> args, List<Dictionary<string, object>> pending)
+        {
+            _buildJob = null;
+            ClearInternal();
+            _craftName = JsonUtil.String(args, "name", "MCP Craft");
+            _craftDescription = JsonUtil.String(args, "description", "");
+            _editorMode = NormaliseMode(JsonUtil.String(args, "editor_mode", "VAB"));
+            SetShipMetadata();
+
+            int partsPerFrame = Math.Max(1, Math.Min(16, JsonUtil.Integer(args, "parts_per_frame", 2)));
+            _jobCounter++;
+            _buildJob = new BuildJob
+            {
+                Id = "build-" + _jobCounter,
+                Pending = pending,
+                Total = pending.Count,
+                PartsPerFrame = partsPerFrame,
+                State = "queued",
+                Error = null,
+                Completed = 0
+            };
+            KspMcpBridge bridge = KspMcpBridge.Instance;
+            if (bridge != null)
+            {
+                bridge.RecordEvent("editor.build.started", new Dictionary<string, object>
+                {
+                    { "job_id", _buildJob.Id },
+                    { "total", _buildJob.Total },
+                    { "parts_per_frame", _buildJob.PartsPerFrame }
+                });
+            }
+            return JobStatus(new Dictionary<string, object> { { "job_id", _buildJob.Id } });
+        }
+
+        public Dictionary<string, object> JobStatus(Dictionary<string, object> args)
+        {
+            string requested = JsonUtil.String(args, "job_id", null);
+            if (_buildJob == null)
+            {
+                return new Dictionary<string, object>
+                {
+                    { "available", false },
+                    { "state", "idle" }
+                };
+            }
+            if (!string.IsNullOrEmpty(requested) && !string.Equals(requested, _buildJob.Id, StringComparison.Ordinal))
+            {
+                throw new KspMcpException("job_not_found", "editor job not found: " + requested, null);
+            }
+            return new Dictionary<string, object>
+            {
+                { "available", true },
+                { "job_id", _buildJob.Id },
+                { "state", _buildJob.State },
+                { "completed", _buildJob.Completed },
+                { "total", _buildJob.Total },
+                { "remaining", Math.Max(0, _buildJob.Total - _buildJob.Completed) },
+                { "progress", _buildJob.Total == 0 ? 1d : (double)_buildJob.Completed / _buildJob.Total },
+                { "parts_per_frame", _buildJob.PartsPerFrame },
+                { "error", _buildJob.Error }
+            };
+        }
+
         public Dictionary<string, object> AddPart(Dictionary<string, object> args)
         {
             EnsureEditor();
+            if (_buildJob != null && (_buildJob.State == "queued" || _buildJob.State == "running"))
+            {
+                throw new KspMcpException("editor_busy", "an asynchronous editor build is still running", JobStatus(null));
+            }
             string id = JsonUtil.String(args, "id", null);
             try
             {
@@ -765,6 +921,271 @@ namespace KspMcp
             };
         }
 
+        /// <summary>
+        /// Calculate launch-facing performance from the parts that KSP has
+        /// actually loaded. Values are estimates because fuel crossfeed,
+        /// throttle curves and atmospheric drag are dynamic, but this catches
+        /// the common failure modes that a visual-free builder cannot see:
+        /// insufficient liftoff TWR, an inverted thrust/COM relationship,
+        /// missing engines, and staging with no usable propellant.
+        /// </summary>
+        public Dictionary<string, object> Analyze(Dictionary<string, object> args)
+        {
+            EnsureEditor();
+            SyncPartMap();
+            bool includeParts = JsonUtil.Boolean(args, "include_parts", false);
+            const double Gravity = 9.80665d;
+
+            Vector3 centerMassSum = Vector3.zero;
+            Vector3 centerThrustSum = Vector3.zero;
+            double totalMass = 0d;
+            double totalPropellantMass = 0d;
+            double totalThrust = 0d;
+            double totalSeaIspThrust = 0d;
+            double totalVacuumIspThrust = 0d;
+            int engineCount = 0;
+            var stageData = new Dictionary<int, Dictionary<string, object>>();
+            var engineReports = new List<object>();
+
+            foreach (Part part in EditorLogic.fetch.ship.parts)
+            {
+                if (part == null) continue;
+                double partMass = SafePartMass(part);
+                double partPropellant = SafePropellantMass(part);
+                totalMass += partMass;
+                totalPropellantMass += partPropellant;
+                centerMassSum += part.transform.position * (float)partMass;
+
+                int stage = part.inverseStage < 0 ? 0 : part.inverseStage;
+                Dictionary<string, object> stageItem = GetStageData(stageData, stage);
+                stageItem["part_count"] = (int)stageItem["part_count"] + 1;
+                stageItem["part_mass_tonnes"] = (double)stageItem["part_mass_tonnes"] + partMass;
+                stageItem["propellant_mass_tonnes"] = (double)stageItem["propellant_mass_tonnes"] + partPropellant;
+
+                if (part.Modules == null) continue;
+                foreach (PartModule module in part.Modules)
+                {
+                    if (module == null || !IsEngineModule(module)) continue;
+                    double thrust = Math.Max(0d, MemberNumber(module, "maxThrust", 0d));
+                    double seaIsp = Math.Max(1d, CurveValue(MemberValue(module, "atmosphereCurve"), 1f, 1d));
+                    double vacuumIsp = Math.Max(seaIsp, CurveValue(MemberValue(module, "atmosphereCurve"), 0f, seaIsp));
+                    engineCount++;
+                    totalThrust += thrust;
+                    totalSeaIspThrust += thrust * seaIsp;
+                    totalVacuumIspThrust += thrust * vacuumIsp;
+                    stageItem["engine_count"] = (int)stageItem["engine_count"] + 1;
+                    stageItem["thrust_kN"] = (double)stageItem["thrust_kN"] + thrust;
+                    stageItem["sea_isp_s"] = (double)stageItem["sea_isp_s"] + thrust * seaIsp;
+                    stageItem["vacuum_isp_s"] = (double)stageItem["vacuum_isp_s"] + thrust * vacuumIsp;
+
+                    object transforms = MemberValue(module, "thrustTransforms");
+                    Transform thrustTransform = null;
+                    IEnumerable transformList = transforms as IEnumerable;
+                    if (transformList != null)
+                    {
+                        foreach (object rawTransform in transformList)
+                        {
+                            thrustTransform = rawTransform as Transform;
+                            if (thrustTransform != null) break;
+                        }
+                    }
+                    Vector3 thrustPosition = thrustTransform == null ? part.transform.position : thrustTransform.position;
+                    centerThrustSum += thrustPosition * (float)thrust;
+                    if (includeParts)
+                    {
+                        engineReports.Add(new Dictionary<string, object>
+                        {
+                            { "part_id", PartId(part) },
+                            { "part", part.partInfo == null ? part.partName : part.partInfo.name },
+                            { "stage", stage },
+                            { "module", module.GetType().Name },
+                            { "thrust_kN", thrust },
+                            { "sea_level_isp_s", seaIsp },
+                            { "vacuum_isp_s", vacuumIsp },
+                            { "thrust_position", JsonUtil.Vector3Object(thrustPosition) }
+                        });
+                    }
+                }
+            }
+
+            var warnings = new List<object>();
+            var errors = new List<object>();
+            Vector3 centerMass = totalMass <= 0d ? Vector3.zero : centerMassSum / (float)totalMass;
+            Vector3 centerThrust = totalThrust <= 0d ? Vector3.zero : centerThrustSum / (float)totalThrust;
+            double weightedSeaIsp = totalThrust <= 0d ? 0d : totalSeaIspThrust / totalThrust;
+            double weightedVacuumIsp = totalThrust <= 0d ? 0d : totalVacuumIspThrust / totalThrust;
+            double seaTwr = totalMass <= 0d ? 0d : totalThrust / (totalMass * Gravity);
+            double vacuumTwr = totalMass <= 0d ? 0d : totalThrust / (totalMass * Gravity);
+            double estimatedDv = 0d;
+
+            if (engineCount == 0)
+            {
+                errors.Add("craft has no engine module");
+            }
+            else
+            {
+                if (seaTwr < 1.0d) errors.Add("estimated liftoff TWR is below 1.0; the craft cannot climb from the launch pad");
+                else if (seaTwr < 1.20d) warnings.Add("estimated liftoff TWR is below 1.20; ascent will be slow and drag losses may be high");
+                double comAboveThrust = centerMass.y - centerThrust.y;
+                if (comAboveThrust <= 0.05d)
+                {
+                    errors.Add("center of mass is not above the center of thrust in the VAB vertical axis; the rocket may pitch over");
+                }
+                else if (comAboveThrust < 0.20d)
+                {
+                    warnings.Add("center of mass is only slightly above the center of thrust; add fins or improve the mass/thrust layout");
+                }
+
+                List<int> stageNumbers = new List<int>(stageData.Keys);
+                stageNumbers.Sort();
+                foreach (int stage in stageNumbers)
+                {
+                    Dictionary<string, object> item = stageData[stage];
+                    double stageThrust = (double)item["thrust_kN"];
+                    double stagePropellant = (double)item["propellant_mass_tonnes"];
+                    double remainingMass = 0d;
+                    foreach (Part candidate in EditorLogic.fetch.ship.parts)
+                    {
+                        if (candidate == null) continue;
+                        int candidateStage = candidate.inverseStage < 0 ? 0 : candidate.inverseStage;
+                        if (candidate.inverseStage < 0 || candidateStage <= stage) remainingMass += SafePartMass(candidate);
+                    }
+                    double stageSeaTwr = remainingMass <= 0d ? 0d : stageThrust / (remainingMass * Gravity);
+                    double stageVacuumIsp = (double)item["vacuum_isp_s"] <= 0d ? 0d : (double)item["vacuum_isp_s"] / Math.Max(0.001d, stageThrust);
+                    double finalMass = Math.Max(0.001d, remainingMass - stagePropellant);
+                    double stageDv = stageVacuumIsp <= 0d || remainingMass <= finalMass ? 0d : stageVacuumIsp * Gravity * Math.Log(remainingMass / finalMass);
+                    item["remaining_mass_tonnes"] = remainingMass;
+                    item["twr_sea_level"] = stageSeaTwr;
+                    item["vacuum_isp_s"] = stageVacuumIsp;
+                    item["delta_v_mps_estimate"] = stageDv;
+                    estimatedDv += stageDv;
+                    if (stageThrust > 0d && stageSeaTwr < 1.0d)
+                    {
+                        errors.Add("stage " + stage + " estimated TWR is below 1.0");
+                    }
+                }
+            }
+
+            var stageSummary = new List<object>();
+            foreach (int stage in new List<int>(stageData.Keys))
+            {
+                stageSummary.Add(stageData[stage]);
+            }
+            stageSummary.Sort(delegate(object left, object right)
+            {
+                return ((int)((Dictionary<string, object>)left)["stage"]).CompareTo((int)((Dictionary<string, object>)right)["stage"]);
+            });
+
+            return new Dictionary<string, object>
+            {
+                { "estimate_method", "KSP part mass/resources and engine atmosphere curves; excludes drag, steering losses, boiloff, and crossfeed changes" },
+                { "launch_safe_estimate", errors.Count == 0 },
+                { "errors", errors },
+                { "warnings", warnings },
+                { "mass_tonnes", totalMass },
+                { "propellant_mass_tonnes", totalPropellantMass },
+                { "engine_count", engineCount },
+                { "thrust_kN", totalThrust },
+                { "twr_sea_level", seaTwr },
+                { "twr_vacuum", vacuumTwr },
+                { "sea_level_isp_s", weightedSeaIsp },
+                { "vacuum_isp_s", weightedVacuumIsp },
+                { "delta_v_mps_estimate", estimatedDv },
+                { "center_of_mass", JsonUtil.Vector3Object(centerMass) },
+                { "center_of_thrust", JsonUtil.Vector3Object(centerThrust) },
+                { "com_above_thrust_m", totalThrust <= 0d ? 0d : centerMass.y - centerThrust.y },
+                { "stage_summary", stageSummary },
+                { "engines", engineReports }
+            };
+        }
+
+        private static Dictionary<string, object> GetStageData(Dictionary<int, Dictionary<string, object>> stages, int stage)
+        {
+            Dictionary<string, object> item;
+            if (stages.TryGetValue(stage, out item)) return item;
+            item = new Dictionary<string, object>
+            {
+                { "stage", stage },
+                { "part_count", 0 },
+                { "engine_count", 0 },
+                { "part_mass_tonnes", 0d },
+                { "propellant_mass_tonnes", 0d },
+                { "thrust_kN", 0d },
+                { "sea_isp_s", 0d },
+                { "vacuum_isp_s", 0d }
+            };
+            stages[stage] = item;
+            return item;
+        }
+
+        private static bool IsEngineModule(PartModule module)
+        {
+            return module != null && module.GetType().Name.IndexOf("ModuleEngines", StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        private static double SafePartMass(Part part)
+        {
+            if (part == null) return 0d;
+            double mass = Math.Max(0d, part.mass);
+            try { mass += Math.Max(0d, part.GetResourceMass()); } catch (Exception) { }
+            return mass;
+        }
+
+        private static double SafePropellantMass(Part part)
+        {
+            if (part == null || part.Resources == null) return 0d;
+            double mass = 0d;
+            foreach (PartResource resource in part.Resources)
+            {
+                if (resource == null) continue;
+                string name = resource.resourceName ?? "";
+                if (name.Equals("ElectricCharge", StringComparison.OrdinalIgnoreCase) ||
+                    name.Equals("Ablator", StringComparison.OrdinalIgnoreCase) ||
+                    name.Equals("Ore", StringComparison.OrdinalIgnoreCase)) continue;
+                try
+                {
+                    PartResourceDefinition definition = PartResourceLibrary.Instance.GetDefinition(name);
+                    if (definition != null) mass += Math.Max(0d, resource.amount * definition.density);
+                }
+                catch (Exception) { }
+            }
+            return mass;
+        }
+
+        private static object MemberValue(object target, string name)
+        {
+            if (target == null) return null;
+            BindingFlags flags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
+            try
+            {
+                FieldInfo field = target.GetType().GetField(name, flags);
+                if (field != null) return field.GetValue(target);
+                PropertyInfo property = target.GetType().GetProperty(name, flags);
+                if (property != null) return property.GetValue(target, null);
+            }
+            catch (Exception) { }
+            return null;
+        }
+
+        private static double MemberNumber(object target, string name, double fallback)
+        {
+            object value = MemberValue(target, name);
+            if (value == null) return fallback;
+            try { return Convert.ToDouble(value); } catch (Exception) { return fallback; }
+        }
+
+        private static double CurveValue(object curve, float atmosphere, double fallback)
+        {
+            if (curve == null) return fallback;
+            try
+            {
+                MethodInfo method = curve.GetType().GetMethod("Evaluate", new[] { typeof(float) });
+                if (method != null) return Convert.ToDouble(method.Invoke(curve, new object[] { atmosphere }));
+            }
+            catch (Exception) { }
+            return fallback;
+        }
+
         public Dictionary<string, object> Save(Dictionary<string, object> args)
         {
             EnsureEditor();
@@ -796,6 +1217,7 @@ namespace KspMcp
         public Dictionary<string, object> Load(Dictionary<string, object> args)
         {
             EnsureEditor();
+            _buildJob = null;
             string path = JsonUtil.String(args, "path", null);
             string mode = NormaliseMode(JsonUtil.String(args, "editor_mode", _editorMode));
             if (string.IsNullOrEmpty(path))

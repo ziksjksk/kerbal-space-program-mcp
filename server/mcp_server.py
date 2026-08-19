@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from typing import Any, Callable
 
 from .bridge_client import BridgeClient, BridgeError
@@ -64,6 +65,38 @@ def _tool(name: str, description: str, properties: dict[str, Any] | None = None,
 TOOLS: list[dict[str, Any]] = [
     _tool("ksp_status", "Read the current KSP scene, editor craft summary, flight telemetry, and bridge capabilities."),
     _tool(
+        "ksp_realtime_state",
+        "Read compact cached no-visual telemetry and incremental KSP events. Prefer this over ksp_status while building or flying.",
+        {
+            "since": {"type": "integer", "minimum": 0},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 256},
+            "include_events": {"type": "boolean"},
+        },
+    ),
+    _tool(
+        "ksp_watch",
+        "Sample compact telemetry for a bounded interval so a model without vision can observe construction, staging, ascent, orbit, or landing in real time.",
+        {
+            "duration": {"type": "number", "minimum": 0.1, "maximum": 60},
+            "interval": {"type": "number", "minimum": 0.05, "maximum": 2},
+            "since": {"type": "integer", "minimum": 0},
+            "include_events": {"type": "boolean"},
+        },
+    ),
+    _tool(
+        "ksp_batch",
+        "Send several safe KSP commands in one bridge round trip to reduce latency. Irreversible launch, abort, and recovery commands must use their dedicated tools.",
+        {
+            "commands": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 32,
+                "items": _object_schema({"command": {"type": "string"}, "args": {"type": "object"}}, ["command"]),
+            }
+        },
+        ["commands"],
+    ),
+    _tool(
         "ksp_wait_for_scene",
         "Wait until KSP reaches a requested scene such as EDITOR or FLIGHT.",
         {"scene": {"type": "string"}, "timeout": {"type": "number", "minimum": 0.1}},
@@ -87,8 +120,20 @@ TOOLS: list[dict[str, Any]] = [
     _tool(
         "ksp_editor_apply_craft",
         "Replace the editor with a complete craft document built from zero. This is the main bulk-building tool.",
-        {"craft": CRAFT_SCHEMA, "require_connected": {"type": "boolean"}},
+        {
+            "craft": CRAFT_SCHEMA,
+            "require_connected": {"type": "boolean"},
+            "live": {"type": "boolean"},
+            "wait_for_completion": {"type": "boolean"},
+            "parts_per_frame": {"type": "integer", "minimum": 1, "maximum": 16},
+        },
         ["craft"],
+    ),
+    _tool(
+        "ksp_editor_job_status",
+        "Read the progress of an asynchronous editor build or load job without requesting the full craft tree.",
+        {"job_id": {"type": "string"}},
+        ["job_id"],
     ),
     _tool(
         "ksp_editor_add_part",
@@ -156,6 +201,11 @@ TOOLS: list[dict[str, Any]] = [
     ),
     _tool("ksp_editor_validate", "Validate the current editor craft and return errors, warnings, cost, connectivity, and part counts."),
     _tool(
+        "ksp_editor_analyze",
+        "Analyze real KSP part modules for approximate mass, thrust-to-weight, staging delta-v, center-of-mass/thrust geometry, and launch-risk warnings.",
+        {"include_parts": {"type": "boolean"}},
+    ),
+    _tool(
         "ksp_editor_save",
         "Save the current editor craft as a real KSP .craft file.",
         {"name": {"type": "string"}, "path": {"type": "string"}, "overwrite": {"type": "boolean"}},
@@ -173,6 +223,22 @@ TOOLS: list[dict[str, Any]] = [
         ["confirm"],
     ),
     _tool("ksp_flight_state", "Read active-vessel telemetry, resources, engines, current stage, controls, and orbital values."),
+    _tool(
+        "ksp_flight_guidance_start",
+        "Start a game-side closed-loop guidance plan. It continuously refreshes controls in KSP frames; confirm=true is required. Profiles are ascent, orbit, and landing.",
+        {
+            "profile": {"type": "string", "enum": ["ascent", "orbit", "landing"]},
+            "target_apoapsis": {"type": "number", "minimum": 1000},
+            "target_periapsis": {"type": "number", "minimum": 0},
+            "target_altitude": {"type": "number", "minimum": 10},
+            "auto_stage": {"type": "boolean"},
+            "max_seconds": {"type": "number", "minimum": 5, "maximum": 3600},
+            "confirm": {"type": "boolean"},
+        },
+        ["confirm"],
+    ),
+    _tool("ksp_flight_guidance_stop", "Stop the active closed-loop guidance plan and release MCP control."),
+    _tool("ksp_flight_guidance_status", "Read the active guidance profile, phase, target, control output, and remaining time."),
     _tool("ksp_flight_stage", "Activate the next KSP staging step."),
     _tool(
         "ksp_flight_set_controls",
@@ -231,6 +297,50 @@ class KspMcpApplication:
 
         if name == "ksp_status":
             return self.bridge.status()
+        if name == "ksp_realtime_state":
+            return self.bridge.telemetry(
+                since=int(args.get("since", 0)),
+                limit=int(args.get("limit", 64)),
+                include_events=bool(args.get("include_events", True)),
+            )
+        if name == "ksp_watch":
+            duration = max(0.1, min(60.0, float(args.get("duration", 5.0))))
+            interval = max(0.05, min(2.0, float(args.get("interval", 0.2))))
+            since = max(0, int(args.get("since", 0)))
+            include_events = bool(args.get("include_events", True))
+            samples: list[Any] = []
+            deadline = time.monotonic() + duration
+            while True:
+                sample = self.bridge.telemetry(since=since, limit=64, include_events=include_events)
+                samples.append(sample)
+                if isinstance(sample, dict) and isinstance(sample.get("sequence"), (int, float)):
+                    since = int(sample["sequence"])
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                time.sleep(min(interval, remaining))
+            return {
+                "duration_seconds": duration,
+                "interval_seconds": interval,
+                "sample_count": len(samples),
+                "samples": samples,
+            }
+        if name == "ksp_batch":
+            commands = args.get("commands")
+            if not isinstance(commands, list) or not commands:
+                raise ValueError("ksp_batch requires a non-empty commands array")
+            if len(commands) > 32:
+                raise ValueError("ksp_batch accepts at most 32 commands")
+            normalised: list[dict[str, Any]] = []
+            forbidden = {"editor.launch", "flight.abort", "flight.recover"}
+            for index, item in enumerate(commands):
+                if not isinstance(item, dict) or not isinstance(item.get("command"), str):
+                    raise ValueError(f"commands[{index}] requires a command string")
+                command = item["command"]
+                if command in forbidden:
+                    raise ValueError(f"{command} must use its dedicated confirmation tool")
+                normalised.append({"command": command, "args": item.get("args") or {}})
+            return self.bridge.call_batch(normalised)
         if name == "ksp_wait_for_scene":
             return self.bridge.wait_for_scene(str(args["scene"]), float(args.get("timeout", 30.0)))
         if name == "ksp_parts_list":
@@ -242,7 +352,16 @@ class KspMcpApplication:
         if name == "ksp_editor_apply_craft":
             craft = validate_craft_document(args["craft"], require_connected=bool(args.get("require_connected", False)))
             craft.pop("warnings", None)
+            # Live, frame-sliced construction is the default for MCP callers:
+            # it keeps Unity responsive and exposes progress to a visionless
+            # client through ksp_editor_job_status and ksp_realtime_state.
+            live = bool(args.get("live", not bool(args.get("wait_for_completion", False))))
+            craft["live"] = live
+            if "parts_per_frame" in args:
+                craft["parts_per_frame"] = int(args["parts_per_frame"])
             return self.bridge.call("editor.apply_craft", craft)
+        if name == "ksp_editor_job_status":
+            return self.bridge.call("editor.job_status", args)
         if name == "ksp_editor_add_part":
             return self.bridge.call("editor.add_part", normalise_part_spec(args))
         if name == "ksp_editor_attach_part":
@@ -257,6 +376,8 @@ class KspMcpApplication:
             return self.bridge.call("editor.set_action_group", args)
         if name == "ksp_editor_validate":
             return self.bridge.call("editor.validate", {})
+        if name == "ksp_editor_analyze":
+            return self.bridge.call("editor.analyze", args)
         if name == "ksp_editor_save":
             return self.bridge.call("editor.save", args)
         if name == "ksp_editor_load":
@@ -269,6 +390,12 @@ class KspMcpApplication:
             return self.bridge.call("editor.launch", args)
         if name == "ksp_flight_state":
             return self.bridge.call("flight.state", {})
+        if name == "ksp_flight_guidance_start":
+            return self.bridge.call("flight.guidance_start", args)
+        if name == "ksp_flight_guidance_stop":
+            return self.bridge.call("flight.guidance_stop", {})
+        if name == "ksp_flight_guidance_status":
+            return self.bridge.call("flight.guidance_status", {})
         if name == "ksp_flight_stage":
             return self.bridge.call("flight.stage", {})
         if name == "ksp_flight_set_controls":
@@ -325,11 +452,11 @@ def handle_message(app: KspMcpApplication, message: dict[str, Any]) -> dict[str,
             {
                 "protocolVersion": str(params.get("protocolVersion", "2024-11-05")),
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "kerbal-space-program", "version": "0.1.0"},
+                "serverInfo": {"name": "kerbal-space-program", "version": "0.2.0"},
                 "instructions": (
-                    "Use ksp_status first. Build in VAB/SPH with ksp_editor_new and "
-                    "ksp_editor_apply_craft or ksp_editor_add_part, then validate and save "
-                    "before launching."
+                    "Use ksp_realtime_state for compact no-visual state. Build in VAB/SPH with "
+                    "ksp_editor_new and live ksp_editor_apply_craft, then poll "
+                    "ksp_editor_job_status until complete, validate and save before launching."
                 ),
             },
         )
