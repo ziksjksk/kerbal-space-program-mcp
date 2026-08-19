@@ -295,6 +295,10 @@ namespace KspMcp
                 case "editor.launch": return _craft.Launch(args);
                 case "editor.job_status": return _craft.JobStatus(args);
                 case "flight.state": return _flight.Snapshot();
+                case "flight.bodies": return _flight.Bodies(args);
+                case "flight.maneuver_nodes": return _flight.ManeuverNodes();
+                case "flight.add_maneuver_node": return _flight.AddManeuverNode(args);
+                case "flight.clear_maneuver_nodes": return _flight.ClearManeuverNodes(args);
                 case "flight.guidance_start": return _flight.StartGuidance(args);
                 case "flight.guidance_stop": return _flight.StopGuidance();
                 case "flight.guidance_status": return _flight.GuidanceStatus();
@@ -355,7 +359,7 @@ namespace KspMcp
             return new Dictionary<string, object>
             {
                 { "bridge", "ksp-mcp" },
-                { "bridge_version", "0.2.0" },
+                { "bridge_version", "0.2.1" },
                 { "scene", SceneName() },
                 { "endpoint", "http://" + _host + ":" + _port },
                 { "editor", _craft.Status() },
@@ -363,7 +367,7 @@ namespace KspMcp
                 { "capabilities", new Dictionary<string, object>
                     {
                         { "editor", new List<object> { "new", "snapshot", "apply", "add", "attach", "update", "remove", "stage", "action_group", "validate", "analyze", "save", "load", "launch", "job_status" } },
-                        { "flight", new List<object> { "state", "compact_telemetry", "guidance_start", "guidance_stop", "guidance_status", "stage", "controls", "sas", "rcs", "warp", "activate_part", "abort", "recover" } },
+                        { "flight", new List<object> { "state", "compact_telemetry", "bodies", "maneuver_nodes", "add_maneuver_node", "clear_maneuver_nodes", "guidance_start", "guidance_stop", "guidance_status", "stage", "controls", "sas", "rcs", "warp", "activate_part", "abort", "recover" } },
                         { "bridge", new List<object> { "telemetry", "batch" } }
                     }
                 }

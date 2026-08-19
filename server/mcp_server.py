@@ -10,6 +10,7 @@ from typing import Any, Callable
 
 from .bridge_client import BridgeClient, BridgeError
 from .craft_model import CraftValidationError, normalise_part_spec, validate_craft_document
+from .orbital import OrbitalPlanError, plan_circular_hohmann_transfer
 
 
 def _object_schema(properties: dict[str, Any] | None = None, required: list[str] | None = None) -> dict[str, Any]:
@@ -224,6 +225,45 @@ TOOLS: list[dict[str, Any]] = [
     ),
     _tool("ksp_flight_state", "Read active-vessel telemetry, resources, engines, current stage, controls, and orbital values."),
     _tool(
+        "ksp_flight_bodies",
+        "Read celestial-body radii, gravitational parameters, atmospheres, spheres of influence, and patched-conic orbit data from the running KSP instance.",
+        {"query": {"type": "string"}},
+    ),
+    _tool(
+        "ksp_flight_transfer_plan",
+        "Calculate a transparent circular-coplanar Hohmann estimate from the active vessel's body to a destination body. It is read-only and does not create or execute a burn.",
+        {
+            "destination_body": {"type": "string"},
+            "origin_body": {"type": "string"},
+            "parking_altitude_m": {"type": "number", "minimum": 0},
+            "target_altitude_m": {"type": "number", "minimum": 0},
+            "direction": {"type": "string", "enum": ["prograde"]},
+        },
+        ["destination_body"],
+    ),
+    _tool(
+        "ksp_flight_maneuver_nodes",
+        "Read native KSP patched-conic maneuver nodes, including node-coordinate delta-v, burn vector, timing, and next-patch orbit.",
+    ),
+    _tool(
+        "ksp_flight_add_maneuver_node",
+        "Create one native KSP patched-conic maneuver node after explicit confirmation. Delta-v uses radial-plus, normal-plus, prograde coordinates in m/s.",
+        {
+            "ut": {"type": "number", "minimum": 0},
+            "radial": {"type": "number"},
+            "normal": {"type": "number"},
+            "prograde": {"type": "number"},
+            "confirm": {"type": "boolean"},
+        },
+        ["confirm"],
+    ),
+    _tool(
+        "ksp_flight_clear_maneuver_nodes",
+        "Remove all native KSP maneuver nodes after explicit confirmation.",
+        {"confirm": {"type": "boolean"}},
+        ["confirm"],
+    ),
+    _tool(
         "ksp_flight_guidance_start",
         "Start a game-side closed-loop guidance plan. It continuously refreshes controls in KSP frames; confirm=true is required. Profiles are ascent, orbit, and landing.",
         {
@@ -390,6 +430,44 @@ class KspMcpApplication:
             return self.bridge.call("editor.launch", args)
         if name == "ksp_flight_state":
             return self.bridge.call("flight.state", {})
+        if name == "ksp_flight_bodies":
+            return self.bridge.call("flight.bodies", args)
+        if name == "ksp_flight_transfer_plan":
+            destination = args.get("destination_body")
+            if not isinstance(destination, str) or not destination.strip():
+                raise OrbitalPlanError("destination_body must be a non-empty body name")
+            batch = self.bridge.call_batch(
+                [
+                    {"command": "flight.state", "args": {}},
+                    {"command": "flight.bodies", "args": {"query": ""}},
+                ]
+            )
+            if not isinstance(batch, dict) or not isinstance(batch.get("results"), list) or len(batch["results"]) < 2:
+                raise OrbitalPlanError("the bridge returned no paired flight state/body data")
+            state_item, bodies_item = batch["results"][0], batch["results"][1]
+            if not isinstance(state_item, dict) or not state_item.get("ok"):
+                raise OrbitalPlanError("flight.state failed while preparing the transfer plan")
+            if not isinstance(bodies_item, dict) or not bodies_item.get("ok"):
+                raise OrbitalPlanError("flight.bodies failed while preparing the transfer plan")
+            return plan_circular_hohmann_transfer(
+                bodies_payload=bodies_item.get("result") or {},
+                flight_payload=state_item.get("result") or {},
+                destination_body=destination,
+                origin_body=args.get("origin_body"),
+                parking_altitude_m=float(args.get("parking_altitude_m", 80_000.0)),
+                target_altitude_m=float(args.get("target_altitude_m", 80_000.0)),
+                direction=str(args.get("direction", "prograde")),
+            )
+        if name == "ksp_flight_maneuver_nodes":
+            return self.bridge.call("flight.maneuver_nodes", {})
+        if name == "ksp_flight_add_maneuver_node":
+            if args.get("confirm") is not True:
+                raise ValueError("ksp_flight_add_maneuver_node requires confirm=true")
+            return self.bridge.call("flight.add_maneuver_node", args)
+        if name == "ksp_flight_clear_maneuver_nodes":
+            if args.get("confirm") is not True:
+                raise ValueError("ksp_flight_clear_maneuver_nodes requires confirm=true")
+            return self.bridge.call("flight.clear_maneuver_nodes", args)
         if name == "ksp_flight_guidance_start":
             return self.bridge.call("flight.guidance_start", args)
         if name == "ksp_flight_guidance_stop":
@@ -452,7 +530,7 @@ def handle_message(app: KspMcpApplication, message: dict[str, Any]) -> dict[str,
             {
                 "protocolVersion": str(params.get("protocolVersion", "2024-11-05")),
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "kerbal-space-program", "version": "0.2.0"},
+                "serverInfo": {"name": "kerbal-space-program", "version": "0.2.1"},
                 "instructions": (
                     "Use ksp_realtime_state for compact no-visual state. Build in VAB/SPH with "
                     "ksp_editor_new and live ksp_editor_apply_craft, then poll "

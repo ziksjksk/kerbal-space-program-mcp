@@ -257,6 +257,10 @@ namespace KspMcp
             {
                 ApplyLandingGuidance(state, vessel);
             }
+            else if (_guidance.Profile == "orbit")
+            {
+                ApplyOrbitGuidance(state, vessel);
+            }
             else
             {
                 ApplyAscentGuidance(state, vessel);
@@ -293,12 +297,87 @@ namespace KspMcp
             ApplyDirectionControl(state, vessel, target, throttle, targetPitch);
         }
 
+        private void ApplyOrbitGuidance(FlightCtrlState state, Vessel vessel)
+        {
+            double altitude = Math.Max(0d, vessel.altitude);
+            double apoapsis = vessel.orbit == null ? 0d : NumberMember(vessel.orbit, "ApA");
+            double periapsis = vessel.orbit == null ? -1d : NumberMember(vessel.orbit, "PeA");
+
+            // A vessel launched straight into the orbit profile should still
+            // receive the same safe gravity turn until KSP reports a useful
+            // bound orbit. Once Ap/Pe exist, this controller switches to
+            // burns at the appropriate apsis instead of repeating ascent.
+            if (vessel.orbit == null || altitude < 1000d || apoapsis < 1000d)
+            {
+                ApplyAscentGuidance(state, vessel);
+                if (_guidance != null) _guidance.Phase = "orbital_ascent";
+                return;
+            }
+
+            double targetApoapsis = _guidance.TargetApoapsis;
+            double targetPeriapsis = _guidance.TargetPeriapsis;
+            double apoapsisTolerance = Math.Max(250d, targetApoapsis * 0.01d);
+            double periapsisTolerance = Math.Max(250d, Math.Max(1d, targetPeriapsis) * 0.01d);
+            double timeToApoapsis = NumberMember(vessel.orbit, "timeToAp");
+            double timeToPeriapsis = NumberMember(vessel.orbit, "timeToPe");
+            Vector3d prograde = vessel.obt_velocity.sqrMagnitude > 0.01d
+                ? vessel.obt_velocity.normalized
+                : AscentTargetVector(vessel, 0d);
+            Vector3d retrograde = -prograde;
+            double throttle = 0d;
+            Vector3d target = prograde;
+            double targetPitch = 0d;
+
+            if (apoapsis < targetApoapsis - apoapsisTolerance)
+            {
+                double error = targetApoapsis - apoapsis;
+                throttle = ClampDouble(error / Math.Max(1000d, targetApoapsis * 0.25d), 0.15d, 1d);
+                target = AscentTargetVector(vessel, 5d);
+                targetPitch = 5d;
+                _guidance.Phase = "raise_apoapsis";
+            }
+            else if (periapsis < targetPeriapsis - periapsisTolerance)
+            {
+                if (timeToApoapsis > 15d)
+                {
+                    _guidance.Phase = "coast_to_circularisation";
+                }
+                else
+                {
+                    double error = targetPeriapsis - periapsis;
+                    throttle = ClampDouble(error / Math.Max(1000d, targetPeriapsis * 0.2d), 0.08d, 1d);
+                    _guidance.Phase = "raise_periapsis_at_apoapsis";
+                }
+            }
+            else if (periapsis > targetPeriapsis + periapsisTolerance)
+            {
+                if (timeToPeriapsis > 15d)
+                {
+                    target = retrograde;
+                    _guidance.Phase = "coast_to_lowering_burn";
+                }
+                else
+                {
+                    double error = periapsis - targetPeriapsis;
+                    throttle = ClampDouble(error / Math.Max(1000d, targetPeriapsis * 0.2d), 0.08d, 1d);
+                    target = retrograde;
+                    _guidance.Phase = "lower_periapsis_at_periapsis";
+                }
+            }
+            else
+            {
+                _guidance.Phase = "orbit_achieved";
+            }
+
+            ApplyDirectionControl(state, vessel, target, throttle, targetPitch);
+        }
+
         private void ApplyLandingGuidance(FlightCtrlState state, Vessel vessel)
         {
             double altitude = Math.Max(0d, vessel.terrainAltitude);
             double verticalSpeed = vessel.verticalSpeed;
             double surfaceSpeed = vessel.srfSpeed;
-            Vector3d velocity = vessel.obt_velocity;
+            Vector3d velocity = vessel.srf_velocity;
             Vector3d target = velocity.sqrMagnitude > 0.01d ? -velocity.normalized : SurfaceNormal(vessel);
             double desiredVerticalSpeed = altitude > 1000d ? -25d : (altitude > 200d ? -8d : -2d);
             double throttle = ClampDouble(0.5d + (desiredVerticalSpeed - verticalSpeed) * 0.035d, 0d, 1d);
@@ -504,6 +583,102 @@ namespace KspMcp
             throw new KspMcpException("warp_unavailable", "KSP TimeWarp.SetRate is not available", null);
         }
 
+        public Dictionary<string, object> Bodies(Dictionary<string, object> args)
+        {
+            string query = JsonUtil.String(args, "query", "").ToLowerInvariant();
+            var result = new List<object>();
+            if (FlightGlobals.Bodies != null)
+            {
+                foreach (CelestialBody body in FlightGlobals.Bodies)
+                {
+                    if (body == null) continue;
+                    string name = body.bodyName ?? "";
+                    if (query.Length > 0 && name.ToLowerInvariant().IndexOf(query, StringComparison.Ordinal) < 0) continue;
+                    result.Add(new Dictionary<string, object>
+                    {
+                        { "name", name },
+                        { "display_name", body.theName },
+                        { "radius_m", body.Radius },
+                        { "grav_parameter_m3_s2", body.gravParameter },
+                        { "sphere_of_influence_m", body.sphereOfInfluence },
+                        { "atmosphere", body.atmosphere },
+                        { "max_atmosphere_altitude_m", NumberMember(body, "atmosphereDepth") },
+                        { "ocean", body.ocean },
+                        { "reference_body", body.referenceBody == null ? null : body.referenceBody.bodyName },
+                        { "orbit", body.orbit == null ? null : OrbitSummary(body.orbit) }
+                    });
+                }
+            }
+            return new Dictionary<string, object> { { "count", result.Count }, { "bodies", result } };
+        }
+
+        public Dictionary<string, object> ManeuverNodes()
+        {
+            EnsureFlight();
+            Vessel vessel = FlightGlobals.ActiveVessel;
+            var nodes = new List<object>();
+            if (vessel.patchedConicSolver != null && vessel.patchedConicSolver.maneuverNodes != null)
+            {
+                foreach (ManeuverNode node in vessel.patchedConicSolver.maneuverNodes)
+                {
+                    if (node == null) continue;
+                    Vector3d deltaV = node.DeltaV;
+                    Vector3d burnVector = vessel.orbit == null ? deltaV : node.GetBurnVector(vessel.orbit);
+                    nodes.Add(new Dictionary<string, object>
+                    {
+                        { "ut", node.UT },
+                        { "eta", node.UT - Planetarium.GetUniversalTime() },
+                        { "radial_plus_mps", deltaV.x },
+                        { "normal_plus_mps", -deltaV.y },
+                        { "prograde_mps", deltaV.z },
+                        { "delta_v_mps", Math.Sqrt(deltaV.sqrMagnitude) },
+                        { "delta_v_node_coordinates", JsonUtil.Vector3dObject(deltaV) },
+                        { "burn_vector_world", JsonUtil.Vector3dObject(burnVector) },
+                        { "orbit_after", node.nextPatch == null ? null : OrbitSummary(node.nextPatch) }
+                    });
+                }
+            }
+            return new Dictionary<string, object> { { "count", nodes.Count }, { "nodes", nodes } };
+        }
+
+        public Dictionary<string, object> AddManeuverNode(Dictionary<string, object> args)
+        {
+            EnsureFlight();
+            if (!JsonUtil.Boolean(args, "confirm", false)) throw new KspMcpException("confirmation_required", "adding a maneuver node requires confirm=true", null);
+            Vessel vessel = FlightGlobals.ActiveVessel;
+            if (vessel.patchedConicSolver == null) throw new KspMcpException("maneuver_unavailable", "active vessel has no patched conic solver", null);
+            double defaultUt = Planetarium.GetUniversalTime() + (vessel.orbit == null ? 60d : Math.Max(1d, vessel.orbit.timeToAp));
+            double ut = Math.Max(Planetarium.GetUniversalTime() + 0.1d, JsonUtil.Number(args, "ut", defaultUt));
+            double radial = JsonUtil.Number(args, "radial", 0d);
+            double normalPlus = JsonUtil.Number(args, "normal", 0d);
+            double prograde = JsonUtil.Number(args, "prograde", 0d);
+            ManeuverNode node = vessel.patchedConicSolver.AddManeuverNode(ut);
+            if (node == null) throw new KspMcpException("maneuver_failed", "KSP did not return a maneuver node", null);
+            node.OnGizmoUpdated(new Vector3d(radial, -normalPlus, prograde), ut);
+            KspMcpBridge bridge = KspMcpBridge.Instance;
+            if (bridge != null) bridge.RecordEvent("flight.maneuver_node.added", new Dictionary<string, object> { { "ut", ut }, { "prograde", prograde }, { "normal", normalPlus }, { "radial", radial } });
+            return new Dictionary<string, object> { { "added", true }, { "node", ManeuverNodes() } };
+        }
+
+        public Dictionary<string, object> ClearManeuverNodes(Dictionary<string, object> args)
+        {
+            EnsureFlight();
+            if (!JsonUtil.Boolean(args, "confirm", false)) throw new KspMcpException("confirmation_required", "clearing maneuver nodes requires confirm=true", null);
+            Vessel vessel = FlightGlobals.ActiveVessel;
+            int count = 0;
+            if (vessel.patchedConicSolver != null && vessel.patchedConicSolver.maneuverNodes != null)
+            {
+                var nodes = new List<ManeuverNode>(vessel.patchedConicSolver.maneuverNodes);
+                foreach (ManeuverNode node in nodes)
+                {
+                    if (node == null) continue;
+                    try { vessel.patchedConicSolver.RemoveManeuverNode(node); } catch (Exception) { try { node.RemoveSelf(); } catch (Exception) { } }
+                    count++;
+                }
+            }
+            return new Dictionary<string, object> { { "cleared", count }, { "nodes", ManeuverNodes() } };
+        }
+
         public Dictionary<string, object> ActivatePart(Dictionary<string, object> args)
         {
             EnsureFlight();
@@ -682,6 +857,7 @@ namespace KspMcp
                 { "vessel_id", vessel.id.ToString() },
                 { "active", vessel.isActiveVessel },
                 { "loaded", vessel.loaded },
+                { "universal_time", Planetarium.GetUniversalTime() },
                 { "commandable", vessel.isCommandable },
                 { "situation", vessel.situation.ToString() },
                 { "body", vessel.mainBody == null ? null : vessel.mainBody.bodyName },
@@ -860,6 +1036,26 @@ namespace KspMcp
                 { "gear_up", state.gearUp },
                 { "gear_down", state.gearDown },
                 { "lights", state.headlight }
+            };
+        }
+
+        private static Dictionary<string, object> OrbitSummary(Orbit orbit)
+        {
+            if (orbit == null) return null;
+            return new Dictionary<string, object>
+            {
+                { "reference_body", orbit.referenceBody == null ? null : orbit.referenceBody.bodyName },
+                { "semi_major_axis_m", NumberMember(orbit, "semiMajorAxis") },
+                { "apoapsis_m", NumberMember(orbit, "ApA") },
+                { "periapsis_m", NumberMember(orbit, "PeA") },
+                { "eccentricity", NumberMember(orbit, "eccentricity") },
+                { "inclination_deg", NumberMember(orbit, "inclination") },
+                { "longitude_of_ascending_node_deg", NumberMember(orbit, "LAN") },
+                { "argument_of_periapsis_deg", NumberMember(orbit, "argumentOfPeriapsis") },
+                { "period_s", NumberMember(orbit, "period") },
+                { "epoch_ut", NumberMember(orbit, "epoch") },
+                { "time_to_apoapsis_s", NumberMember(orbit, "timeToAp") },
+                { "time_to_periapsis_s", NumberMember(orbit, "timeToPe") }
             };
         }
 
