@@ -60,6 +60,22 @@ class TransferBridge(FakeBridge):
         }
 
 
+class EventBridge(FakeBridge):
+    def __init__(self):
+        self.calls = 0
+
+    def telemetry(self, **kwargs):
+        self.calls += 1
+        return {
+            "sequence": self.calls,
+            "event_cursor": 1 if self.calls > 1 else 0,
+            "oldest_event_cursor": 1,
+            "events_lost": 0,
+            "events": [] if self.calls == 1 else [{"event_id": 1, "type": "flight.liftoff"}],
+            "kwargs": kwargs,
+        }
+
+
 class McpProtocolTests(unittest.TestCase):
     def setUp(self):
         self.app = KspMcpApplication(FakeBridge())
@@ -82,6 +98,7 @@ class McpProtocolTests(unittest.TestCase):
         self.assertIn("ksp_editor_apply_craft", names)
         self.assertIn("ksp_flight_set_controls", names)
         self.assertIn("ksp_realtime_state", names)
+        self.assertIn("ksp_wait_for_event", names)
         self.assertIn("ksp_editor_job_status", names)
         self.assertIn("ksp_editor_cancel_job", names)
         self.assertIn("ksp_flight_guidance_start", names)
@@ -111,6 +128,13 @@ class McpProtocolTests(unittest.TestCase):
         self.assertEqual(result["max_samples"], 2)
         self.assertEqual(result["event_limit"], 256)
 
+    def test_wait_for_event_returns_when_cursor_advances(self):
+        app = KspMcpApplication(EventBridge())
+        result = app.call_tool("ksp_wait_for_event", {"since": 0, "timeout": 0.2, "limit": 8})
+        self.assertTrue(result["triggered"])
+        self.assertFalse(result["timed_out"])
+        self.assertEqual(result["state"]["event_cursor"], 1)
+
     def test_live_craft_defaults_to_frame_sliced_job(self):
         response = handle_message(
             self.app,
@@ -133,7 +157,7 @@ class McpProtocolTests(unittest.TestCase):
             self.app,
             {"jsonrpc": "2.0", "id": 12, "method": "initialize", "params": {}},
         )
-        self.assertEqual(response["result"]["serverInfo"]["version"], "0.2.7")
+        self.assertEqual(response["result"]["serverInfo"]["version"], "0.2.8")
 
     def test_live_build_can_be_cancelled(self):
         response = handle_message(

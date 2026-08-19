@@ -1,4 +1,4 @@
-"jh®Ğ¥‹¥Rw±¥ç-y×§v‡ßŠW¡jÊrêëyÔáyú%–Œ"¥zg§¶Æ«zz-rZ,yĞÂLæãpÂLæãpÂLæã9¸ì.)ŞëN©¢È­Š‰ú"{Ú–'N¥êÚ¶*'"w^ÆŠ^­«b¢wÚŠW¶š®¶²Šw^ÅëÚ–æ­yÛhée"{Ú–'N¥êÚ¶*'"w^ÆŠ^­«b¢wÚŠW¶š®¶²Šw^ÅëÚ–æ­yÛhéeusing System;
+using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Net;
@@ -373,7 +373,7 @@ namespace KspMcp
             return new Dictionary<string, object>
             {
                 { "bridge", "ksp-mcp" },
-                { "bridge_version", "0.2.7" },
+                { "bridge_version", "0.2.8" },
                 { "scene", SceneName() },
                 { "endpoint", "http://" + _host + ":" + _port },
                 { "verbose_logging", _verboseLogging },
@@ -443,7 +443,7 @@ namespace KspMcp
             _telemetryCache = new Dictionary<string, object>
             {
                 { "sequence", _telemetrySequence },
-                { "bridge_version", "0.2.7" },
+                { "bridge_version", "0.2.8" },
                 { "captured_at", SafeUniversalTime() },
                 { "scene", SceneName() },
                 { "editor", _craft.CompactStatus() },

@@ -7,7 +7,7 @@
 
 建造链路支持从空白编辑器开始创建火箭，也支持一次性提交完整的部件树；粒度较细的工具可以继续增删零件、移动/旋转、重新连接、设置阶段和动作组。飞行链路支持发射后的状态读取、油门和姿态控制、SAS/RCS、分级、时间加速、单部件动作、紧急中止和回收。
 
-0.2.7 在 0.2.6 的低延迟 HTTP 复用、紧凑遥测和事件游标、单往返批处理、分帧异步建造、真实零件性能分析、星体模型、原生轨道节点和有限燃烧控制之上，进一步提高无视觉实时性：建造期间跳过重复部件表扫描、资源/发动机摘要低频缓存、`ksp_watch` 有界采样，并保留默认 20 Hz 的位置和事件遥测；同时扩大事件缓冲、报告丢失游标、提高 watch 的事件窗口，新增发动机状态/点火、升空、着陆和失去控制能力事件；自动分级现在区分真实燃烧、未来级启用、纯分离级和空阶段，转移规划还会核对加载轨道的当前相位误差。无视觉模型可以通过事件游标观察“哪个零件刚生成、何时点火、何时分级、何时升空、当前是否进入燃烧/着陆阶段”，用户仍能在 KSP 中看到部件逐帧出现。
+0.2.8 在 0.2.7 的低延迟 HTTP 复用、紧凑遥测和事件游标、单往返批处理、分帧异步建造、真实零件性能分析、星体模型、原生轨道节点和有限燃烧控制之上，进一步提高无视觉实时性：建造期间跳过重复部件表扫描、资源/发动机摘要低频缓存、`ksp_watch` 有界采样，并保留默认 20 Hz 的位置和事件遥测；同时扩大事件缓冲、报告丢失游标、提高 watch 的事件窗口，新增 `ksp_wait_for_event` 低延迟等待工具，以及发动机状态/点火、升空、着陆和失去控制能力事件；自动分级现在区分真实燃烧、未来级启用、纯分离级和空阶段，转移规划还会核对加载轨道的当前相位误差。无视觉模型可以通过事件游标观察“哪个零件刚生成、何时点火、何时分级、何时升空、当前是否进入燃烧/着陆阶段”，用户仍能在 KSP 中看到部件逐帧出现。
 
 当前目标平台是 KSP 1.12.x（KSP 1.x 的 `Assembly-CSharp.dll` API）。KSP 2 使用另一套 API，不能直接使用这个插件。
 
@@ -80,7 +80,7 @@ python -m server
 2. 调用 `ksp_parts_list` 查看当前游戏实例实际加载的零件名称和连接节点。
 3. 调用 `ksp_editor_new` 清空编辑器。
 4. 用 `ksp_editor_apply_craft` 提交完整部件树。MCP 默认使用分帧 live 模式，立即返回 `job_id`，默认每个 Unity 帧生成 8 个部件；需要更明显的逐件展示时传 `parts_per_frame=1`，需要更快完成时可以提高到 12 或 16。每个部件会通过 `editor.build.part_added` 事件进入实时事件游标。
-5. 用 `ksp_editor_job_status` 和 `ksp_realtime_state` 读取 `completed/total`、事件和当前部件数，直到任务进入 `completed`。
+5. 用 `ksp_editor_job_status` 读取 `completed/total`，并把最近的 `event_cursor` 交给 `ksp_wait_for_event`；事件一到就用 `ksp_realtime_state` 读取增量事件和当前部件数，直到任务进入 `completed`。
 6. 调用 `ksp_editor_analyze` 读取真实零件质量、推力、TWR、近似 Δv、质心/推力中心和分级风险。
 7. 用 `ksp_editor_validate` 检查控制核心、发动机、连接关系、阶段和成本，再用 `ksp_editor_save` 保存 `.craft` 文件。
 8. 用户明确允许后，才调用 `ksp_editor_launch`。
@@ -93,6 +93,8 @@ VAB 中插件会把生成的根零件自动放到安全高度（默认 `y=50`）
 
 `ksp_realtime_state` 返回缓存的紧凑状态，避免每次读取都序列化完整部件树。它包含场景、建造任务、当前飞船、位置/速度、海拔、地形高度、垂直速度、质量、级号、姿态、轨道根数和 MCP 控制租约；`events` 使用单调递增的 `event_cursor`，模型可以把上次游标传入 `since`，只接收增量事件。
 
+`ksp_wait_for_event` 是低延迟的事件等待接口：模型传入上一次的 `since` 游标，工具在 MCP 侧以很短的轮询间隔等待游标推进，收到部件生成、点火、分级、升空、远点、近点或着陆事件后立即返回；没有事件才会等到超时。它不会阻塞 KSP Unity 主线程，适合在实时飞行控制循环中替代较长的固定时间 `ksp_watch`。
+
 `ksp_watch` 会在一个有界时间段内连续采样这些状态，适合无视觉模型观察“部件逐个出现、加载稳定、发射、点火、分级、远点/近点变化和着陆”。为避免一次 MCP 响应积累几千个样本拖慢模型，`ksp_watch` 默认最多返回 120 个样本，也可传 `max_samples`（1–240）调整；`event_limit` 默认 256，用于覆盖高速分帧建造的一整个轮询窗口。遥测还会返回 `oldest_event_cursor` 和 `events_lost`，如果客户端轮询太慢，模型可以发现事件游标已经落后，而不是把不完整历史误认为完整过程。`ksp_batch` 把多个安全命令放在一次 HTTP 往返里；发射、Abort 和回收仍必须使用各自的确认工具，不能隐藏在批处理中。
 
 `ksp_realtime_state` 的摘要是轻量的：编辑器只返回当前部件数、任务进度和事件；飞行侧返回位置/速度、轨道根数、阶段、指导阶段、发动机点火/故障汇总和资源总量，不遍历完整部件树。默认遥测间隔为 50 ms，可在 `GameData/KspMcp/PluginData/config.cfg` 用 `telemetryIntervalMs` 调整（25–1000）；要检查连接节点、模块、资源和详细验证结果时再调用 `ksp_editor_get_craft`、`ksp_editor_validate` 或 `ksp_editor_analyze`。如果需要排查游戏侧问题，可以临时设置 `verboseLogging = true`，正常使用应保持 `false`。
@@ -102,6 +104,7 @@ VAB 中插件会把生成的根零件自动放到安全高度（默认 `y=50`）
 ```text
 ksp_editor_apply_craft(...)
   -> ksp_editor_job_status(job_id)
+  -> ksp_wait_for_event(since=event_cursor)
   -> ksp_realtime_state(since=event_cursor)
   -> ksp_editor_analyze()
   -> ksp_editor_validate()
@@ -131,7 +134,7 @@ ksp_editor_apply_craft(...)
 - `stage 0` 可以作为最终载荷/分离动作，因此允许没有发动机；但 `stage > 0` 如果含有分离器却没有后续发动机，会被拒绝。
 - KSP 原生对舱体、适配器和油箱等被动零件使用 `inverseStage=-1` 是正常状态，不会被误判成非法分级；真正带发动机或分离动作的零件仍必须有有效阶段号。
 
-推荐的两级大型火箭参考结构采用：Mk1 指令舱、上级 Mainsail、下级 Mammoth、两组燃料箱和两个分离器。重新安装 0.2.7 后应先通过 `ksp_editor_validate`、`ksp_editor_analyze` 和 `ksp_realtime_state` 做游戏内烟测；当前工作区的运行实例仍是旧版桥，因此这里不把尚未重新验证的游戏内点火/分离结果写成已实测事实。
+推荐的两级大型火箭参考结构采用：Mk1 指令舱、上级 Mainsail、下级 Mammoth、两组燃料箱和两个分离器。重新安装 0.2.8 后应先通过 `ksp_editor_validate`、`ksp_editor_analyze`、`ksp_wait_for_event` 和 `ksp_realtime_state` 做游戏内烟测；当前工作区的运行实例仍是旧版桥，因此这里不把尚未重新验证的游戏内点火/分离结果写成已实测事实。
 
 完整部件格式如下：
 
