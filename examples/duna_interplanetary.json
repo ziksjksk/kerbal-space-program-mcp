@@ -1,0 +1,137 @@
+{
+  "name": "MCP Duna Interplanetary Expedition",
+  "description": "A stock KSP 1.12.x three-stage reference vehicle for a Kerbin launch, Duna transfer, and powered terminal descent. The MCP must still inspect the live parts catalog and run in-game validation before launch.",
+  "editor_mode": "VAB",
+  "mission": {
+    "destination": "Duna",
+    "architecture": "core launch stage -> nuclear transfer stage -> powered terminal descent stage",
+    "staging_order": [
+      "stage 2: Size3 core engine and tanks",
+      "stage 1: transfer decoupler and nuclear engine",
+      "stage 0: terminal descent engine and command pod"
+    ],
+    "required_runtime_checks": [
+      "ksp_parts_list",
+      "ksp_editor_validate",
+      "ksp_editor_analyze",
+      "ksp_flight_guidance_start"
+    ]
+  },
+  "parts": [
+    {
+      "id": "command-pod",
+      "part": "mk1pod.v2",
+      "position": [0, 50, 0],
+      "rotation": [0, 0, 0, 1],
+      "stage": 0
+    },
+    {
+      "id": "payload-adapter",
+      "part": "adapterSize2-Size1",
+      "parent_id": "command-pod",
+      "parent_attach_node": "bottom",
+      "attach_node": "top",
+      "snap_to_node": true,
+      "stage": 0
+    },
+    {
+      "id": "descent-tank",
+      "part": "Rockomax8BW",
+      "parent_id": "payload-adapter",
+      "parent_attach_node": "bottom",
+      "attach_node": "top",
+      "snap_to_node": true,
+      "stage": 0
+    },
+    {
+      "id": "descent-engine",
+      "part": "liquidEngine2-2.v2",
+      "parent_id": "descent-tank",
+      "parent_attach_node": "bottom",
+      "attach_node": "top",
+      "snap_to_node": true,
+      "stage": 0
+    },
+    {
+      "id": "transfer-separator-top",
+      "part": "Decoupler.2",
+      "parent_id": "descent-engine",
+      "parent_attach_node": "bottom",
+      "attach_node": "top",
+      "snap_to_node": true,
+      "stage": 0
+    },
+    {
+      "id": "transfer-tank-upper",
+      "part": "Rockomax64.BW",
+      "parent_id": "transfer-separator-top",
+      "parent_attach_node": "bottom",
+      "attach_node": "top",
+      "snap_to_node": true,
+      "stage": 1
+    },
+    {
+      "id": "transfer-tank-lower",
+      "part": "Rockomax64.BW",
+      "parent_id": "transfer-tank-upper",
+      "parent_attach_node": "bottom",
+      "attach_node": "top",
+      "snap_to_node": true,
+      "stage": 1
+    },
+    {
+      "id": "transfer-engine",
+      "part": "nuclearEngine",
+      "parent_id": "transfer-tank-lower",
+      "parent_attach_node": "bottom",
+      "attach_node": "top",
+      "snap_to_node": true,
+      "stage": 1
+    },
+    {
+      "id": "core-separator",
+      "part": "Decoupler.2",
+      "parent_id": "transfer-engine",
+      "parent_attach_node": "bottom",
+      "attach_node": "top",
+      "snap_to_node": true,
+      "stage": 1
+    },
+    {
+      "id": "core-adapter",
+      "part": "Size3To2Adapter.v2",
+      "parent_id": "core-separator",
+      "parent_attach_node": "bottom",
+      "attach_node": "top",
+      "snap_to_node": true,
+      "stage": 2
+    },
+    {
+      "id": "core-tank-upper",
+      "part": "Size3LargeTank",
+      "parent_id": "core-adapter",
+      "parent_attach_node": "bottom",
+      "attach_node": "top",
+      "snap_to_node": true,
+      "stage": 2
+    },
+    {
+      "id": "core-tank-lower",
+      "part": "Size3LargeTank",
+      "parent_id": "core-tank-upper",
+      "parent_attach_node": "bottom",
+      "attach_node": "top",
+      "snap_to_node": true,
+      "stage": 2
+    },
+    {
+      "id": "core-engine",
+      "part": "Size3EngineCluster",
+      "parent_id": "core-tank-lower",
+      "parent_attach_node": "bottom",
+      "attach_node": "top",
+      "snap_to_node": true,
+      "stage": 2
+    }
+  ]
+}

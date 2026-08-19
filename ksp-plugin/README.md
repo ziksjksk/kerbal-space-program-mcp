@@ -68,6 +68,8 @@ GET http://127.0.0.1:8765/api/v1/telemetry?since=0&limit=256&include_events=true
 
 `editor.launch`、`flight.abort` 和 `flight.recover` 被明确禁止放入批处理，必须走各自的确认接口。
 
+零件解析会优先使用 KSP 的运行时名称，并兼容配置文件常见的点号/下划线差异（例如 `liquidEngine2-2.v2` 与 `liquidEngine2-2_v2`）。仍然建议先调用 `parts.list`，把当前实例实际返回的名称和连接节点作为建造输入。
+
 ### 分帧建造
 
 `editor.apply_craft` 可以传 `live=true` 和 `parts_per_frame`（1–16）。默认每个 Unity 帧生成 12 个部件；插件会返回 `job_id`，在后续 Unity 帧中逐个或按小批次生成部件，并为每个部件发出 `editor.build.part_added` 事件；用下面的命令读取进度：

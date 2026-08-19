@@ -1845,22 +1845,54 @@ namespace KspMcp
 
         private static AvailablePart ResolveAvailablePart(string name)
         {
+            var candidates = new List<string>();
+            AddPartNameCandidate(candidates, name);
+            if (!string.IsNullOrEmpty(name))
+            {
+                AddPartNameCandidate(candidates, name.Replace('.', '_'));
+                AddPartNameCandidate(candidates, name.Replace('_', '.'));
+            }
+
+            MethodInfo method = null;
             try
             {
-                MethodInfo method = typeof(PartLoader).GetMethod("getPartInfoByName", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static);
-                if (method != null)
-                {
-                    AvailablePart result = method.Invoke(null, new object[] { name }) as AvailablePart;
-                    if (result != null) return result;
-                }
+                method = typeof(PartLoader).GetMethod("getPartInfoByName", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static);
             }
             catch (Exception) { }
+            if (method != null)
+            {
+                foreach (string candidate in candidates)
+                {
+                    try
+                    {
+                        AvailablePart result = method.Invoke(null, new object[] { candidate }) as AvailablePart;
+                        if (result != null) return result;
+                    }
+                    catch (Exception) { }
+                }
+            }
 
             foreach (AvailablePart part in LoadedParts())
             {
-                if (part != null && string.Equals(part.name, name, StringComparison.OrdinalIgnoreCase)) return part;
+                if (part == null) continue;
+                foreach (string candidate in candidates)
+                {
+                    if (string.Equals(part.name, candidate, StringComparison.OrdinalIgnoreCase)) return part;
+                }
+                if (string.Equals(NormalizePartName(part.name), NormalizePartName(name), StringComparison.Ordinal)) return part;
             }
             return null;
+        }
+
+        private static void AddPartNameCandidate(List<string> candidates, string value)
+        {
+            if (string.IsNullOrEmpty(value)) return;
+            if (!candidates.Contains(value)) candidates.Add(value);
+        }
+
+        private static string NormalizePartName(string value)
+        {
+            return (value ?? "").Trim().Replace('_', '.').ToLowerInvariant();
         }
 
         private static List<AvailablePart> LoadedParts()
