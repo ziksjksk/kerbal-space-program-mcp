@@ -38,6 +38,13 @@ namespace KspMcp
             public double TargetApoapsis;
             public double TargetPeriapsis;
             public double TargetAltitude;
+            public double TargetLatitude;
+            public double TargetLongitude;
+            public bool HasLandingTarget;
+            public double GearDeployAltitude;
+            public bool DeployGear;
+            public bool GearCommanded;
+            public bool TouchdownRecorded;
             public double StartedAt;
             public double EndsAt;
             public bool AutoStage;
@@ -52,7 +59,16 @@ namespace KspMcp
             public double BurnDuration;
             public double BurnThrottle;
             public double BurnDeltaV;
+            public double BurnStartAt;
+            public double BurnEndAt;
+            public double LastAlignmentErrorDegrees;
+            public bool BurnIgnitionRecorded;
             public bool BurnCompletionRecorded;
+            public double LastAvailableThrust;
+            public double LastTwr;
+            public double LastStoppingDistance;
+            public double LastTargetDistance;
+            public double LastTargetHorizontalSpeed;
             public Dictionary<string, object> Preflight;
         }
 
@@ -318,6 +334,12 @@ namespace KspMcp
                 string.Equals(previousSituation, "SPLASHED", StringComparison.OrdinalIgnoreCase);
             if (touchdown && !wasTouchdown && previousSituation != null)
             {
+                if (_guidance != null && _guidance.Profile == "landing")
+                {
+                    _guidance.Phase = "touchdown";
+                    _guidance.LastThrottle = 0d;
+                    _guidance.TouchdownRecorded = true;
+                }
                 bridge.RecordEvent("flight.touchdown", new Dictionary<string, object>
                 {
                     { "vessel_id", vesselId },
@@ -325,7 +347,8 @@ namespace KspMcp
                     { "to", situation },
                     { "terrain_altitude", vessel.terrainAltitude },
                     { "vertical_speed", vessel.verticalSpeed },
-                    { "surface_speed", vessel.srfSpeed }
+                    { "surface_speed", vessel.srfSpeed },
+                    { "guidance_profile", _guidance == null ? null : _guidance.Profile }
                 });
             }
 
@@ -438,6 +461,17 @@ namespace KspMcp
                 throw new KspMcpException("invalid_guidance_profile", "supported profiles are ascent, orbit, landing, and node_burn", profile);
             }
             Dictionary<string, object> preflight = GuidancePreflight(profile);
+            bool hasLandingTarget = JsonUtil.Has(args, "target_latitude") || JsonUtil.Has(args, "target_longitude");
+            if (hasLandingTarget && profile != "landing")
+            {
+                throw new KspMcpException("invalid_guidance_target", "target_latitude/target_longitude are only valid for landing guidance", null);
+            }
+            double targetLatitude = JsonUtil.Number(args, "target_latitude", 0d);
+            double targetLongitude = JsonUtil.Number(args, "target_longitude", 0d);
+            if (hasLandingTarget && (targetLatitude < -90d || targetLatitude > 90d || targetLongitude < -180d || targetLongitude > 180d))
+            {
+                throw new KspMcpException("invalid_guidance_target", "landing target latitude must be -90..90 and longitude must be -180..180", null);
+            }
             double now = Planetarium.GetUniversalTime();
             double maxSeconds = Math.Max(5d, Math.Min(3600d, JsonUtil.Number(args, "max_seconds", profile == "landing" || profile == "node_burn" ? 600d : 240d)));
             _guidance = new GuidancePlan
@@ -446,12 +480,22 @@ namespace KspMcp
                 TargetApoapsis = Math.Max(1000d, JsonUtil.Number(args, "target_apoapsis", 80000d)),
                 TargetPeriapsis = JsonUtil.Number(args, "target_periapsis", 75000d),
                 TargetAltitude = Math.Max(10d, JsonUtil.Number(args, "target_altitude", 0d)),
+                TargetLatitude = targetLatitude,
+                TargetLongitude = targetLongitude,
+                HasLandingTarget = hasLandingTarget,
+                GearDeployAltitude = Math.Max(100d, Math.Min(10000d, JsonUtil.Number(args, "gear_deploy_altitude", 2500d))),
+                DeployGear = JsonUtil.Boolean(args, "deploy_gear", profile == "landing"),
+                GearCommanded = false,
+                TouchdownRecorded = false,
                 StartedAt = now,
                 EndsAt = now + maxSeconds,
                 AutoStage = JsonUtil.Boolean(args, "auto_stage", true),
                 Phase = "initialising",
                 LastError = null,
                 BurnCompletionRecorded = false,
+                BurnIgnitionRecorded = false,
+                LastAvailableThrust = JsonUtil.Number(preflight, "available_thrust_kN", 0d),
+                LastTwr = JsonUtil.Number(preflight, "twr", 0d),
                 Preflight = preflight
             };
             try
@@ -527,7 +571,8 @@ namespace KspMcp
                 { "twr", twr },
                 { "current_stage", vessel.currentStage },
                 { "next_stage", Math.Max(0, vessel.currentStage - 1) },
-                { "engine_count", engines["count"] }
+                { "engine_count", engines["count"] },
+                { "stage_report", GuidanceStageReport(vessel) }
             };
         }
 
@@ -538,6 +583,70 @@ namespace KspMcp
             _lease.Clear();
             _leaseUntil = 0d;
             return new Dictionary<string, object> { { "stopped", wasActive }, { "guidance", GuidanceStatus() } };
+        }
+
+        public Dictionary<string, object> UpdateGuidance(Dictionary<string, object> args)
+        {
+            EnsureFlight();
+            if (_guidance == null) throw new KspMcpException("guidance_inactive", "there is no active guidance plan to update", null);
+
+            if (JsonUtil.Has(args, "target_apoapsis"))
+            {
+                _guidance.TargetApoapsis = Math.Max(1000d, JsonUtil.Number(args, "target_apoapsis", _guidance.TargetApoapsis));
+            }
+            if (JsonUtil.Has(args, "target_periapsis"))
+            {
+                _guidance.TargetPeriapsis = JsonUtil.Number(args, "target_periapsis", _guidance.TargetPeriapsis);
+            }
+            if (JsonUtil.Has(args, "target_altitude"))
+            {
+                _guidance.TargetAltitude = Math.Max(10d, JsonUtil.Number(args, "target_altitude", _guidance.TargetAltitude));
+            }
+            if (JsonUtil.Has(args, "auto_stage"))
+            {
+                _guidance.AutoStage = JsonUtil.Boolean(args, "auto_stage", _guidance.AutoStage);
+            }
+            if (JsonUtil.Has(args, "deploy_gear"))
+            {
+                _guidance.DeployGear = JsonUtil.Boolean(args, "deploy_gear", _guidance.DeployGear);
+            }
+            if (JsonUtil.Has(args, "gear_deploy_altitude"))
+            {
+                _guidance.GearDeployAltitude = Math.Max(100d, Math.Min(10000d, JsonUtil.Number(args, "gear_deploy_altitude", _guidance.GearDeployAltitude)));
+            }
+            if (JsonUtil.Has(args, "target_latitude") || JsonUtil.Has(args, "target_longitude"))
+            {
+                if (_guidance.Profile != "landing") throw new KspMcpException("invalid_guidance_target", "landing coordinates can only update a landing plan", null);
+                double latitude = JsonUtil.Number(args, "target_latitude", _guidance.TargetLatitude);
+                double longitude = JsonUtil.Number(args, "target_longitude", _guidance.TargetLongitude);
+                if (latitude < -90d || latitude > 90d || longitude < -180d || longitude > 180d)
+                {
+                    throw new KspMcpException("invalid_guidance_target", "landing target latitude must be -90..90 and longitude must be -180..180", null);
+                }
+                _guidance.TargetLatitude = latitude;
+                _guidance.TargetLongitude = longitude;
+                _guidance.HasLandingTarget = true;
+            }
+            if (JsonUtil.Has(args, "extend_seconds"))
+            {
+                double extension = Math.Max(0d, Math.Min(3600d, JsonUtil.Number(args, "extend_seconds", 0d)));
+                _guidance.EndsAt = Math.Min(_guidance.StartedAt + 7200d, _guidance.EndsAt + extension);
+            }
+
+            KspMcpBridge bridge = KspMcpBridge.Instance;
+            if (bridge != null) bridge.RecordEvent("flight.guidance.updated", new Dictionary<string, object>
+            {
+                { "profile", _guidance.Profile },
+                { "target_apoapsis", _guidance.TargetApoapsis },
+                { "target_periapsis", _guidance.TargetPeriapsis },
+                { "target_altitude", _guidance.TargetAltitude },
+                { "has_landing_target", _guidance.HasLandingTarget },
+                { "target_latitude", _guidance.HasLandingTarget ? (object)_guidance.TargetLatitude : null },
+                { "target_longitude", _guidance.HasLandingTarget ? (object)_guidance.TargetLongitude : null },
+                { "auto_stage", _guidance.AutoStage },
+                { "deploy_gear", _guidance.DeployGear }
+            });
+            return GuidanceStatus();
         }
 
         public Dictionary<string, object> GuidanceStatus()
@@ -552,6 +661,13 @@ namespace KspMcp
                 { "target_apoapsis", _guidance.TargetApoapsis },
                 { "target_periapsis", _guidance.TargetPeriapsis },
                 { "target_altitude", _guidance.TargetAltitude },
+                { "target_latitude", _guidance.HasLandingTarget ? (object)_guidance.TargetLatitude : null },
+                { "target_longitude", _guidance.HasLandingTarget ? (object)_guidance.TargetLongitude : null },
+                { "has_landing_target", _guidance.HasLandingTarget },
+                { "deploy_gear", _guidance.DeployGear },
+                { "gear_deploy_altitude", _guidance.GearDeployAltitude },
+                { "gear_commanded", _guidance.GearCommanded },
+                { "touchdown_recorded", _guidance.TouchdownRecorded },
                 { "auto_stage", _guidance.AutoStage },
                 { "seconds_remaining", Math.Max(0d, _guidance.EndsAt - now) },
                 { "last_throttle", _guidance.LastThrottle },
@@ -563,6 +679,15 @@ namespace KspMcp
                 { "burn_duration", _guidance.BurnDuration },
                 { "burn_throttle", _guidance.BurnThrottle },
                 { "burn_delta_v", _guidance.BurnDeltaV },
+                { "burn_start_ut", _guidance.BurnStartAt },
+                { "burn_end_ut", _guidance.BurnEndAt },
+                { "burn_alignment_error_degrees", _guidance.LastAlignmentErrorDegrees },
+                { "burn_ignition_recorded", _guidance.BurnIgnitionRecorded },
+                { "available_thrust_kN", _guidance.LastAvailableThrust },
+                { "twr", _guidance.LastTwr },
+                { "stopping_distance_m", _guidance.LastStoppingDistance },
+                { "target_distance_m", _guidance.LastTargetDistance },
+                { "target_horizontal_speed_mps", _guidance.LastTargetHorizontalSpeed },
                 { "last_error", _guidance.LastError },
                 { "preflight", _guidance.Preflight }
             };
@@ -663,6 +788,8 @@ namespace KspMcp
             _guidance.BurnDuration = duration;
             _guidance.BurnThrottle = throttle;
             _guidance.BurnDeltaV = deltaV;
+            _guidance.BurnStartAt = node.UT - duration * 0.5d;
+            _guidance.BurnEndAt = node.UT + duration * 0.5d;
             _guidance.AutoStage = false;
             _guidance.Phase = "coast_to_node_burn";
             KspMcpBridge bridge = KspMcpBridge.Instance;
@@ -697,17 +824,40 @@ namespace KspMcp
                 return;
             }
             double now = Planetarium.GetUniversalTime();
-            double start = _guidance.BurnUt - _guidance.BurnDuration * 0.5d;
-            double end = _guidance.BurnUt + _guidance.BurnDuration * 0.5d;
+            double start = _guidance.BurnStartAt > 0d ? _guidance.BurnStartAt : _guidance.BurnUt - _guidance.BurnDuration * 0.5d;
+            double end = _guidance.BurnEndAt > 0d ? _guidance.BurnEndAt : _guidance.BurnUt + _guidance.BurnDuration * 0.5d;
             double throttle = 0d;
+            _guidance.LastAlignmentErrorDegrees = DirectionErrorDegrees(vessel, burnVector);
             if (now < start)
             {
                 _guidance.Phase = "aligning_for_node_burn";
             }
             else if (now <= end)
             {
-                throttle = _guidance.BurnThrottle;
-                _guidance.Phase = "burning_node";
+                // Do not spend a finite burn while the vehicle is still
+                // pointing away from the requested vector. The window is
+                // extended by the small amount of time spent aligning, so a
+                // slow reaction wheel does not silently turn a correct node
+                // into a large off-axis impulse.
+                if (_guidance.LastAlignmentErrorDegrees > 8d)
+                {
+                    _guidance.Phase = "aligning_for_node_burn";
+                    _guidance.BurnEndAt = Math.Min(_guidance.StartedAt + 3600d, end + Math.Min(2d, Math.Max(0.05d, Time.fixedDeltaTime)));
+                }
+                else
+                {
+                    bool engineReady = EnsureGuidanceEngineActive(vessel);
+                    if (!engineReady)
+                    {
+                        _guidance.LastError = "no ignited/operational engine is available for the maneuver burn";
+                        _guidance.Phase = "burn_engine_unavailable";
+                    }
+                    else
+                    {
+                        throttle = _guidance.BurnThrottle * ClampDouble(1d - _guidance.LastAlignmentErrorDegrees / 8d, 0.35d, 1d);
+                        _guidance.Phase = "burning_node";
+                    }
+                }
             }
             else
             {
@@ -761,6 +911,7 @@ namespace KspMcp
                 foreach (PartModule module in part.Modules)
                 {
                     if (module == null || module.GetType().Name.IndexOf("ModuleEngines", StringComparison.OrdinalIgnoreCase) < 0) continue;
+                    if (BoolMember(module, "flameout")) continue;
                     if (!BoolMember(module, "isOperational") && !BoolMember(module, "moduleIsEnabled")) continue;
                     fallbackStage = Math.Max(fallbackStage, part.inverseStage);
                 }
@@ -778,11 +929,89 @@ namespace KspMcp
                 foreach (PartModule module in part.Modules)
                 {
                     if (module == null || module.GetType().Name.IndexOf("ModuleEngines", StringComparison.OrdinalIgnoreCase) < 0) continue;
+                    if (BoolMember(module, "flameout")) continue;
                     if (!BoolMember(module, "isOperational") && !BoolMember(module, "moduleIsEnabled")) continue;
                     total += Math.Max(0d, NumberMember(module, "maxThrust"));
                 }
             }
             return total;
+        }
+
+        private bool EnsureGuidanceEngineActive(Vessel vessel)
+        {
+            if (vessel == null || vessel.parts == null) return false;
+            if (HasLiveEngine(vessel)) return true;
+
+            int targetStage = Math.Max(0, vessel.currentStage - 1);
+            if (!StageContainsEngine(vessel, targetStage)) targetStage = vessel.currentStage;
+            if (!StageContainsEngine(vessel, targetStage)) return false;
+
+            bool invoked = false;
+            foreach (Part part in vessel.parts)
+            {
+                if (part == null || part.inverseStage != targetStage) continue;
+                if (InvokeStagedPart(part, targetStage, vessel)) invoked = true;
+            }
+            if (!invoked) invoked = ActivateNextStageRaw();
+            if (invoked && targetStage < vessel.currentStage) TrySetCurrentStage(vessel, targetStage);
+
+            bool ready = HasLiveEngine(vessel) || HasOperationalEngine(vessel, targetStage);
+            if (ready && _guidance != null && !_guidance.BurnIgnitionRecorded)
+            {
+                _guidance.BurnIgnitionRecorded = true;
+                KspMcpBridge bridge = KspMcpBridge.Instance;
+                if (bridge != null) bridge.RecordEvent("flight.ignition.guidance", new Dictionary<string, object>
+                {
+                    { "stage", targetStage },
+                    { "staging_cursor", vessel.currentStage }
+                });
+            }
+            return ready;
+        }
+
+        private static bool StageContainsEngine(Vessel vessel, int stage)
+        {
+            if (vessel == null || vessel.parts == null) return false;
+            foreach (Part part in vessel.parts)
+            {
+                if (part == null || part.inverseStage != stage || part.Modules == null) continue;
+                foreach (PartModule module in part.Modules)
+                {
+                    if (module != null && module.GetType().Name.IndexOf("ModuleEngines", StringComparison.OrdinalIgnoreCase) >= 0) return true;
+                }
+            }
+            return false;
+        }
+
+        private static bool HasLiveEngine(Vessel vessel)
+        {
+            if (vessel == null || vessel.parts == null) return false;
+            foreach (Part part in vessel.parts)
+            {
+                if (part == null || part.Modules == null) continue;
+                foreach (PartModule module in part.Modules)
+                {
+                    if (module == null || module.GetType().Name.IndexOf("ModuleEngines", StringComparison.OrdinalIgnoreCase) < 0) continue;
+                    if (BoolMember(module, "engineIgnited") && !BoolMember(module, "flameout") &&
+                        (BoolMember(module, "isOperational") || BoolMember(module, "moduleIsEnabled"))) return true;
+                }
+            }
+            return false;
+        }
+
+        private static bool HasOperationalEngine(Vessel vessel, int stage)
+        {
+            if (vessel == null || vessel.parts == null) return false;
+            foreach (Part part in vessel.parts)
+            {
+                if (part == null || part.inverseStage != stage || part.Modules == null) continue;
+                foreach (PartModule module in part.Modules)
+                {
+                    if (module == null || module.GetType().Name.IndexOf("ModuleEngines", StringComparison.OrdinalIgnoreCase) < 0) continue;
+                    if (!BoolMember(module, "flameout") && (BoolMember(module, "isOperational") || BoolMember(module, "engineIgnited"))) return true;
+                }
+            }
+            return false;
         }
 
         public Dictionary<string, object> StartManeuverBurn(Dictionary<string, object> args)
@@ -886,6 +1115,23 @@ namespace KspMcp
             string situation = vessel.situation.ToString();
             bool landed = string.Equals(situation, "LANDED", StringComparison.OrdinalIgnoreCase) ||
                 string.Equals(situation, "SPLASHED", StringComparison.OrdinalIgnoreCase);
+
+            if (_guidance.DeployGear && (landed || altitude <= _guidance.GearDeployAltitude))
+            {
+                state.gearDown = true;
+                state.gearUp = false;
+                if (!_guidance.GearCommanded)
+                {
+                    try { FireGroup("Gear", true); } catch (Exception exception) { _guidance.LastError = "gear deployment request failed: " + exception.Message; }
+                    _guidance.GearCommanded = true;
+                    KspMcpBridge bridge = KspMcpBridge.Instance;
+                    if (bridge != null) bridge.RecordEvent("flight.landing.gear_commanded", new Dictionary<string, object>
+                    {
+                        { "altitude", altitude },
+                        { "terrain_altitude", vessel.terrainAltitude }
+                    });
+                }
+            }
             if (!landed && altitude > 10000d && apoapsis > 20000d && periapsis > -1000d)
             {
                 double throttle = 0d;
@@ -923,6 +1169,28 @@ namespace KspMcp
             bool burnWindow = altitude <= stoppingDistance * 1.35d + 250d || verticalSpeed < desiredVerticalSpeed || altitude < 1000d;
             double requiredAcceleration = gravity + verticalCorrection;
             if (burnWindow) requiredAcceleration += horizontalBraking;
+            _guidance.LastStoppingDistance = stoppingDistance;
+            _guidance.LastAvailableThrust = thrust;
+            _guidance.LastTwr = gravity <= 0d ? 0d : maxAcceleration / gravity;
+
+            Vector3d targetThrust = retrograde;
+            double targetDistance;
+            double targetHorizontalSpeed;
+            double targetHorizontalAcceleration;
+            if (TryLandingTargetThrust(vessel, altitude, verticalSpeed, gravity, out targetThrust, out targetDistance, out targetHorizontalSpeed, out targetHorizontalAcceleration))
+            {
+                _guidance.LastTargetDistance = targetDistance;
+                _guidance.LastTargetHorizontalSpeed = targetHorizontalSpeed;
+                if (burnWindow)
+                {
+                    requiredAcceleration = Math.Sqrt(requiredAcceleration * requiredAcceleration + targetHorizontalAcceleration * targetHorizontalAcceleration);
+                }
+            }
+            else
+            {
+                _guidance.LastTargetDistance = 0d;
+                _guidance.LastTargetHorizontalSpeed = 0d;
+            }
             double throttleCommand = maxAcceleration <= 0d ? 0d : ClampDouble(requiredAcceleration / maxAcceleration, 0d, 1d);
 
             if (landed || (altitude <= 5d && Math.Abs(verticalSpeed) < 2.5d && surfaceSpeed < 3d))
@@ -940,7 +1208,67 @@ namespace KspMcp
             else if (altitude > 1000d) _guidance.Phase = "suicide_burn_and_retrograde_braking";
             else if (altitude > 200d) _guidance.Phase = "powered_descent";
             else _guidance.Phase = "final_hover_and_touchdown";
-            ApplyDirectionControl(state, vessel, retrograde, throttleCommand, 0d);
+            ApplyDirectionControl(state, vessel, targetThrust, throttleCommand, 0d);
+        }
+
+        private bool TryLandingTargetThrust(
+            Vessel vessel,
+            double altitude,
+            double verticalSpeed,
+            double gravity,
+            out Vector3d thrustDirection,
+            out double distance,
+            out double desiredHorizontalSpeed,
+            out double horizontalAcceleration)
+        {
+            thrustDirection = Vector3d.zero;
+            distance = 0d;
+            desiredHorizontalSpeed = 0d;
+            horizontalAcceleration = 0d;
+            if (_guidance == null || !_guidance.HasLandingTarget || vessel == null || vessel.mainBody == null) return false;
+
+            Vector3d targetPosition;
+            if (!TryGetWorldSurfacePosition(vessel.mainBody, _guidance.TargetLatitude, _guidance.TargetLongitude, 0d, out targetPosition)) return false;
+            Vector3d up = SurfaceNormal(vessel);
+            Vector3d displacement = ProjectOnPlane(targetPosition - vessel.GetWorldPos3D(), up);
+            distance = displacement.magnitude;
+            if (distance < 1d) return false;
+
+            Vector3d targetDirection = displacement / distance;
+            double timeHorizon = ClampDouble(altitude / Math.Max(5d, Math.Abs(verticalSpeed)), 5d, 30d);
+            desiredHorizontalSpeed = ClampDouble(distance / timeHorizon, 0d, 80d);
+            Vector3d currentHorizontalVelocity = ProjectOnPlane(vessel.srf_velocity, up);
+            Vector3d desiredHorizontalVelocity = targetDirection * desiredHorizontalSpeed;
+            Vector3d velocityError = desiredHorizontalVelocity - currentHorizontalVelocity;
+            horizontalAcceleration = ClampDouble(velocityError.magnitude / 4d, 0d, Math.Max(2d, gravity * 1.5d));
+            Vector3d horizontalCommand = velocityError.sqrMagnitude < 0.01d ? Vector3d.zero : velocityError.normalized * horizontalAcceleration;
+            thrustDirection = up * Math.Max(0.5d, gravity) + horizontalCommand;
+            if (thrustDirection.sqrMagnitude < 0.0001d) return false;
+            thrustDirection.Normalize();
+            return true;
+        }
+
+        private static Vector3d ProjectOnPlane(Vector3d vector, Vector3d normal)
+        {
+            if (normal.sqrMagnitude < 0.0001d) return vector;
+            Vector3d unitNormal = normal.normalized;
+            return vector - unitNormal * Vector3d.Dot(vector, unitNormal);
+        }
+
+        private static bool TryGetWorldSurfacePosition(CelestialBody body, double latitude, double longitude, double altitude, out Vector3d position)
+        {
+            position = Vector3d.zero;
+            if (body == null) return false;
+            try
+            {
+                MethodInfo method = body.GetType().GetMethod("GetWorldSurfacePosition", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance, null, new[] { typeof(double), typeof(double), typeof(double) }, null);
+                if (method == null) return false;
+                object value = method.Invoke(body, new object[] { latitude, longitude, altitude });
+                if (!(value is Vector3d)) return false;
+                position = (Vector3d)value;
+                return position.sqrMagnitude > 0.0001d;
+            }
+            catch (Exception) { return false; }
         }
 
         private void ApplyDirectionControl(FlightCtrlState state, Vessel vessel, Vector3d target, double throttle, double targetPitch)
@@ -962,6 +1290,21 @@ namespace KspMcp
             _guidance.LastPitch = state.pitch;
             _guidance.LastYaw = state.yaw;
             _guidance.LastTargetPitchDegrees = targetPitch;
+            _guidance.LastAlignmentErrorDegrees = DirectionErrorDegrees(vessel, target);
+            _guidance.LastAvailableThrust = AvailableGuidanceThrust(vessel);
+            double gravity = SurfaceGravity(vessel, Math.Max(0d, vessel.altitude));
+            double mass = Math.Max(0.001d, vessel.GetTotalMass());
+            _guidance.LastTwr = gravity <= 0d ? 0d : _guidance.LastAvailableThrust / (mass * gravity);
+        }
+
+        private static double DirectionErrorDegrees(Vessel vessel, Vector3d target)
+        {
+            if (vessel == null || target.sqrMagnitude < 0.0001d) return 180d;
+            target.Normalize();
+            Vector3 local = vessel.transform.InverseTransformDirection((Vector3)target);
+            double forward = Math.Max(0.0001d, local.z);
+            double lateral = Math.Sqrt(local.x * local.x + local.y * local.y);
+            return Math.Abs(Math.Atan2(lateral, forward) * 180d / Math.PI);
         }
 
         private void TryAutomaticStage(Vessel vessel)
@@ -973,6 +1316,7 @@ namespace KspMcp
             // parts carry that lower number in inverseStage.
             int stagingCursorBefore = vessel.currentStage;
             int nextStage = Math.Max(0, stagingCursorBefore - 1);
+            Dictionary<string, object> nextStageSummary = StageActionSummary(vessel, nextStage);
             bool currentStageHasEngine = false;
             bool currentStageHasAction = false;
             bool hasLowerAction = false;
@@ -1038,7 +1382,11 @@ namespace KspMcp
                     {
                         { "stage", nextStage },
                         { "staging_cursor_before", stagingCursorBefore },
-                        { "staging_cursor_after", vessel.currentStage }
+                        { "staging_cursor_after", vessel.currentStage },
+                        { "reason", "ignition" },
+                        { "engine_count", nextStageSummary["engine_count"] },
+                        { "decoupler_count", nextStageSummary["decoupler_count"] },
+                        { "separation", nextStageSummary["decoupler_count"] is int && (int)nextStageSummary["decoupler_count"] > 0 }
                     });
                 }
                 return;
@@ -1069,13 +1417,45 @@ namespace KspMcp
                 {
                     { "stage", nextStage },
                     { "staging_cursor_before", stagingCursorBefore },
-                    { "staging_cursor_after", vessel.currentStage }
+                    { "staging_cursor_after", vessel.currentStage },
+                    { "reason", anyIgnitedEngine ? "engine_flameout_or_empty_stage" : "empty_action_stage" },
+                    { "engine_count", nextStageSummary["engine_count"] },
+                    { "decoupler_count", nextStageSummary["decoupler_count"] },
+                    { "separation", nextStageSummary["decoupler_count"] is int && (int)nextStageSummary["decoupler_count"] > 0 }
                 });
             }
             catch (Exception exception)
             {
                 if (_guidance != null) _guidance.LastError = exception.Message;
             }
+        }
+
+        private static Dictionary<string, object> StageActionSummary(Vessel vessel, int stage)
+        {
+            int engines = 0;
+            int decouplers = 0;
+            if (vessel != null && vessel.parts != null)
+            {
+                foreach (Part part in vessel.parts)
+                {
+                    if (part == null || part.inverseStage != stage || part.Modules == null) continue;
+                    foreach (PartModule module in part.Modules)
+                    {
+                        if (module == null) continue;
+                        string name = module.GetType().Name;
+                        if (name.IndexOf("ModuleEngines", StringComparison.OrdinalIgnoreCase) >= 0) engines++;
+                        if (name.IndexOf("Decouple", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                            name.IndexOf("Separator", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                            name.IndexOf("Seperator", StringComparison.OrdinalIgnoreCase) >= 0) decouplers++;
+                    }
+                }
+            }
+            return new Dictionary<string, object>
+            {
+                { "stage", stage },
+                { "engine_count", engines },
+                { "decoupler_count", decouplers }
+            };
         }
 
         private static bool ActivateNextStageRaw()
@@ -1187,6 +1567,21 @@ namespace KspMcp
             {
                 return right.inStageIndex.CompareTo(left.inStageIndex);
             });
+            int stagedEngineCount = 0;
+            int stagedDecouplerCount = 0;
+            foreach (Part stagedPart in stagedParts)
+            {
+                if (stagedPart == null || stagedPart.Modules == null) continue;
+                foreach (PartModule module in stagedPart.Modules)
+                {
+                    if (module == null) continue;
+                    string moduleName = module.GetType().Name;
+                    if (moduleName.IndexOf("ModuleEngines", StringComparison.OrdinalIgnoreCase) >= 0) stagedEngineCount++;
+                    if (moduleName.IndexOf("Decouple", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                        moduleName.IndexOf("Separator", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                        moduleName.IndexOf("Seperator", StringComparison.OrdinalIgnoreCase) >= 0) stagedDecouplerCount++;
+                }
+            }
 
             // StageManager is reliable for stock decouplers, but it does not
             // consistently invoke ModuleEnginesFX actions on vessels created
@@ -1208,7 +1603,10 @@ namespace KspMcp
                 {
                     { "stage_before", before },
                     { "stage_activated", target },
-                    { "custom_activation", invoked }
+                    { "custom_activation", invoked },
+                    { "engine_count", stagedEngineCount },
+                    { "decoupler_count", stagedDecouplerCount },
+                    { "separation", stagedDecouplerCount > 0 }
                 });
                 return new Dictionary<string, object>
                 {
@@ -1217,6 +1615,9 @@ namespace KspMcp
                     { "stage_activated", target },
                     { "stage_after", vessel.currentStage },
                     { "custom_activation", invoked },
+                    { "engine_count", stagedEngineCount },
+                    { "decoupler_count", stagedDecouplerCount },
+                    { "separation", stagedDecouplerCount > 0 },
                     { "state", Snapshot() }
                 };
             }
@@ -1229,9 +1630,23 @@ namespace KspMcp
             {
                 { "stage_before", before },
                 { "stage_activated", target },
-                { "custom_activation", false }
+                { "custom_activation", false },
+                { "engine_count", stagedEngineCount },
+                { "decoupler_count", stagedDecouplerCount },
+                { "separation", stagedDecouplerCount > 0 }
             });
-            return new Dictionary<string, object> { { "staged", true }, { "stage_before", before }, { "stage_activated", target }, { "stage_after", vessel.currentStage }, { "custom_activation", false }, { "state", Snapshot() } };
+            return new Dictionary<string, object>
+            {
+                { "staged", true },
+                { "stage_before", before },
+                { "stage_activated", target },
+                { "stage_after", vessel.currentStage },
+                { "custom_activation", false },
+                { "engine_count", stagedEngineCount },
+                { "decoupler_count", stagedDecouplerCount },
+                { "separation", stagedDecouplerCount > 0 },
+                { "state", Snapshot() }
+            };
         }
 
         public Dictionary<string, object> Warp(Dictionary<string, object> args)
@@ -1889,6 +2304,62 @@ namespace KspMcp
             };
         }
 
+        private static List<object> GuidanceStageReport(Vessel vessel)
+        {
+            var stages = new Dictionary<int, Dictionary<string, object>>();
+            if (vessel != null && vessel.parts != null)
+            {
+                foreach (Part part in vessel.parts)
+                {
+                    if (part == null || part.Modules == null) continue;
+                    int stage = part.inverseStage;
+                    Dictionary<string, object> item;
+                    if (!stages.TryGetValue(stage, out item))
+                    {
+                        item = new Dictionary<string, object>
+                        {
+                            { "stage", stage },
+                            { "part_count", 0 },
+                            { "engine_count", 0 },
+                            { "decoupler_count", 0 },
+                            { "ignited_engines", 0 },
+                            { "operational_engines", 0 },
+                            { "flameout_engines", 0 },
+                            { "max_thrust_kN", 0d }
+                        };
+                        stages[stage] = item;
+                    }
+                    item["part_count"] = (int)item["part_count"] + 1;
+                    foreach (PartModule module in part.Modules)
+                    {
+                        if (module == null) continue;
+                        string moduleName = module.GetType().Name;
+                        if (moduleName.IndexOf("ModuleEngines", StringComparison.OrdinalIgnoreCase) >= 0)
+                        {
+                            item["engine_count"] = (int)item["engine_count"] + 1;
+                            item["max_thrust_kN"] = (double)item["max_thrust_kN"] + Math.Max(0d, NumberMember(module, "maxThrust"));
+                            if (BoolMember(module, "engineIgnited")) item["ignited_engines"] = (int)item["ignited_engines"] + 1;
+                            if (BoolMember(module, "isOperational")) item["operational_engines"] = (int)item["operational_engines"] + 1;
+                            if (BoolMember(module, "flameout")) item["flameout_engines"] = (int)item["flameout_engines"] + 1;
+                        }
+                        if (moduleName.IndexOf("Decouple", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                            moduleName.IndexOf("Separator", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                            moduleName.IndexOf("Seperator", StringComparison.OrdinalIgnoreCase) >= 0)
+                        {
+                            item["decoupler_count"] = (int)item["decoupler_count"] + 1;
+                        }
+                    }
+                }
+            }
+            var result = new List<object>();
+            foreach (Dictionary<string, object> item in stages.Values) result.Add(item);
+            result.Sort(delegate(object left, object right)
+            {
+                return ((int)((Dictionary<string, object>)right)["stage"]).CompareTo((int)((Dictionary<string, object>)left)["stage"]);
+            });
+            return result;
+        }
+
         private static double NumberMember(object target, string name)
         {
             try
@@ -1977,4 +2448,3 @@ namespace KspMcp
         }
     }
 }
-

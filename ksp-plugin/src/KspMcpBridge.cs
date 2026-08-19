@@ -18,6 +18,11 @@ namespace KspMcp
         private HttpListener _listener;
         private Thread _listenerThread;
         private readonly object _queueLock = new object();
+        // Telemetry is a read-only snapshot produced on the Unity thread and
+        // consumed by the HTTP listener thread. Keeping the cache and event
+        // cursor behind one lock lets the no-visual endpoint answer without
+        // waiting for the command queue or touching Unity objects off-thread.
+        private readonly object _telemetryLock = new object();
         private readonly Queue<PendingRequest> _requests = new Queue<PendingRequest>();
         private KspMcpCraft _craft;
         private KspMcpFlight _flight;
@@ -193,7 +198,18 @@ namespace KspMcp
                 }
                 if (context.Request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase) && path == "/api/v1/telemetry")
                 {
-                    Enqueue(context, "telemetry", QueryArguments(context.Request));
+                    // Telemetry is deliberately served from the last cache on
+                    // the listener thread. A long editor snapshot/analyze
+                    // command must not make a high-rate visionless client
+                    // wait behind the Unity main-thread request queue.
+                    try
+                    {
+                        WriteResponse(context, Success(TelemetryFromCache(QueryArguments(context.Request))), 200);
+                    }
+                    catch (Exception exception)
+                    {
+                        WriteResponse(context, Failure("telemetry_unavailable", exception.Message, null), 503);
+                    }
                     continue;
                 }
                 if (context.Request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase) && path == "/api/v1/parts")
@@ -316,6 +332,7 @@ namespace KspMcp
                 case "flight.guidance_start": return _flight.StartGuidance(args);
                 case "flight.guidance_stop": return _flight.StopGuidance();
                 case "flight.guidance_status": return _flight.GuidanceStatus();
+                case "flight.guidance_update": return _flight.UpdateGuidance(args);
                 case "flight.stage": return _flight.Stage();
                 case "flight.set_controls": return _flight.SetControls(args);
                 case "flight.set_sas": return _flight.SetSas(args);
@@ -373,7 +390,7 @@ namespace KspMcp
             return new Dictionary<string, object>
             {
                 { "bridge", "ksp-mcp" },
-                { "bridge_version", "0.2.9" },
+                { "bridge_version", "0.3.0" },
                 { "scene", SceneName() },
                 { "endpoint", "http://" + _host + ":" + _port },
                 { "verbose_logging", _verboseLogging },
@@ -383,7 +400,7 @@ namespace KspMcp
                 { "capabilities", new Dictionary<string, object>
                     {
                         { "editor", new List<object> { "new", "snapshot", "apply", "add", "attach", "update", "remove", "stage", "action_group", "validate", "analyze", "save", "load", "launch", "job_status", "cancel_job" } },
-                        { "flight", new List<object> { "state", "compact_telemetry", "bodies", "maneuver_nodes", "add_maneuver_node", "clear_maneuver_nodes", "maneuver_burn_start", "guidance_start", "guidance_stop", "guidance_status", "stage", "controls", "sas", "rcs", "warp", "activate_part", "abort", "recover" } },
+                        { "flight", new List<object> { "state", "compact_telemetry", "bodies", "maneuver_nodes", "add_maneuver_node", "clear_maneuver_nodes", "maneuver_burn_start", "guidance_start", "guidance_stop", "guidance_status", "guidance_update", "stage", "controls", "sas", "rcs", "warp", "activate_part", "abort", "recover" } },
                         { "bridge", new List<object> { "telemetry", "batch" } }
                     }
                 }
@@ -393,21 +410,49 @@ namespace KspMcp
         private Dictionary<string, object> Telemetry(Dictionary<string, object> args)
         {
             UpdateTelemetryCache(false);
-            Dictionary<string, object> cache = _telemetryCache ?? new Dictionary<string, object>();
-            long since = (long)Math.Max(0d, JsonUtil.Number(args, "since", 0d));
-            int limit = Math.Max(1, Math.Min(256, JsonUtil.Integer(args, "limit", 64)));
-            bool includeEvents = JsonUtil.Boolean(args, "include_events", true);
-            var result = new Dictionary<string, object>();
-            foreach (KeyValuePair<string, object> item in cache) result[item.Key] = item.Value;
-            result["event_cursor"] = _eventSequence;
-            long oldestEventCursor = _events.Count == 0 ? _eventSequence + 1 : (long)_events[0]["event_id"];
-            result["oldest_event_cursor"] = oldestEventCursor;
-            result["events_lost"] = since < oldestEventCursor - 1 ? oldestEventCursor - 1 - since : 0;
-            result["events"] = includeEvents ? EventsSince(since, limit) : new List<object>();
-            return result;
+            return TelemetryFromCache(args);
         }
 
-        private List<object> EventsSince(long since, int limit)
+        private Dictionary<string, object> TelemetryFromCache(Dictionary<string, object> args)
+        {
+            // This method is intentionally free of Unity/KSP calls. It is
+            // used both by the main-thread dispatch path and directly by the
+            // HTTP listener thread for low-latency polling.
+            lock (_telemetryLock)
+            {
+                Dictionary<string, object> cache = _telemetryCache ?? new Dictionary<string, object>();
+                long since = (long)Math.Max(0d, JsonUtil.Number(args, "since", 0d));
+                int limit = Math.Max(1, Math.Min(256, JsonUtil.Integer(args, "limit", 64)));
+                bool includeEvents = JsonUtil.Boolean(args, "include_events", true);
+                var result = new Dictionary<string, object>();
+                foreach (KeyValuePair<string, object> item in cache) result[item.Key] = item.Value;
+                result["event_cursor"] = _eventSequence;
+                long oldestEventCursor = _events.Count == 0 ? _eventSequence + 1 : (long)_events[0]["event_id"];
+                long eventsLost = since < oldestEventCursor - 1 ? oldestEventCursor - 1 - since : 0;
+                result["oldest_event_cursor"] = oldestEventCursor;
+                result["events_lost"] = eventsLost;
+                List<object> events = includeEvents ? EventsSinceLocked(since, limit) : new List<object>();
+                result["events"] = events;
+                long lastReturned = since;
+                foreach (object raw in events)
+                {
+                    Dictionary<string, object> item = raw as Dictionary<string, object>;
+                    if (item == null) continue;
+                    lastReturned = Math.Max(lastReturned, (long)item["event_id"]);
+                }
+                // event_cursor is the producer cursor; next_since is the
+                // consumer cursor. They differ when a response limit clips a
+                // burst of build/staging events. A client that advances to
+                // event_cursor in that case would silently skip the middle.
+                result["events_returned"] = events.Count;
+                result["events_truncated"] = includeEvents && eventsLost == 0 && lastReturned < _eventSequence;
+                result["resync_required"] = eventsLost > 0;
+                result["next_since"] = eventsLost > 0 ? _eventSequence : (includeEvents ? lastReturned : _eventSequence);
+                return result;
+            }
+        }
+
+        private List<object> EventsSinceLocked(long since, int limit)
         {
             var result = new List<object>();
             for (int index = 0; index < _events.Count; index++)
@@ -421,17 +466,30 @@ namespace KspMcp
             return result;
         }
 
+        /*
+         * Kept as a small wrapper for older internal callers. All callers
+         * that need a consistent cursor should use TelemetryFromCache, which
+         * owns the lock for the whole response construction.
+         */
+        private List<object> EventsSince(long since, int limit)
+        {
+            lock (_telemetryLock) return EventsSinceLocked(since, limit);
+        }
+
         internal void RecordEvent(string type, object data)
         {
-            _eventSequence++;
-            _events.Add(new Dictionary<string, object>
+            lock (_telemetryLock)
             {
-                { "event_id", _eventSequence },
-                { "universal_time", SafeUniversalTime() },
-                { "type", type },
-                { "data", data }
-            });
-            if (_events.Count > MaxTelemetryEvents) _events.RemoveAt(0);
+                _eventSequence++;
+                _events.Add(new Dictionary<string, object>
+                {
+                    { "event_id", _eventSequence },
+                    { "universal_time", SafeUniversalTime() },
+                    { "type", type },
+                    { "data", data }
+                });
+                if (_events.Count > MaxTelemetryEvents) _events.RemoveAt(0);
+            }
         }
 
         private void UpdateTelemetryCache(bool force)
@@ -440,15 +498,16 @@ namespace KspMcp
             if (!force && _lastTelemetryAt >= 0f && now - _lastTelemetryAt < _telemetryIntervalSeconds) return;
             _lastTelemetryAt = now;
             _telemetrySequence++;
-            _telemetryCache = new Dictionary<string, object>
+            Dictionary<string, object> nextCache = new Dictionary<string, object>
             {
                 { "sequence", _telemetrySequence },
-                { "bridge_version", "0.2.9" },
+                { "bridge_version", "0.3.0" },
                 { "captured_at", SafeUniversalTime() },
                 { "scene", SceneName() },
                 { "editor", _craft.CompactStatus() },
                 { "flight", _flight.CompactSnapshot() }
             };
+            lock (_telemetryLock) _telemetryCache = nextCache;
         }
 
         private static double SafeUniversalTime()
@@ -541,4 +600,3 @@ namespace KspMcp
         }
     }
 }
-

@@ -1,8 +1,3 @@
-Import-Clixml: Unexpected end of file has occurred. The following elements are not closed: S, En, DCT, Obj, En, DCT, Obj, En, DCT,
-Obj, En, DCT, Obj, Objs. Line 1516, position 46.
-InvalidOperation: Index operation failed; the array index evaluated to null.
-Import-Clixml: Unexpected end of file has occurred. The following elements are not closed: DCT, Obj, En, DCT, Obj, En, DCT, Obj, En,
-DCT, Obj, Objs. Line 107, position 13.
 """A dependency-free MCP stdio server for the KSP bridge."""
 
 from __future__ import annotations
@@ -85,6 +80,7 @@ TOOLS: list[dict[str, Any]] = [
         {
             "since": {"type": "integer", "minimum": 0},
             "timeout": {"type": "number", "minimum": 0.05, "maximum": 30},
+            "poll_interval": {"type": "number", "minimum": 0.02, "maximum": 1},
             "limit": {"type": "integer", "minimum": 1, "maximum": 256},
             "include_events": {"type": "boolean"},
         },
@@ -313,6 +309,21 @@ TOOLS: list[dict[str, Any]] = [
     ),
     _tool("ksp_flight_guidance_stop", "Stop the active closed-loop guidance plan and release MCP control."),
     _tool("ksp_flight_guidance_status", "Read the active guidance profile, phase, target, control output, and remaining time."),
+    _tool(
+        "ksp_flight_guidance_update",
+        "Update targets and safety options on the active game-side guidance plan without releasing MCP control; useful for a no-visual real-time mission loop.",
+        {
+            "target_apoapsis": {"type": "number", "minimum": 1000},
+            "target_periapsis": {"type": "number", "minimum": 0},
+            "target_altitude": {"type": "number", "minimum": 10},
+            "target_latitude": {"type": "number", "minimum": -90, "maximum": 90},
+            "target_longitude": {"type": "number", "minimum": -180, "maximum": 180},
+            "auto_stage": {"type": "boolean"},
+            "deploy_gear": {"type": "boolean"},
+            "gear_deploy_altitude": {"type": "number", "minimum": 100, "maximum": 10000},
+            "extend_seconds": {"type": "number", "minimum": 0, "maximum": 3600},
+        },
+    ),
     _tool("ksp_flight_stage", "Activate the next KSP staging step."),
     _tool(
         "ksp_flight_set_controls",
@@ -380,6 +391,7 @@ class KspMcpApplication:
         if name == "ksp_wait_for_event":
             since = max(0, int(args.get("since", 0)))
             timeout = max(0.05, min(30.0, float(args.get("timeout", 5.0))))
+            poll_interval = max(0.02, min(1.0, float(args.get("poll_interval", 0.05))))
             limit = max(1, min(256, int(args.get("limit", 64))))
             include_events = bool(args.get("include_events", True))
             deadline = time.monotonic() + timeout
@@ -399,10 +411,11 @@ class KspMcpApplication:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     break
-                time.sleep(min(0.05, remaining))
+                time.sleep(min(poll_interval, remaining))
             return {
                 "since": since,
                 "timeout_seconds": timeout,
+                "poll_interval_seconds": poll_interval,
                 "triggered": triggered,
                 "timed_out": not triggered,
                 "state": latest,
@@ -424,7 +437,9 @@ class KspMcpApplication:
                 # truncated response silently loses the middle of the build.
                 sample = self.bridge.telemetry(since=since, limit=event_limit, include_events=include_events)
                 samples.append(sample)
-                if isinstance(sample, dict) and isinstance(sample.get("event_cursor"), (int, float)):
+                if isinstance(sample, dict) and isinstance(sample.get("next_since"), (int, float)):
+                    since = int(sample["next_since"])
+                elif isinstance(sample, dict) and isinstance(sample.get("event_cursor"), (int, float)):
                     since = int(sample["event_cursor"])
                 if len(samples) >= max_samples:
                     break
@@ -478,7 +493,7 @@ class KspMcpApplication:
             elif live:
                 # Make the performance/visibility tradeoff explicit on the
                 # wire instead of relying on a hidden plugin default.
-                craft["parts_per_frame"] = 8
+                 craft["parts_per_frame"] = 12
             return self.bridge.call("editor.apply_craft", craft)
         if name == "ksp_editor_job_status":
             return self.bridge.call("editor.job_status", args)
@@ -560,6 +575,8 @@ class KspMcpApplication:
             return self.bridge.call("flight.guidance_stop", {})
         if name == "ksp_flight_guidance_status":
             return self.bridge.call("flight.guidance_status", {})
+        if name == "ksp_flight_guidance_update":
+            return self.bridge.call("flight.guidance_update", args)
         if name == "ksp_flight_stage":
             return self.bridge.call("flight.stage", {})
         if name == "ksp_flight_set_controls":
@@ -616,7 +633,7 @@ def handle_message(app: KspMcpApplication, message: dict[str, Any]) -> dict[str,
             {
                 "protocolVersion": str(params.get("protocolVersion", "2024-11-05")),
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "kerbal-space-program", "version": "0.2.9"},
+                "serverInfo": {"name": "kerbal-space-program", "version": "0.3.0"},
                 "instructions": (
                     "Use ksp_realtime_state for compact no-visual state. Build in VAB/SPH with "
                     "ksp_editor_new and live ksp_editor_apply_craft, then poll "
@@ -696,4 +713,3 @@ def main(argv: list[str] | None = None) -> None:
     if args.self_test:
         raise SystemExit(_self_test())
     run_stdio()
-

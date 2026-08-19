@@ -76,6 +76,22 @@ class EventBridge(FakeBridge):
         }
 
 
+class BurstBridge(FakeBridge):
+    def __init__(self):
+        self.since_values = []
+
+    def telemetry(self, **kwargs):
+        self.since_values.append(kwargs["since"])
+        return {
+            "sequence": len(self.since_values),
+            "event_cursor": 3,
+            "next_since": 1 if len(self.since_values) == 1 else 3,
+            "events_truncated": len(self.since_values) == 1,
+            "events_lost": 0,
+            "events": [{"event_id": 1}],
+        }
+
+
 class McpProtocolTests(unittest.TestCase):
     def setUp(self):
         self.app = KspMcpApplication(FakeBridge())
@@ -102,6 +118,7 @@ class McpProtocolTests(unittest.TestCase):
         self.assertIn("ksp_editor_job_status", names)
         self.assertIn("ksp_editor_cancel_job", names)
         self.assertIn("ksp_flight_guidance_start", names)
+        self.assertIn("ksp_flight_guidance_update", names)
         self.assertIn("ksp_flight_transfer_plan", names)
         self.assertIn("ksp_flight_maneuver_nodes", names)
         self.assertIn("ksp_flight_maneuver_burn_start", names)
@@ -135,6 +152,16 @@ class McpProtocolTests(unittest.TestCase):
         self.assertFalse(result["timed_out"])
         self.assertEqual(result["state"]["event_cursor"], 1)
 
+    def test_watch_follows_consumer_cursor_when_response_is_truncated(self):
+        bridge = BurstBridge()
+        app = KspMcpApplication(bridge)
+        result = app.call_tool(
+            "ksp_watch",
+            {"duration": 0.1, "interval": 0.05, "max_samples": 2, "event_limit": 1},
+        )
+        self.assertEqual(result["sample_count"], 2)
+        self.assertEqual(bridge.since_values, [0, 1])
+
     def test_live_craft_defaults_to_frame_sliced_job(self):
         response = handle_message(
             self.app,
@@ -150,14 +177,14 @@ class McpProtocolTests(unittest.TestCase):
         )
         self.assertFalse(response["result"]["isError"])
         self.assertTrue(response["result"]["structuredContent"]["args"]["live"])
-        self.assertEqual(response["result"]["structuredContent"]["args"]["parts_per_frame"], 8)
+        self.assertEqual(response["result"]["structuredContent"]["args"]["parts_per_frame"], 12)
 
     def test_initialize_reports_current_server_version(self):
         response = handle_message(
             self.app,
             {"jsonrpc": "2.0", "id": 12, "method": "initialize", "params": {}},
         )
-        self.assertEqual(response["result"]["serverInfo"]["version"], "0.2.9")
+        self.assertEqual(response["result"]["serverInfo"]["version"], "0.3.0")
 
     def test_live_build_can_be_cancelled(self):
         response = handle_message(
@@ -171,6 +198,22 @@ class McpProtocolTests(unittest.TestCase):
         )
         self.assertFalse(response["result"]["isError"])
         self.assertEqual(response["result"]["structuredContent"]["command"], "editor.cancel_job")
+
+    def test_guidance_update_routes_to_bridge(self):
+        response = handle_message(
+            self.app,
+            {
+                "jsonrpc": "2.0",
+                "id": 13,
+                "method": "tools/call",
+                "params": {
+                    "name": "ksp_flight_guidance_update",
+                    "arguments": {"target_apoapsis": 90000, "auto_stage": True},
+                },
+            },
+        )
+        self.assertFalse(response["result"]["isError"])
+        self.assertEqual(response["result"]["structuredContent"]["command"], "flight.guidance_update")
 
     def test_batch_rejects_irreversible_commands(self):
         response = handle_message(
@@ -277,4 +320,3 @@ class McpProtocolTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
