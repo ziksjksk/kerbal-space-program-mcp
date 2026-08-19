@@ -26,6 +26,7 @@ namespace KspMcp
         private string _token = "";
         private int _maxRequestsPerFrame = 8;
         private bool _verboseLogging;
+        private float _telemetryIntervalSeconds = 0.05f;
         private bool _stopping;
         private float _lastTelemetryAt = -1f;
         private long _telemetrySequence;
@@ -124,6 +125,11 @@ namespace KspMcp
                 if (int.TryParse(node.GetValue("maxRequestsPerFrame"), out maxRequests) && maxRequests > 0)
                 {
                     _maxRequestsPerFrame = Math.Min(maxRequests, 32);
+                }
+                int telemetryIntervalMs;
+                if (int.TryParse(node.GetValue("telemetryIntervalMs"), out telemetryIntervalMs) && telemetryIntervalMs > 0)
+                {
+                    _telemetryIntervalSeconds = Math.Max(0.025f, Math.Min(1f, telemetryIntervalMs / 1000f));
                 }
             }
             catch (Exception exception)
@@ -364,10 +370,11 @@ namespace KspMcp
             return new Dictionary<string, object>
             {
                 { "bridge", "ksp-mcp" },
-                { "bridge_version", "0.2.2" },
+                { "bridge_version", "0.2.3" },
                 { "scene", SceneName() },
                 { "endpoint", "http://" + _host + ":" + _port },
                 { "verbose_logging", _verboseLogging },
+                { "telemetry_interval_ms", (int)(_telemetryIntervalSeconds * 1000f) },
                 { "editor", _craft.Status() },
                 { "flight", _flight.Snapshot() },
                 { "capabilities", new Dictionary<string, object>
@@ -424,12 +431,13 @@ namespace KspMcp
         private void UpdateTelemetryCache(bool force)
         {
             float now = Time.realtimeSinceStartup;
-            if (!force && _lastTelemetryAt >= 0f && now - _lastTelemetryAt < 0.1f) return;
+            if (!force && _lastTelemetryAt >= 0f && now - _lastTelemetryAt < _telemetryIntervalSeconds) return;
             _lastTelemetryAt = now;
             _telemetrySequence++;
             _telemetryCache = new Dictionary<string, object>
             {
                 { "sequence", _telemetrySequence },
+                { "bridge_version", "0.2.3" },
                 { "captured_at", SafeUniversalTime() },
                 { "scene", SceneName() },
                 { "editor", _craft.CompactStatus() },

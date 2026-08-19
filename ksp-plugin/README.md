@@ -38,7 +38,7 @@ X-KSP-MCP-Token: <可选>
 {"ok":false,"error":{"code":"...","message":"...","details":null}}
 ```
 
-HTTP 接收线程不会直接调用 Unity/KSP API；它把请求放进队列，主线程每帧最多处理 `maxRequestsPerFrame` 个请求。普通状态会缓存为约 10 Hz 的紧凑遥测，避免高频客户端反复遍历完整部件树。
+HTTP 接收线程不会直接调用 Unity/KSP API；它把请求放进队列，主线程每帧最多处理 `maxRequestsPerFrame` 个请求。普通状态会缓存为默认约 20 Hz 的紧凑遥测，避免高频客户端反复遍历完整部件树。
 
 编辑器紧凑遥测只读取部件数和异步任务状态，不会在每次高频轮询时遍历完整部件映射或连接关系。默认关闭逐零件调试日志；需要排障时可以把 PluginData/config.cfg 中的 verboseLogging 临时设为 true，正常使用应保持 false。
 
@@ -48,7 +48,7 @@ HTTP 接收线程不会直接调用 Unity/KSP API；它把请求放进队列，�
 GET http://127.0.0.1:8765/api/v1/telemetry?since=0&limit=64&include_events=true
 ```
 
-遥测响应包含 `sequence`、`event_cursor`、场景、编辑器任务、紧凑飞行状态和增量 `events`。客户端保存 `event_cursor`，下一次请求把它作为 `since`，即可只读取新增的建造进度、命令完成、自动分级和指导器事件。
+遥测响应包含 `sequence`、`bridge_version`、`event_cursor`、场景、编辑器任务、紧凑飞行状态和增量 `events`。客户端保存 `event_cursor`，下一次请求把它作为 `since`，即可只读取新增的逐零件建造进度、命令完成、点火、分级、星体/飞行状态和指导器阶段事件。
 
 多个安全命令可以通过一个请求批量提交：
 
@@ -68,7 +68,7 @@ GET http://127.0.0.1:8765/api/v1/telemetry?since=0&limit=64&include_events=true
 
 ### 分帧建造
 
-`editor.apply_craft` 可以传 `live=true` 和 `parts_per_frame`（1–16）。插件会返回 `job_id`，在后续 Unity 帧中逐个或按小批次生成部件；用下面的命令读取进度：
+`editor.apply_craft` 可以传 `live=true` 和 `parts_per_frame`（1–16）。默认每个 Unity 帧生成 8 个部件；插件会返回 `job_id`，在后续 Unity 帧中逐个或按小批次生成部件，并为每个部件发出 `editor.build.part_added` 事件；用下面的命令读取进度：
 
 ```json
 {"command":"editor.job_status","args":{"job_id":"build-1"}}
@@ -98,6 +98,6 @@ GET http://127.0.0.1:8765/api/v1/telemetry?since=0&limit=64&include_events=true
 
 `flight.bodies` 读取 KSP 的星体参数和 patched-conic 轨道；MCP 端的 `ksp_flight_transfer_plan` 会用这些数据计算透明的圆共面 Hohmann 估算。`flight.maneuver_nodes` 读取原生节点，`flight.add_maneuver_node` 和 `flight.clear_maneuver_nodes` 都要求确认参数，避免把规划误变成执行。节点 Δv 使用 radial-plus、normal-plus、prograde 坐标，单位为 m/s。
 
-`profile=orbit` 会在尚未入轨时使用上升制导，获得目标远点后在远点抬升近点；若近点高于目标，则在近点执行逆行降轨。`profile=landing` 使用相对地表速度对准反向速度，并根据地形高度和垂直速度调节油门。两者是可停止的基础闭环，不包含完整的 Duna 转移窗口搜索、再入气动模型或地形避障。
+`profile=orbit` 会在尚未入轨时使用上升制导，获得目标远点后在远点抬升近点；若近点高于目标，则在近点执行逆行降轨。`profile=landing` 会先执行简单脱轨决策，再使用相对地表速度对准反向速度，并根据制动距离、局部重力、地形高度和垂直速度调节油门。两者是可停止的基础闭环，不包含完整的 Duna 转移窗口搜索、再入气动模型或地形避障。
 
 编辑器建造请求支持 `snap_to_node`。默认值为 `true`，会按父子 AttachNode 自动对齐位置和方向；若要保留传入的世界坐标和四元数，可以显式传 `false`。对称复制不依赖游戏当前的 UI 对称模式：MCP 文档中的每个零件都是显式实例，因此插件会在生成单个零件时暂时关闭 UI 对称，避免多出未登记的零件。

@@ -117,6 +117,14 @@ class McpProtocolTests(unittest.TestCase):
         )
         self.assertFalse(response["result"]["isError"])
         self.assertTrue(response["result"]["structuredContent"]["args"]["live"])
+        self.assertEqual(response["result"]["structuredContent"]["args"]["parts_per_frame"], 8)
+
+    def test_initialize_reports_current_server_version(self):
+        response = handle_message(
+            self.app,
+            {"jsonrpc": "2.0", "id": 12, "method": "initialize", "params": {}},
+        )
+        self.assertEqual(response["result"]["serverInfo"]["version"], "0.2.3")
 
     def test_live_build_can_be_cancelled(self):
         response = handle_message(

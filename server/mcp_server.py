@@ -1,4 +1,4 @@
-"""A dependency-free MCP stdio server for the KSP bridge."""
+"jh®Ð¥‹¥Rw±¥ç-y×§v‡ßŠW¡jÊrêëyÔáyú%–Œ"ž¥zg§¶Æ«zz-rZ,yÔ„œ0“9¸Äœ0“9¸Äœ0“9¸În;Šw¶ãŠh²+b¢}ú"{Ú–'N¥êÚ¶*'"w^ÆŠ^­«b¢wÚŠW¶š®¶²Šw^ÅëÚ–æ­yÛhžée"{Ú–'N¥êÚ¶*'"w^ÆŠ^­«b¢wÚŠW¶š®¶²Šw^ÅëÚ–æ­yÛhžée"""A dependency-free MCP stdio server for the KSP bridge."""
 
 from __future__ import annotations
 
@@ -271,7 +271,7 @@ TOOLS: list[dict[str, Any]] = [
     ),
     _tool(
         "ksp_flight_guidance_start",
-        "Start a game-side closed-loop guidance plan. It continuously refreshes controls in KSP frames; confirm=true is required. Profiles are ascent, orbit, and landing.",
+        "Start a game-side closed-loop guidance plan. It continuously refreshes controls in KSP frames; confirm=true is required. Profiles are ascent, orbit, landing, and node_burn.",
         {
             "profile": {"type": "string", "enum": ["ascent", "orbit", "landing", "node_burn"]},
             "target_apoapsis": {"type": "number", "minimum": 1000},
@@ -416,6 +416,10 @@ class KspMcpApplication:
             craft["live"] = live
             if "parts_per_frame" in args:
                 craft["parts_per_frame"] = int(args["parts_per_frame"])
+            elif live:
+                # Make the performance/visibility tradeoff explicit on the
+                # wire instead of relying on a hidden plugin default.
+                craft["parts_per_frame"] = 8
             return self.bridge.call("editor.apply_craft", craft)
         if name == "ksp_editor_job_status":
             return self.bridge.call("editor.job_status", args)
@@ -553,7 +557,7 @@ def handle_message(app: KspMcpApplication, message: dict[str, Any]) -> dict[str,
             {
                 "protocolVersion": str(params.get("protocolVersion", "2024-11-05")),
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "kerbal-space-program", "version": "0.2.2"},
+                "serverInfo": {"name": "kerbal-space-program", "version": "0.2.3"},
                 "instructions": (
                     "Use ksp_realtime_state for compact no-visual state. Build in VAB/SPH with "
                     "ksp_editor_new and live ksp_editor_apply_craft, then poll "

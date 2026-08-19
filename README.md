@@ -7,7 +7,7 @@
 
 建造链路支持从空白编辑器开始创建火箭，也支持一次性提交完整的部件树；粒度较细的工具可以继续增删零件、移动/旋转、重新连接、设置阶段和动作组。飞行链路支持发射后的状态读取、油门和姿态控制、SAS/RCS、分级、时间加速、单部件动作、紧急中止和回收。
 
-0.2.2 在 0.2.1 的低延迟 HTTP 复用、紧凑遥测和事件游标、单往返批处理、分帧异步建造、真实零件性能分析、星体模型、原生轨道节点和有限燃烧控制之上，进一步减少编辑器遥测和逐零件日志造成的卡顿，并补上自动初级点火事件。无视觉模型可以更快地观察建造进度，而用户仍能在 KSP 中看到部件逐帧出现。
+0.2.3 在 0.2.2 的低延迟 HTTP 复用、紧凑遥测和事件游标、单往返批处理、分帧异步建造、真实零件性能分析、星体模型、原生轨道节点和有限燃烧控制之上，进一步提高无视觉实时性：默认 20 Hz 紧凑遥测、逐零件建造事件、发动机/资源/指导摘要、自动点火与分离状态事件，并修复节点燃烧入口和轨道着陆阶段机。无视觉模型可以通过事件游标观察“哪个零件刚生成、何时点火、何时分级、当前是否进入燃烧/着陆阶段”，用户仍能在 KSP 中看到部件逐帧出现。
 
 当前目标平台是 KSP 1.12.x（KSP 1.x 的 `Assembly-CSharp.dll` API）。KSP 2 使用另一套 API，不能直接使用这个插件。
 
@@ -79,7 +79,7 @@ python -m server
 1. 调用 `ksp_status` 确认已经进入 VAB/SPH。
 2. 调用 `ksp_parts_list` 查看当前游戏实例实际加载的零件名称和连接节点。
 3. 调用 `ksp_editor_new` 清空编辑器。
-4. 用 `ksp_editor_apply_craft` 提交完整部件树。MCP 默认使用分帧 live 模式，立即返回 `job_id`，默认每个 Unity 帧生成 4 个部件；需要更明显的逐件展示时传 `parts_per_frame=1`，需要更快完成时可以提高到 8 或 16。
+4. 用 `ksp_editor_apply_craft` 提交完整部件树。MCP 默认使用分帧 live 模式，立即返回 `job_id`，默认每个 Unity 帧生成 8 个部件；需要更明显的逐件展示时传 `parts_per_frame=1`，需要更快完成时可以提高到 12 或 16。每个部件会通过 `editor.build.part_added` 事件进入实时事件游标。
 5. 用 `ksp_editor_job_status` 和 `ksp_realtime_state` 读取 `completed/total`、事件和当前部件数，直到任务进入 `completed`。
 6. 调用 `ksp_editor_analyze` 读取真实零件质量、推力、TWR、近似 Δv、质心/推力中心和分级风险。
 7. 用 `ksp_editor_validate` 检查控制核心、发动机、连接关系、阶段和成本，再用 `ksp_editor_save` 保存 `.craft` 文件。
@@ -95,7 +95,7 @@ VAB 中插件会把生成的根零件自动放到安全高度（默认 `y=50`）
 
 `ksp_watch` 会在一个有界时间段内连续采样这些状态，适合无视觉模型观察“部件逐个出现、加载稳定、发射、分级、远点/近点变化和着陆”。`ksp_batch` 把多个安全命令放在一次 HTTP 往返里；发射、Abort 和回收仍必须使用各自的确认工具，不能隐藏在批处理中。
 
-`ksp_realtime_state` 的编辑器摘要是轻量的：它只返回当前部件数、任务进度和事件，不遍历完整部件树；要检查连接节点、模块、资源和详细验证结果时再调用 `ksp_editor_get_craft`、`ksp_editor_validate` 或 `ksp_editor_analyze`。如果需要排查游戏侧问题，可以在 `GameData/KspMcp/PluginData/config.cfg` 中临时设置 `verboseLogging = true`，正常使用应保持 `false`。
+`ksp_realtime_state` 的摘要是轻量的：编辑器只返回当前部件数、任务进度和事件；飞行侧返回位置/速度、轨道根数、阶段、指导阶段、发动机点火/故障汇总和资源总量，不遍历完整部件树。默认遥测间隔为 50 ms，可在 `GameData/KspMcp/PluginData/config.cfg` 用 `telemetryIntervalMs` 调整（25–1000）；要检查连接节点、模块、资源和详细验证结果时再调用 `ksp_editor_get_craft`、`ksp_editor_validate` 或 `ksp_editor_analyze`。如果需要排查游戏侧问题，可以临时设置 `verboseLogging = true`，正常使用应保持 `false`。
 
 示例观察循环：
 
@@ -131,7 +131,7 @@ ksp_editor_apply_craft(...)
 - `stage 0` 可以作为最终载荷/分离动作，因此允许没有发动机；但 `stage > 0` 如果含有分离器却没有后续发动机，会被拒绝。
 - KSP 原生对舱体、适配器和油箱等被动零件使用 `inverseStage=-1` 是正常状态，不会被误判成非法分级；真正带发动机或分离动作的零件仍必须有有效阶段号。
 
-一个经过真实 KSP 1.12.x 烟测的两级大型火箭采用：Mk1 指令舱、上级 Mainsail、下级 Mammoth、两组燃料箱和两个分离器。加载保存的 `.craft` 后，KSP 会在发射台确认控制核心，MCP 可读到 `commandable=true`；实测下级点火、级间分离和上级 Mainsail 接管均成功。
+推荐的两级大型火箭参考结构采用：Mk1 指令舱、上级 Mainsail、下级 Mammoth、两组燃料箱和两个分离器。重新安装 0.2.3 后应先通过 `ksp_editor_validate`、`ksp_editor_analyze` 和 `ksp_realtime_state` 做游戏内烟测；当前工作区的运行实例仍是旧版桥，因此这里不把尚未重新验证的游戏内点火/分离结果写成已实测事实。
 
 完整部件格式如下：
 
@@ -176,9 +176,9 @@ ksp_editor_apply_craft(...)
 
 ### 实时飞行指导
 
-新增的 `ksp_flight_guidance_start` 在游戏帧内运行闭环指导，支持 `ascent`、`orbit` 和 `landing` 三种基础 profile；`ksp_flight_guidance_stop` 立即释放控制，`ksp_flight_guidance_status` 返回当前阶段、目标、控制输出和剩余时间。启动必须传 `confirm=true`，默认允许自动分级，但不会绕过发射工具的确认门槛。
+新增的 `ksp_flight_guidance_start` 在游戏帧内运行闭环指导，支持 `ascent`、`orbit`、`landing` 和 `node_burn` 四种 profile；`ksp_flight_guidance_stop` 立即释放控制，`ksp_flight_guidance_status` 返回当前阶段、目标、控制输出和剩余时间。启动必须传 `confirm=true`，默认允许自动分级，但不会绕过发射工具的确认门槛。
 
-当前指导器的职责是提供可观测、可停止的基础闭环：上升阶段按海拔执行重力转弯并以目标远点收油，轨道阶段按远点/近点和原生轨道遥测执行圆化修正，着陆阶段按相对地表反向速度和垂直速度控制下降。它不是全任务级别的“保证成功”黑盒；去 Duna 的转移窗口精确求解、跨影响球捕获、再入热/气动控制和地形避障仍需要模型逐段规划。模型应持续调用 `ksp_realtime_state`，发现燃料、姿态或垂直速度异常时先停止指导或 Abort。
+当前指导器的职责是提供可观测、可停止的基础闭环：上升阶段按海拔执行重力转弯并以目标远点收油，轨道阶段按远点/近点和原生轨道遥测执行圆化修正，节点燃烧阶段根据原生节点向量进行对准和有限燃烧，着陆阶段先把正近点降到与星体相交，再按相对地表反向速度、制动距离和垂直速度控制下降。它不是全任务级别的“保证成功”黑盒；去 Duna 的转移窗口精确求解、跨影响球捕获、再入热/气动控制和地形避障仍需要模型逐段规划。模型应持续调用 `ksp_realtime_state`，发现燃料、姿态或垂直速度异常时先停止指导或 Abort。
 
 ## 重要边界
 

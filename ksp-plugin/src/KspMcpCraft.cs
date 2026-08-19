@@ -1,4 +1,4 @@
-using System;
+"jh®Ð¥‹¥FŠ-zW¦z{b²h¬²)àusing System;
 using System.Collections;
 using System.Collections.Generic;
 using System.IO;
@@ -38,6 +38,8 @@ namespace KspMcp
             public string State;
             public string Error;
             public int Completed;
+            public string LastPartId;
+            public string LastPartName;
         }
 
         public bool IsEditorAvailable
@@ -101,6 +103,20 @@ namespace KspMcp
                         }
                         _buildJob.Pending.RemoveAt(index);
                         _buildJob.Completed++;
+                        _buildJob.LastPartId = JsonUtil.String(part, "id", null);
+                        _buildJob.LastPartName = JsonUtil.String(part, "part", null);
+                        KspMcpBridge partBridge = KspMcpBridge.Instance;
+                        if (partBridge != null)
+                        {
+                            partBridge.RecordEvent("editor.build.part_added", new Dictionary<string, object>
+                            {
+                                { "job_id", _buildJob.Id },
+                                { "part_id", _buildJob.LastPartId },
+                                { "part", _buildJob.LastPartName },
+                                { "completed", _buildJob.Completed },
+                                { "total", _buildJob.Total }
+                            });
+                        }
                         progress = true;
                         break;
                     }
@@ -112,10 +128,10 @@ namespace KspMcp
 
                 EnsureEditorRootPlacement();
                 FireEditorModified();
-                KspMcpBridge bridge = KspMcpBridge.Instance;
-                if (bridge != null)
+                KspMcpBridge progressBridge = KspMcpBridge.Instance;
+                if (progressBridge != null)
                 {
-                    bridge.RecordEvent("editor.build.progress", new Dictionary<string, object>
+                    progressBridge.RecordEvent("editor.build.progress", new Dictionary<string, object>
                     {
                         { "job_id", _buildJob.Id },
                         { "completed", _buildJob.Completed },
@@ -292,7 +308,7 @@ namespace KspMcp
             SetShipMetadata();
             FireEditorModified();
 
-            int partsPerFrame = Math.Max(1, Math.Min(16, JsonUtil.Integer(args, "parts_per_frame", 4)));
+            int partsPerFrame = Math.Max(1, Math.Min(16, JsonUtil.Integer(args, "parts_per_frame", 8)));
             _jobCounter++;
             _buildJob = new BuildJob
             {
@@ -302,7 +318,9 @@ namespace KspMcp
                 PartsPerFrame = partsPerFrame,
                 State = "queued",
                 Error = null,
-                Completed = 0
+                Completed = 0,
+                LastPartId = null,
+                LastPartName = null
             };
             KspMcpBridge bridge = KspMcpBridge.Instance;
             if (bridge != null)
@@ -342,6 +360,8 @@ namespace KspMcp
                 { "remaining", Math.Max(0, _buildJob.Total - _buildJob.Completed) },
                 { "progress", _buildJob.Total == 0 ? 1d : (double)_buildJob.Completed / _buildJob.Total },
                 { "parts_per_frame", _buildJob.PartsPerFrame },
+                { "last_part_id", _buildJob.LastPartId },
+                { "last_part", _buildJob.LastPartName },
                 { "error", _buildJob.Error }
             };
         }
@@ -857,6 +877,7 @@ namespace KspMcp
             int commandModules = 0;
             int decouplers = 0;
             double totalMass = 0d;
+            double totalPropellantMass = 0d;
             var stagePartCounts = new Dictionary<int, int>();
             var stageEngineCounts = new Dictionary<int, int>();
             var stageCommandCounts = new Dictionary<int, int>();
@@ -868,8 +889,10 @@ namespace KspMcp
                 if (part.parent == null) roots++;
                 totalMass += part.mass;
                 try { totalMass += part.GetResourceMass(); } catch (Exception) { }
+                totalPropellantMass += SafePropellantMass(part);
 
                 bool hasStagedActionModule = false;
+                bool hasCommandModule = part.isControllable;
 
                 int partStage = part.inverseStage < 0 ? 0 : part.inverseStage;
                 if (!stagePartCounts.ContainsKey(partStage)) stagePartCounts[partStage] = 0;
@@ -878,11 +901,6 @@ namespace KspMcp
                 if (!stageDecouplerCounts.ContainsKey(partStage)) stageDecouplerCounts[partStage] = 0;
                 stagePartCounts[partStage]++;
 
-                if (part.isControllable)
-                {
-                    commandModules++;
-                    stageCommandCounts[partStage]++;
-                }
                 if (part.Modules != null)
                 {
                     foreach (PartModule module in part.Modules)
@@ -904,10 +922,19 @@ namespace KspMcp
                         }
                         if (moduleName.IndexOf("Command", StringComparison.OrdinalIgnoreCase) >= 0)
                         {
-                            commandModules++;
-                            stageCommandCounts[partStage]++;
+                            hasCommandModule = true;
                         }
                     }
+                }
+
+                // A controllable part can expose both isControllable and a
+                // ModuleCommand module. Count the physical control part once;
+                // double-counting made the no-visual validator report a
+                // healthier control architecture than the craft really had.
+                if (hasCommandModule)
+                {
+                    commandModules++;
+                    stageCommandCounts[partStage]++;
                 }
 
                 if (part.parent != null && part.parent.FindAttachNodeByPart(part) == null)
@@ -928,6 +955,7 @@ namespace KspMcp
             if (!SafeAreAllPartsConnected()) errors.Add("KSP reports that not all parts are connected");
             if (commandModules == 0) errors.Add("craft has no controllable command module");
             if (engines == 0) warnings.Add("craft has no engine module");
+            else if (totalPropellantMass <= 0d) errors.Add("craft has engines but no usable propellant resources");
             if (decouplers == 0) warnings.Add("craft has no decoupler/separator; this may be intentional");
 
             var stageSummary = new List<object>();
@@ -975,6 +1003,7 @@ namespace KspMcp
                         { "decoupler_count", decouplers },
                         { "stage_summary", stageSummary },
                         { "mass_tonnes", totalMass },
+                        { "propellant_mass_tonnes", totalPropellantMass },
                         { "dry_cost", dryCost },
                         { "fuel_cost", fuelCost },
                         { "connected", SafeAreAllPartsConnected() }
@@ -1002,7 +1031,8 @@ namespace KspMcp
             Vector3 centerThrustSum = Vector3.zero;
             double totalMass = 0d;
             double totalPropellantMass = 0d;
-            double totalThrust = 0d;
+            double totalSeaLevelThrust = 0d;
+            double totalVacuumThrust = 0d;
             double totalSeaIspThrust = 0d;
             double totalVacuumIspThrust = 0d;
             int engineCount = 0;
@@ -1028,17 +1058,27 @@ namespace KspMcp
                 foreach (PartModule module in part.Modules)
                 {
                     if (module == null || !IsEngineModule(module)) continue;
-                    double thrust = Math.Max(0d, MemberNumber(module, "maxThrust", 0d));
+                    double vacuumBaseThrust = Math.Max(0d, MemberNumber(module, "maxThrust", 0d));
                     double seaIsp = Math.Max(1d, CurveValue(MemberValue(module, "atmosphereCurve"), 1f, 1d));
                     double vacuumIsp = Math.Max(seaIsp, CurveValue(MemberValue(module, "atmosphereCurve"), 0f, seaIsp));
+                    // KSP's ModuleEngines maxThrust is the vacuum-rated
+                    // value; sea-level thrust follows the Isp ratio at the
+                    // local pressure. Keeping both values prevents the
+                    // validator from counting vacuum thrust as launch-pad
+                    // thrust and overstating TWR.
+                    double vacuumThrust = vacuumBaseThrust;
+                    double seaThrust = vacuumThrust * seaIsp / Math.Max(1d, vacuumIsp);
                     engineCount++;
-                    totalThrust += thrust;
-                    totalSeaIspThrust += thrust * seaIsp;
-                    totalVacuumIspThrust += thrust * vacuumIsp;
+                    totalSeaLevelThrust += seaThrust;
+                    totalVacuumThrust += vacuumThrust;
+                    totalSeaIspThrust += seaThrust * seaIsp;
+                    totalVacuumIspThrust += vacuumThrust * vacuumIsp;
                     stageItem["engine_count"] = (int)stageItem["engine_count"] + 1;
-                    stageItem["thrust_kN"] = (double)stageItem["thrust_kN"] + thrust;
-                    stageItem["sea_isp_s"] = (double)stageItem["sea_isp_s"] + thrust * seaIsp;
-                    stageItem["vacuum_isp_s"] = (double)stageItem["vacuum_isp_s"] + thrust * vacuumIsp;
+                    stageItem["sea_level_thrust_kN"] = (double)stageItem["sea_level_thrust_kN"] + seaThrust;
+                    stageItem["vacuum_thrust_kN"] = (double)stageItem["vacuum_thrust_kN"] + vacuumThrust;
+                    stageItem["thrust_kN"] = (double)stageItem["thrust_kN"] + vacuumThrust;
+                    stageItem["sea_isp_s"] = (double)stageItem["sea_isp_s"] + seaThrust * seaIsp;
+                    stageItem["vacuum_isp_s"] = (double)stageItem["vacuum_isp_s"] + vacuumThrust * vacuumIsp;
 
                     object transforms = MemberValue(module, "thrustTransforms");
                     Transform thrustTransform = null;
@@ -1052,7 +1092,7 @@ namespace KspMcp
                         }
                     }
                     Vector3 thrustPosition = thrustTransform == null ? part.transform.position : thrustTransform.position;
-                    centerThrustSum += thrustPosition * (float)thrust;
+                    centerThrustSum += thrustPosition * (float)vacuumThrust;
                     if (includeParts)
                     {
                         engineReports.Add(new Dictionary<string, object>
@@ -1061,7 +1101,8 @@ namespace KspMcp
                             { "part", part.partInfo == null ? part.partName : part.partInfo.name },
                             { "stage", stage },
                             { "module", module.GetType().Name },
-                            { "thrust_kN", thrust },
+                            { "thrust_kN_vacuum", vacuumThrust },
+                            { "thrust_kN_sea_level", seaThrust },
                             { "sea_level_isp_s", seaIsp },
                             { "vacuum_isp_s", vacuumIsp },
                             { "thrust_position", JsonUtil.Vector3Object(thrustPosition) }
@@ -1073,11 +1114,19 @@ namespace KspMcp
             var warnings = new List<object>();
             var errors = new List<object>();
             Vector3 centerMass = totalMass <= 0d ? Vector3.zero : centerMassSum / (float)totalMass;
-            Vector3 centerThrust = totalThrust <= 0d ? Vector3.zero : centerThrustSum / (float)totalThrust;
-            double weightedSeaIsp = totalThrust <= 0d ? 0d : totalSeaIspThrust / totalThrust;
-            double weightedVacuumIsp = totalThrust <= 0d ? 0d : totalVacuumIspThrust / totalThrust;
-            double seaTwr = totalMass <= 0d ? 0d : totalThrust / (totalMass * Gravity);
-            double vacuumTwr = totalMass <= 0d ? 0d : totalThrust / (totalMass * Gravity);
+            Vector3 centerThrust = totalVacuumThrust <= 0d ? Vector3.zero : centerThrustSum / (float)totalVacuumThrust;
+            double weightedSeaIsp = totalSeaLevelThrust <= 0d ? 0d : totalSeaIspThrust / totalSeaLevelThrust;
+            double weightedVacuumIsp = totalVacuumThrust <= 0d ? 0d : totalVacuumIspThrust / totalVacuumThrust;
+            int launchStage = -1;
+            foreach (int candidateStage in stageData.Keys)
+            {
+                if ((int)stageData[candidateStage]["engine_count"] > 0) launchStage = Math.Max(launchStage, candidateStage);
+            }
+            double launchSeaLevelThrust = launchStage < 0 ? 0d : (double)stageData[launchStage]["sea_level_thrust_kN"];
+            double launchVacuumThrust = launchStage < 0 ? 0d : (double)stageData[launchStage]["vacuum_thrust_kN"];
+            double seaTwr = totalMass <= 0d ? 0d : launchSeaLevelThrust / (totalMass * Gravity);
+            double vacuumTwr = totalMass <= 0d ? 0d : launchVacuumThrust / (totalMass * Gravity);
+            double comAboveThrust = centerMass.y - centerThrust.y;
             double estimatedDv = 0d;
 
             if (engineCount == 0)
@@ -1088,7 +1137,18 @@ namespace KspMcp
             {
                 if (seaTwr < 1.0d) errors.Add("estimated liftoff TWR is below 1.0; the craft cannot climb from the launch pad");
                 else if (seaTwr < 1.20d) warnings.Add("estimated liftoff TWR is below 1.20; ascent will be slow and drag losses may be high");
-                double comAboveThrust = centerMass.y - centerThrust.y;
+                Part rootPart = null;
+                foreach (Part candidate in EditorLogic.fetch.ship.parts)
+                {
+                    if (candidate != null && candidate.parent == null)
+                    {
+                        rootPart = candidate;
+                        break;
+                    }
+                }
+                Vector3 localCenterMass = rootPart == null ? centerMass : rootPart.transform.InverseTransformPoint(centerMass);
+                Vector3 localCenterThrust = rootPart == null ? centerThrust : rootPart.transform.InverseTransformPoint(centerThrust);
+                comAboveThrust = localCenterMass.y - localCenterThrust.y;
                 if (comAboveThrust <= 0.05d)
                 {
                     errors.Add("center of mass is not above the center of thrust in the VAB vertical axis; the rocket may pitch over");
@@ -1103,7 +1163,8 @@ namespace KspMcp
                 foreach (int stage in stageNumbers)
                 {
                     Dictionary<string, object> item = stageData[stage];
-                    double stageThrust = (double)item["thrust_kN"];
+                    double stageThrust = (double)item["vacuum_thrust_kN"];
+                    double stageSeaThrust = (double)item["sea_level_thrust_kN"];
                     double stagePropellant = (double)item["propellant_mass_tonnes"];
                     double remainingMass = 0d;
                     foreach (Part candidate in EditorLogic.fetch.ship.parts)
@@ -1112,12 +1173,14 @@ namespace KspMcp
                         int candidateStage = candidate.inverseStage < 0 ? 0 : candidate.inverseStage;
                         if (candidate.inverseStage < 0 || candidateStage <= stage) remainingMass += SafePartMass(candidate);
                     }
-                    double stageSeaTwr = remainingMass <= 0d ? 0d : stageThrust / (remainingMass * Gravity);
+                    double stageSeaTwr = remainingMass <= 0d ? 0d : stageSeaThrust / (remainingMass * Gravity);
+                    double stageVacuumTwr = remainingMass <= 0d ? 0d : stageThrust / (remainingMass * Gravity);
                     double stageVacuumIsp = (double)item["vacuum_isp_s"] <= 0d ? 0d : (double)item["vacuum_isp_s"] / Math.Max(0.001d, stageThrust);
                     double finalMass = Math.Max(0.001d, remainingMass - stagePropellant);
                     double stageDv = stageVacuumIsp <= 0d || remainingMass <= finalMass ? 0d : stageVacuumIsp * Gravity * Math.Log(remainingMass / finalMass);
                     item["remaining_mass_tonnes"] = remainingMass;
                     item["twr_sea_level"] = stageSeaTwr;
+                    item["twr_vacuum"] = stageVacuumTwr;
                     item["vacuum_isp_s"] = stageVacuumIsp;
                     item["delta_v_mps_estimate"] = stageDv;
                     estimatedDv += stageDv;
@@ -1147,7 +1210,9 @@ namespace KspMcp
                 { "mass_tonnes", totalMass },
                 { "propellant_mass_tonnes", totalPropellantMass },
                 { "engine_count", engineCount },
-                { "thrust_kN", totalThrust },
+                { "launch_stage", launchStage },
+                { "thrust_kN_sea_level", launchSeaLevelThrust },
+                { "thrust_kN_vacuum", launchVacuumThrust },
                 { "twr_sea_level", seaTwr },
                 { "twr_vacuum", vacuumTwr },
                 { "sea_level_isp_s", weightedSeaIsp },
@@ -1155,7 +1220,7 @@ namespace KspMcp
                 { "delta_v_mps_estimate", estimatedDv },
                 { "center_of_mass", JsonUtil.Vector3Object(centerMass) },
                 { "center_of_thrust", JsonUtil.Vector3Object(centerThrust) },
-                { "com_above_thrust_m", totalThrust <= 0d ? 0d : centerMass.y - centerThrust.y },
+                { "com_above_thrust_m", totalVacuumThrust <= 0d ? 0d : comAboveThrust },
                 { "stage_summary", stageSummary },
                 { "engines", engineReports }
             };
@@ -1172,6 +1237,8 @@ namespace KspMcp
                 { "engine_count", 0 },
                 { "part_mass_tonnes", 0d },
                 { "propellant_mass_tonnes", 0d },
+                { "sea_level_thrust_kN", 0d },
+                { "vacuum_thrust_kN", 0d },
                 { "thrust_kN", 0d },
                 { "sea_isp_s", 0d },
                 { "vacuum_isp_s", 0d }
