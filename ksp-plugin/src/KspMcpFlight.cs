@@ -25,6 +25,8 @@ namespace KspMcp
         private int _lastTelemetryIgnitedEngines = -1;
         private int _lastTelemetryOperationalEngines = -1;
         private int _lastTelemetryFlameoutEngines = -1;
+        private double _lastTelemetryTimeToApoapsis = double.NaN;
+        private double _lastTelemetryTimeToPeriapsis = double.NaN;
         private float _lastCompactSummaryAt = -1f;
         private string _compactSummaryVesselId;
         private Dictionary<string, object> _compactEngineSummary;
@@ -156,6 +158,8 @@ namespace KspMcp
             _lastTelemetryIgnitedEngines = -1;
             _lastTelemetryOperationalEngines = -1;
             _lastTelemetryFlameoutEngines = -1;
+            _lastTelemetryTimeToApoapsis = double.NaN;
+            _lastTelemetryTimeToPeriapsis = double.NaN;
             _lastCompactSummaryAt = -1f;
             _compactSummaryVesselId = null;
             _compactEngineSummary = null;
@@ -185,6 +189,8 @@ namespace KspMcp
                 _lastTelemetryIgnitedEngines = -1;
                 _lastTelemetryOperationalEngines = -1;
                 _lastTelemetryFlameoutEngines = -1;
+                _lastTelemetryTimeToApoapsis = double.NaN;
+                _lastTelemetryTimeToPeriapsis = double.NaN;
                 return;
             }
 
@@ -210,6 +216,8 @@ namespace KspMcp
                 _lastTelemetryIgnitedEngines = -1;
                 _lastTelemetryOperationalEngines = -1;
                 _lastTelemetryFlameoutEngines = -1;
+                _lastTelemetryTimeToApoapsis = double.NaN;
+                _lastTelemetryTimeToPeriapsis = double.NaN;
             }
             string previousSituation = _lastTelemetrySituation;
             if (!string.Equals(_lastTelemetrySituation, situation, StringComparison.Ordinal))
@@ -318,6 +326,34 @@ namespace KspMcp
                     { "vertical_speed", vessel.verticalSpeed },
                     { "surface_speed", vessel.srfSpeed }
                 });
+            }
+
+            if (vessel.orbit != null)
+            {
+                double timeToApoapsis = NumberMember(vessel.orbit, "timeToAp");
+                double timeToPeriapsis = NumberMember(vessel.orbit, "timeToPe");
+                if (!double.IsNaN(_lastTelemetryTimeToApoapsis) &&
+                    _lastTelemetryTimeToApoapsis > 0.5d && timeToApoapsis <= 0.5d)
+                {
+                    bridge.RecordEvent("flight.apoapsis.reached", new Dictionary<string, object>
+                    {
+                        { "vessel_id", vesselId },
+                        { "apoapsis", NumberMember(vessel.orbit, "ApA") },
+                        { "periapsis", NumberMember(vessel.orbit, "PeA") }
+                    });
+                }
+                if (!double.IsNaN(_lastTelemetryTimeToPeriapsis) &&
+                    _lastTelemetryTimeToPeriapsis > 0.5d && timeToPeriapsis <= 0.5d)
+                {
+                    bridge.RecordEvent("flight.periapsis.reached", new Dictionary<string, object>
+                    {
+                        { "vessel_id", vesselId },
+                        { "apoapsis", NumberMember(vessel.orbit, "ApA") },
+                        { "periapsis", NumberMember(vessel.orbit, "PeA") }
+                    });
+                }
+                _lastTelemetryTimeToApoapsis = timeToApoapsis;
+                _lastTelemetryTimeToPeriapsis = timeToPeriapsis;
             }
         }
 
@@ -849,24 +885,36 @@ namespace KspMcp
             // KSP exposes currentStage as the staging cursor. The action
             // that Space/StageManager will trigger next is one lower, and
             // parts carry that lower number in inverseStage.
-            int nextStage = Math.Max(0, vessel.currentStage - 1);
+            int stagingCursorBefore = vessel.currentStage;
+            int nextStage = Math.Max(0, stagingCursorBefore - 1);
             bool currentStageHasEngine = false;
+            bool currentStageHasAction = false;
+            bool hasLowerAction = false;
             bool currentStageLiveEngine = false;
             bool currentStageIgnited = false;
             bool anyIgnitedEngine = false;
-            bool anyLiveEngine = false;
+            bool anyIgnitedLiveEngine = false;
             foreach (Part part in vessel.parts)
             {
                 if (part == null || part.Modules == null) continue;
                 foreach (PartModule module in part.Modules)
                 {
-                    if (module == null || module.GetType().Name.IndexOf("ModuleEngines", StringComparison.OrdinalIgnoreCase) < 0) continue;
+                    if (module == null) continue;
+                    string moduleName = module.GetType().Name;
+                    bool isEngine = moduleName.IndexOf("ModuleEngines", StringComparison.OrdinalIgnoreCase) >= 0;
+                    bool isDecoupler = moduleName.IndexOf("Decouple", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                        moduleName.IndexOf("Separator", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                        moduleName.IndexOf("Seperator", StringComparison.OrdinalIgnoreCase) >= 0;
+                    if (!isEngine && !isDecoupler) continue;
+                    if (part.inverseStage == nextStage) currentStageHasAction = true;
+                    else if (part.inverseStage >= 0 && part.inverseStage < nextStage) hasLowerAction = true;
+                    if (!isEngine) continue;
                     bool flameout = BoolMember(module, "flameout");
                     bool operational = BoolMember(module, "isOperational");
                     bool ignited = BoolMember(module, "engineIgnited");
                     bool enabled = BoolMember(module, "moduleIsEnabled") || BoolMember(module, "isEnabled");
                     if (ignited) anyIgnitedEngine = true;
-                    if (!flameout && (operational || ignited || enabled)) anyLiveEngine = true;
+                    if (ignited && !flameout) anyIgnitedLiveEngine = true;
                     if (part.inverseStage != nextStage) continue;
                     currentStageHasEngine = true;
                     if (ignited) currentStageIgnited = true;
@@ -879,26 +927,53 @@ namespace KspMcp
             // engines disabled forever.
             if (currentStageHasEngine && !currentStageIgnited && _guidance.LastThrottle > 0.05d)
             {
-                if (ActivateNextStageRaw())
+                bool activated = ActivateNextStageRaw();
+                if (!activated)
+                {
+                    // A few editor-created or modded vessels do not expose
+                    // a working StageManager action for ModuleEnginesFX.
+                    // Reuse the deterministic per-part staging fallback so
+                    // ignition is still possible without visual interaction.
+                    try
+                    {
+                        Stage();
+                        activated = true;
+                    }
+                    catch (Exception exception)
+                    {
+                        _guidance.LastError = exception.Message;
+                    }
+                }
+                if (activated)
                 {
                     if (_guidance != null) _guidance.Phase = "automatic_ignition";
                     KspMcpBridge bridge = KspMcpBridge.Instance;
                     if (bridge != null) bridge.RecordEvent("flight.ignition.automatic", new Dictionary<string, object>
                     {
                         { "stage", nextStage },
-                        { "staging_cursor", vessel.currentStage }
+                        { "staging_cursor_before", stagingCursorBefore },
+                        { "staging_cursor_after", vessel.currentStage }
                     });
                 }
                 return;
             }
-            // Once a previously activated stage is burning, its inverseStage
-            // is usually greater than Vessel.currentStage because KSP has
-            // already moved the staging cursor down. Inspect all engines
-            // before deciding that a stage has died; otherwise an automated
-            // controller can separate a healthy booster one frame later.
-            if (anyIgnitedEngine && anyLiveEngine) return;
-            if (!currentStageHasEngine && anyLiveEngine) return;
+            // Once a previously activated stage is still ignited and has not
+            // flamed out, its inverseStage is usually greater than
+            // Vessel.currentStage because KSP has already moved the staging
+            // cursor down. Do not count a future engine that is merely
+            // enabled as "live"; doing so can prevent a pure decoupler stage
+            // from ever firing.
+            if (anyIgnitedEngine && anyIgnitedLiveEngine) return;
             if (currentStageHasEngine && currentStageLiveEngine && currentStageIgnited) return;
+            // Empty staging rows are legal in KSP. Advance through one when
+            // a lower actionable stage exists instead of leaving guidance
+            // permanently parked on an empty cursor.
+            if (!currentStageHasAction && !hasLowerAction) return;
+            // Do not advance an untouched prelaunch/upper-stage cursor while
+            // the guidance controller is intentionally coasting at zero
+            // throttle. A stage following a real flameout remains eligible
+            // because anyIgnitedEngine is still true in that case.
+            if (!anyIgnitedEngine && _guidance.LastThrottle <= 0.05d) return;
             try
             {
                 Stage();
@@ -906,8 +981,9 @@ namespace KspMcp
                 KspMcpBridge bridge = KspMcpBridge.Instance;
                 if (bridge != null) bridge.RecordEvent("flight.stage.automatic", new Dictionary<string, object>
                 {
-                    { "stage", Math.Max(0, vessel.currentStage - 1) },
-                    { "staging_cursor", vessel.currentStage }
+                    { "stage", nextStage },
+                    { "staging_cursor_before", stagingCursorBefore },
+                    { "staging_cursor_after", vessel.currentStage }
                 });
             }
             catch (Exception exception)
@@ -1017,6 +1093,14 @@ namespace KspMcp
             {
                 if (part != null && part.inverseStage == target) stagedParts.Add(part);
             }
+            // Match KSP's normal staging order. The in-stage index is the
+            // order used by the stock staging stack for parts sharing one
+            // stage, which matters when a separator and an engine are fired
+            // together.
+            stagedParts.Sort(delegate(Part left, Part right)
+            {
+                return right.inStageIndex.CompareTo(left.inStageIndex);
+            });
 
             // StageManager is reliable for stock decouplers, but it does not
             // consistently invoke ModuleEnginesFX actions on vessels created
@@ -1045,6 +1129,7 @@ namespace KspMcp
                     { "staged", true },
                     { "stage_before", before },
                     { "stage_activated", target },
+                    { "stage_after", vessel.currentStage },
                     { "custom_activation", invoked },
                     { "state", Snapshot() }
                 };
@@ -1060,7 +1145,7 @@ namespace KspMcp
                 { "stage_activated", target },
                 { "custom_activation", false }
             });
-            return new Dictionary<string, object> { { "staged", true }, { "stage_before", before }, { "state", Snapshot() } };
+            return new Dictionary<string, object> { { "staged", true }, { "stage_before", before }, { "stage_activated", target }, { "stage_after", vessel.currentStage }, { "custom_activation", false }, { "state", Snapshot() } };
         }
 
         public Dictionary<string, object> Warp(Dictionary<string, object> args)
@@ -1265,11 +1350,23 @@ namespace KspMcp
 
         private static bool InvokeEngineModule(PartModule module)
         {
-            ModuleEngines engine = module as ModuleEngines;
-            if (engine == null) return false;
+            if (module == null) return false;
             try
             {
-                engine.Activate();
+                ModuleEngines engine = module as ModuleEngines;
+                if (engine != null)
+                {
+                    engine.Activate();
+                }
+                else
+                {
+                    // ModuleEnginesFX and modded engine modules can expose
+                    // the same activation method without inheriting the
+                    // stock ModuleEngines type used by this KSP build.
+                    MethodInfo activate = module.GetType().GetMethod("Activate", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance, null, Type.EmptyTypes, null);
+                    if (activate == null) return false;
+                    activate.Invoke(module, null);
+                }
                 KspMcpBridge.Log("direct engine Activate invoked module=" + module.GetType().Name);
                 return true;
             }
@@ -1596,6 +1693,9 @@ namespace KspMcp
                 { "argument_of_periapsis_deg", NumberMember(orbit, "argumentOfPeriapsis") },
                 { "period_s", NumberMember(orbit, "period") },
                 { "epoch_ut", NumberMember(orbit, "epoch") },
+                { "mean_anomaly_at_epoch_rad", NumberMember(orbit, "meanAnomalyAtEpoch") },
+                { "mean_motion_rad_s", NumberMember(orbit, "meanMotion") },
+                { "true_anomaly_rad", NumberMember(orbit, "trueAnomaly") },
                 { "time_to_apoapsis_s", NumberMember(orbit, "timeToAp") },
                 { "time_to_periapsis_s", NumberMember(orbit, "timeToPe") }
             };

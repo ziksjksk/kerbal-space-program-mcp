@@ -61,6 +61,32 @@ def _normalise_degrees(angle: float) -> float:
     return 180.0 if math.isclose(result, -180.0, abs_tol=1e-12) else result
 
 
+def _current_orbital_longitude_deg(body: dict[str, Any], universal_time: float) -> float | None:
+    """Estimate a body's current inertial longitude from KSP orbit fields.
+
+    KSP provides the mean anomaly at epoch and mean motion for loaded body
+    orbits. This is intentionally optional: older/modified installations may
+    omit one of the fields, in which case the transfer plan remains a useful
+    delta-v estimate but cannot claim that the departure window is aligned.
+    """
+
+    orbit = body.get("orbit")
+    if not isinstance(orbit, dict):
+        return None
+    values: list[float] = []
+    for key in ("mean_anomaly_at_epoch_rad", "mean_motion_rad_s", "epoch_ut"):
+        value = orbit.get(key)
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+            return None
+        values.append(float(value))
+    mean_anomaly = values[0] + values[1] * (universal_time - values[2])
+    lan = orbit.get("longitude_of_ascending_node_deg", 0.0)
+    argument = orbit.get("argument_of_periapsis_deg", 0.0)
+    if any(isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)) for value in (lan, argument)):
+        return None
+    return _normalise_degrees(math.degrees(mean_anomaly) + float(lan) + float(argument))
+
+
 def _sqrt(value: float, field: str) -> float:
     if value <= 0 or not math.isfinite(value):
         raise OrbitalPlanError(f"could not calculate a positive {field}")
@@ -182,6 +208,18 @@ def plan_circular_hohmann_transfer(
 
     current_ut = flight_payload.get("universal_time")
     current_ut = float(current_ut) if isinstance(current_ut, (int, float)) else None
+    current_phase = None
+    phase_error = None
+    if current_ut is not None:
+        origin_longitude = _current_orbital_longitude_deg(origin, current_ut)
+        destination_longitude = _current_orbital_longitude_deg(destination, current_ut)
+        if origin_longitude is not None and destination_longitude is not None:
+            current_phase = _normalise_degrees(destination_longitude - origin_longitude)
+            phase_error = _normalise_degrees(current_phase - phase_angle)
+        else:
+            warnings.append(
+                "the running game did not expose enough orbital epoch data to verify the current departure phase angle"
+            )
     return {
         "model": "circular_coplanar_hohmann_patched_conic_estimate",
         "origin_body": origin_name,
@@ -218,6 +256,9 @@ def plan_circular_hohmann_transfer(
         "total_estimated_delta_v_mps": departure_dv + arrival_dv,
         "phase_alignment": {
             "required_target_lead_deg": phase_angle,
+            "current_target_lead_deg": current_phase,
+            "phase_error_deg": phase_error,
+            "verified_from_loaded_orbit": current_phase is not None,
             "how_to_use": "compare the current target-body phase to this value before committing the departure burn",
         },
         "assumptions": [

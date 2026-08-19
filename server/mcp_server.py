@@ -1,4 +1,4 @@
-"""A dependency-free MCP stdio server for the KSP bridge."""
+"jh®Ð¥‹¥FŠ-zW¦z{b²h¬²)à"""A dependency-free MCP stdio server for the KSP bridge."""
 
 from __future__ import annotations
 
@@ -571,7 +571,7 @@ def handle_message(app: KspMcpApplication, message: dict[str, Any]) -> dict[str,
             {
                 "protocolVersion": str(params.get("protocolVersion", "2024-11-05")),
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "kerbal-space-program", "version": "0.2.6"},
+                "serverInfo": {"name": "kerbal-space-program", "version": "0.2.7"},
                 "instructions": (
                     "Use ksp_realtime_state for compact no-visual state. Build in VAB/SPH with "
                     "ksp_editor_new and live ksp_editor_apply_craft, then poll "

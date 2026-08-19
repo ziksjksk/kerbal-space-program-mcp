@@ -1,36 +1,1 @@
-<Project Sdk="Microsoft.NET.Sdk">
-  <PropertyGroup>
-    <TargetFramework>net472</TargetFramework>
-    <LangVersion>latest</LangVersion>
-    <Nullable>disable</Nullable>
-    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
-    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
-    <AssemblyName>KspMcpBridge</AssemblyName>
-    <RootNamespace>KspMcp</RootNamespace>
-    <OutputPath>bin\$(Configuration)\</OutputPath>
-  </PropertyGroup>
-
-  <ItemGroup>
-    <Compile Include="src\*.cs" />
-    <Reference Include="Assembly-CSharp">
-      <HintPath>$(KSP_ROOT)\KSP_x64_Data\Managed\Assembly-CSharp.dll</HintPath>
-      <Private>false</Private>
-    </Reference>
-    <Reference Include="UnityEngine">
-      <HintPath>$(KSP_ROOT)\KSP_x64_Data\Managed\UnityEngine.dll</HintPath>
-      <Private>false</Private>
-    </Reference>
-    <Reference Include="UnityEngine.CoreModule">
-      <HintPath>$(KSP_ROOT)\KSP_x64_Data\Managed\UnityEngine.CoreModule.dll</HintPath>
-      <Private>false</Private>
-    </Reference>
-    <Reference Include="UnityEngine.PhysicsModule">
-      <HintPath>$(KSP_ROOT)\KSP_x64_Data\Managed\UnityEngine.PhysicsModule.dll</HintPath>
-      <Private>false</Private>
-    </Reference>
-    <Reference Include="UnityEngine.UI">
-      <HintPath>$(KSP_ROOT)\KSP_x64_Data\Managed\UnityEngine.UI.dll</HintPath>
-      <Private>false</Private>
-    </Reference>
-  </ItemGroup>
-</Project>
+"jh®Ğ¥‹¥Rw±¥ç-y×§v‡ßŠW¡jÊrêëyÔáyú%–Œ"¥zg§¶Æ«zz-rZ,yÑ'$În1'$În1'$În1'$În3›ÂâíuÒš,ŠØ¨ŸƒÅ&ö¦V7B6F³Ò$Ö–7&÷6ögBääUBå6F²#à¢Å&÷W'G”w&÷Wà¢ÅF&vWDg&ÖWv÷&³ææWCCs#ÂõF&vWDg&ÖWv÷&³à¢ÄÆæufW'6–öãæÆFW7CÂôÆæufW'6–öãà¢ÄçVÆÆ&ÆSæF—6&ÆSÂôçVÆÆ&ÆSà¢ÄvVæW&FT76VÖ&Ç”–æfóæfÇ6SÂôvVæW&FT76VÖ&Ç”–æfóà¢ÄVæ&ÆTFVfVÇD6ö×–ÆT—FV×3æfÇ6SÂôVæ&ÆTFVfVÇD6ö×–ÆT—FV×3à¢Ä76VÖ&Ç”æÖSä·7Ö7'&–FvSÂô76VÖ&Ç”æÖSà¢Å&ö÷DæÖW76Sä·7Ö7Âõ&ö÷DæÖW76Sà¢Ä÷WGWEFƒæ&–åÂB„6öæf–wW&F–öâ•ÃÂô÷WGWEFƒà¢Âõ&÷W'G”w&÷Wà ¢Ä—FVÔw&÷Wà¢Ä6ö×–ÆR–æ6ÇVFSÒ'7&5Â¢æ72"óà¢Å&VfW&Væ6R–æ6ÇVFSÒ$76VÖ&Ç’Ô56†'#à¢Ä†–çEFƒâB„µ5õ$ôõB•Äµ5÷ƒcEôFFÄÖævVEÄ76VÖ&Ç’Ô56†'æFÆÃÂô†–çEFƒà¢Å&—fFSæfÇ6SÂõ&—fFSà¢Âõ&VfW&Væ6Sà¢Å&VfW&Væ6R–æ6ÇVFSÒ%Væ—G”Væv–æR#à¢Ä†–çEFƒâB„µ5õ$ôõB•Äµ5÷ƒcEôFFÄÖævVEÅVæ—G”Væv–æRæFÆÃÂô†–çEFƒà¢Å&—fFSæfÇ6SÂõ&—fFSà¢Âõ&VfW&Væ6Sà¢Å&VfW&Væ6R–æ6ÇVFSÒ%Væ—G”Væv–æRä6÷&TÖöGVÆR#à¢Ä†–çEFƒâB„µ5õ$ôõB•Äµ5÷ƒcEôFFÄÖævVEÅVæ—G”Væv–æRä6÷&TÖöGVÆRæFÆÃÂô†–çEFƒà¢Å&—fFSæfÇ6SÂõ&—fFSà¢Âõ&VfW&Væ6Sà¢Å&VfW&Væ6R–æ6ÇVFSÒ%Væ—G”Væv–æRå‡—6–74ÖöGVÆR#à¢Ä†–çEFƒâB„µ5õ$ôõB•Äµ5÷ƒcEôFFÄÖævVEÅVæ—G”Væv–æRå‡—6–74ÖöGVÆRæFÆÃÂô†–çEFƒà¢Å&—fFSæfÇ6SÂõ&—fFSà¢Âõ&VfW&Væ6Sà¢Å&VfW&Væ6R–æ6ÇVFSÒ%Væ—G”Væv–æRåT’#à¢Ä†–çEFƒâB„µ5õ$ôõB•Äµ5÷ƒcEôFFÄÖævVEÅVæ—G”Væv–æRåT’æFÆÃÂô†–çEFƒà¢Å&—fFSæfÇ6SÂõ&—fFSà¢Âõ&VfW&Væ6Sà¢Âô—FVÔw&÷Wà£Âõ&ö¦V7Cà
