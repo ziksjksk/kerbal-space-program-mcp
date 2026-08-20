@@ -15,6 +15,11 @@ namespace KspMcp
         private bool _rcsEnabled;
         private GuidancePlan _guidance;
         private double _lastGuidanceStageAt;
+        private int _lastAutomaticStageCommandCursor = int.MinValue;
+        private double _lastAutomaticStageCommandAt = double.NegativeInfinity;
+        private int _lastAutomaticStageActivatedCursor = int.MinValue;
+        private double _lastAutomaticStageActivatedAt = double.NegativeInfinity;
+        private readonly HashSet<int> _automaticStageTargetsActivated = new HashSet<int>();
         private bool _haveTelemetryIdentity;
         private string _lastTelemetryVesselId;
         private string _lastTelemetrySituation;
@@ -27,6 +32,8 @@ namespace KspMcp
         private int _lastTelemetryFlameoutEngines = -1;
         private double _lastTelemetryTimeToApoapsis = double.NaN;
         private double _lastTelemetryTimeToPeriapsis = double.NaN;
+        private bool _apoapsisEventArmed = true;
+        private bool _periapsisEventArmed = true;
         private float _lastCompactSummaryAt = -1f;
         private string _compactSummaryVesselId;
         private Dictionary<string, object> _compactEngineSummary;
@@ -48,6 +55,18 @@ namespace KspMcp
             public double StartedAt;
             public double EndsAt;
             public bool AutoStage;
+            public int AscentLaunchStageCursor;
+            public int AscentTransferStageCursor;
+            public bool CircularisationBurnStarted;
+            public bool CircularisationBurnCompleted;
+            public double CircularisationBurnAt;
+            public double CircularisationBurnDuration;
+            public double CircularisationTargetDeltaV;
+            public double CircularisationStartApoapsis;
+            public bool CircularisationTrimStarted;
+            public double CircularisationTrimAt;
+            public double CircularisationTrimDuration;
+            public double CircularisationTrimTargetDeltaV;
             public string Phase;
             public string LastError;
             public double LastThrottle;
@@ -177,6 +196,13 @@ namespace KspMcp
             _lastTelemetryFlameoutEngines = -1;
             _lastTelemetryTimeToApoapsis = double.NaN;
             _lastTelemetryTimeToPeriapsis = double.NaN;
+            _apoapsisEventArmed = true;
+            _periapsisEventArmed = true;
+            _lastAutomaticStageCommandCursor = int.MinValue;
+            _lastAutomaticStageCommandAt = double.NegativeInfinity;
+            _lastAutomaticStageActivatedCursor = int.MinValue;
+            _lastAutomaticStageActivatedAt = double.NegativeInfinity;
+            _automaticStageTargetsActivated.Clear();
             _lastCompactSummaryAt = -1f;
             _compactSummaryVesselId = null;
             _compactEngineSummary = null;
@@ -208,6 +234,8 @@ namespace KspMcp
                 _lastTelemetryFlameoutEngines = -1;
                 _lastTelemetryTimeToApoapsis = double.NaN;
                 _lastTelemetryTimeToPeriapsis = double.NaN;
+                _apoapsisEventArmed = true;
+                _periapsisEventArmed = true;
                 return;
             }
 
@@ -235,6 +263,8 @@ namespace KspMcp
                 _lastTelemetryFlameoutEngines = -1;
                 _lastTelemetryTimeToApoapsis = double.NaN;
                 _lastTelemetryTimeToPeriapsis = double.NaN;
+                _apoapsisEventArmed = true;
+                _periapsisEventArmed = true;
             }
             string previousSituation = _lastTelemetrySituation;
             if (!string.Equals(_lastTelemetrySituation, situation, StringComparison.Ordinal))
@@ -352,11 +382,21 @@ namespace KspMcp
                 });
             }
 
-            if (vessel.orbit != null)
+            // KSP exposes a synthetic orbit while a vessel is still on the
+            // launch pad. Its time-to-apsis can hover around zero and produce
+            // a stream of false apoapsis/periapsis crossings. Those events
+            // are only meaningful once the vessel is airborne (or already in
+            // an orbit), so keep the visionless event stream quiet on the
+            // pad and add hysteresis around the real crossing.
+            bool orbitalEventsMeaningful = !string.Equals(situation, "PRELAUNCH", StringComparison.OrdinalIgnoreCase) &&
+                !string.Equals(situation, "LANDED", StringComparison.OrdinalIgnoreCase) &&
+                !string.Equals(situation, "SPLASHED", StringComparison.OrdinalIgnoreCase) &&
+                !string.Equals(situation, "DEAD", StringComparison.OrdinalIgnoreCase);
+            if (vessel.orbit != null && orbitalEventsMeaningful)
             {
                 double timeToApoapsis = NumberMember(vessel.orbit, "timeToAp");
                 double timeToPeriapsis = NumberMember(vessel.orbit, "timeToPe");
-                if (!double.IsNaN(_lastTelemetryTimeToApoapsis) &&
+                if (_apoapsisEventArmed && !double.IsNaN(_lastTelemetryTimeToApoapsis) &&
                     _lastTelemetryTimeToApoapsis > 0.5d && timeToApoapsis <= 0.5d)
                 {
                     bridge.RecordEvent("flight.apoapsis.reached", new Dictionary<string, object>
@@ -365,8 +405,13 @@ namespace KspMcp
                         { "apoapsis", NumberMember(vessel.orbit, "ApA") },
                         { "periapsis", NumberMember(vessel.orbit, "PeA") }
                     });
+                    _apoapsisEventArmed = false;
                 }
-                if (!double.IsNaN(_lastTelemetryTimeToPeriapsis) &&
+                else if (!_apoapsisEventArmed && timeToApoapsis > 1.0d)
+                {
+                    _apoapsisEventArmed = true;
+                }
+                if (_periapsisEventArmed && !double.IsNaN(_lastTelemetryTimeToPeriapsis) &&
                     _lastTelemetryTimeToPeriapsis > 0.5d && timeToPeriapsis <= 0.5d)
                 {
                     bridge.RecordEvent("flight.periapsis.reached", new Dictionary<string, object>
@@ -375,6 +420,11 @@ namespace KspMcp
                         { "apoapsis", NumberMember(vessel.orbit, "ApA") },
                         { "periapsis", NumberMember(vessel.orbit, "PeA") }
                     });
+                    _periapsisEventArmed = false;
+                }
+                else if (!_periapsisEventArmed && timeToPeriapsis > 1.0d)
+                {
+                    _periapsisEventArmed = true;
                 }
                 _lastTelemetryTimeToApoapsis = timeToApoapsis;
                 _lastTelemetryTimeToPeriapsis = timeToPeriapsis;
@@ -474,6 +524,8 @@ namespace KspMcp
             }
             double now = Planetarium.GetUniversalTime();
             double maxSeconds = Math.Max(5d, Math.Min(3600d, JsonUtil.Number(args, "max_seconds", profile == "landing" || profile == "node_burn" ? 600d : 240d)));
+            Vessel activeVessel = FlightGlobals.ActiveVessel;
+            int ascentLaunchStageCursor = profile == "ascent" ? DetectAscentLaunchStageCursor(activeVessel) : int.MinValue;
             _guidance = new GuidancePlan
             {
                 Profile = profile,
@@ -490,6 +542,18 @@ namespace KspMcp
                 StartedAt = now,
                 EndsAt = now + maxSeconds,
                 AutoStage = JsonUtil.Boolean(args, "auto_stage", true),
+                AscentLaunchStageCursor = ascentLaunchStageCursor,
+                AscentTransferStageCursor = profile == "ascent" ? DetectAscentTransferStageCursor(activeVessel, ascentLaunchStageCursor) : int.MinValue,
+                CircularisationBurnStarted = false,
+                CircularisationBurnCompleted = false,
+                CircularisationBurnAt = 0d,
+                CircularisationBurnDuration = 0d,
+                CircularisationTargetDeltaV = 0d,
+                CircularisationStartApoapsis = 0d,
+                CircularisationTrimStarted = false,
+                CircularisationTrimAt = 0d,
+                CircularisationTrimDuration = 0d,
+                CircularisationTrimTargetDeltaV = 0d,
                 Phase = "initialising",
                 LastError = null,
                 BurnCompletionRecorded = false,
@@ -514,9 +578,17 @@ namespace KspMcp
             _sasEnabled = false;
             try { FireGroup("SAS", false); } catch (Exception) { }
             _lastGuidanceStageAt = now;
+            _lastAutomaticStageCommandCursor = int.MinValue;
+            _lastAutomaticStageCommandAt = double.NegativeInfinity;
+            _lastAutomaticStageActivatedCursor = int.MinValue;
+            _lastAutomaticStageActivatedAt = double.NegativeInfinity;
+            _automaticStageTargetsActivated.Clear();
             KspMcpBridge bridge = KspMcpBridge.Instance;
             if (bridge != null) bridge.RecordEvent("flight.guidance.started", new Dictionary<string, object>
             {
+                { "vessel_id", activeVessel == null ? null : activeVessel.id.ToString() },
+                { "vessel_name", activeVessel == null ? null : activeVessel.vesselName },
+                { "situation", activeVessel == null ? null : activeVessel.situation.ToString() },
                 { "profile", profile },
                 { "preflight", preflight }
             });
@@ -633,9 +705,12 @@ namespace KspMcp
                 _guidance.EndsAt = Math.Min(_guidance.StartedAt + 7200d, _guidance.EndsAt + extension);
             }
 
+            Vessel eventVessel = FlightGlobals.ActiveVessel;
             KspMcpBridge bridge = KspMcpBridge.Instance;
             if (bridge != null) bridge.RecordEvent("flight.guidance.updated", new Dictionary<string, object>
             {
+                { "vessel_id", eventVessel == null ? null : eventVessel.id.ToString() },
+                { "vessel_name", eventVessel == null ? null : eventVessel.vesselName },
                 { "profile", _guidance.Profile },
                 { "target_apoapsis", _guidance.TargetApoapsis },
                 { "target_periapsis", _guidance.TargetPeriapsis },
@@ -669,6 +744,21 @@ namespace KspMcp
                 { "gear_commanded", _guidance.GearCommanded },
                 { "touchdown_recorded", _guidance.TouchdownRecorded },
                 { "auto_stage", _guidance.AutoStage },
+                { "circularisation_burn_started", _guidance.CircularisationBurnStarted },
+                { "circularisation_burn_completed", _guidance.CircularisationBurnCompleted },
+                { "ascent_launch_stage_cursor", _guidance.AscentLaunchStageCursor == int.MinValue ? (object)null : _guidance.AscentLaunchStageCursor },
+                { "ascent_transfer_stage_cursor", _guidance.AscentTransferStageCursor == int.MinValue ? (object)null : _guidance.AscentTransferStageCursor },
+                { "transfer_stage_active", IsAscentTransferStageActive(FlightGlobals.ActiveVessel) },
+                { "circularisation_burn_elapsed_seconds", _guidance.CircularisationBurnStarted ? Math.Max(0d, now - _guidance.CircularisationBurnAt) : 0d },
+                { "circularisation_burn_duration_seconds", _guidance.CircularisationBurnDuration },
+                { "circularisation_burn_remaining_seconds", _guidance.CircularisationBurnStarted && !_guidance.CircularisationBurnCompleted ? Math.Max(0d, _guidance.CircularisationBurnDuration - Math.Max(0d, now - _guidance.CircularisationBurnAt)) : 0d },
+                { "circularisation_target_delta_v_mps", _guidance.CircularisationTargetDeltaV },
+                { "circularisation_start_apoapsis_m", _guidance.CircularisationStartApoapsis },
+                { "circularisation_trim_started", _guidance.CircularisationTrimStarted },
+                { "circularisation_trim_elapsed_seconds", _guidance.CircularisationTrimStarted ? Math.Max(0d, now - _guidance.CircularisationTrimAt) : 0d },
+                { "circularisation_trim_duration_seconds", _guidance.CircularisationTrimDuration },
+                { "circularisation_trim_remaining_seconds", _guidance.CircularisationTrimStarted && !_guidance.CircularisationBurnCompleted ? Math.Max(0d, _guidance.CircularisationTrimDuration - Math.Max(0d, now - _guidance.CircularisationTrimAt)) : 0d },
+                { "circularisation_trim_target_delta_v_mps", _guidance.CircularisationTrimTargetDeltaV },
                 { "seconds_remaining", Math.Max(0d, _guidance.EndsAt - now) },
                 { "last_throttle", _guidance.LastThrottle },
                 { "last_pitch", _guidance.LastPitch },
@@ -720,6 +810,33 @@ namespace KspMcp
         {
             double altitude = Math.Max(0d, vessel.altitude);
             double apoapsis = vessel.orbit == null ? 0d : NumberMember(vessel.orbit, "ApA");
+            double periapsis = vessel.orbit == null ? -1d : NumberMember(vessel.orbit, "PeA");
+            double timeToApoapsis = vessel.orbit == null ? double.PositiveInfinity : NumberMember(vessel.orbit, "timeToAp");
+            double apoapsisTolerance = Math.Max(500d, Math.Max(1d, _guidance.TargetApoapsis) * 0.02d);
+            double periapsisTolerance = Math.Max(250d, Math.Max(1d, _guidance.TargetPeriapsis) * 0.01d);
+            bool needsCircularisation = _guidance.TargetPeriapsis > 0d &&
+                periapsis < _guidance.TargetPeriapsis - periapsisTolerance;
+            bool transferStageActive = IsAscentTransferStageActive(vessel);
+            // Once a finite circularisation impulse has been latched, keep
+            // that state machine in control until its time/PeA stop condition
+            // fires.  ApA can dip a few metres below the insertion threshold
+            // on the first physics tick after apoapsis; allowing the normal
+            // apoapsis-trim branch to win there changes a timed full-throttle
+            // burn into a low-throttle feedback burn and can run it away.
+            bool circularisationBurnInProgress = _guidance.CircularisationBurnStarted &&
+                !_guidance.CircularisationBurnCompleted;
+            bool apoapsisAtInsertionWindow = _guidance.TargetApoapsis > 0d &&
+                apoapsis >= _guidance.TargetApoapsis - apoapsisTolerance;
+            // Stock KSP can restore the pre-separation staging cursor on the
+            // first physics tick after a decoupler fires.  The transfer
+            // engine is nevertheless the physically active engine, so the
+            // guidance state must follow the successful activation record,
+            // not only Vessel.currentStage.  Otherwise the controller stays
+            // in coast_to_apoapsis forever and misses circularisation.
+            bool transferBurnWindowMissed = transferStageActive &&
+                apoapsisAtInsertionWindow &&
+                vessel.verticalSpeed < -5d &&
+                altitude >= Math.Max(1000d, _guidance.TargetApoapsis - 15000d);
             double targetPitch = 90d;
             if (altitude >= 500d && altitude < 5000d) targetPitch = 90d - (altitude - 500d) / 4500d * 20d;
             else if (altitude >= 5000d && altitude < 20000d) targetPitch = 70d - (altitude - 5000d) / 15000d * 35d;
@@ -728,11 +845,134 @@ namespace KspMcp
 
             Vector3d target = AscentTargetVector(vessel, targetPitch);
             double throttle = 1d;
-            if (apoapsis >= _guidance.TargetApoapsis)
+            if (apoapsisAtInsertionWindow || circularisationBurnInProgress)
             {
-                throttle = 0d;
-                _guidance.Phase = "coast_to_apoapsis";
                 target = vessel.obt_velocity.sqrMagnitude > 0.01d ? vessel.obt_velocity.normalized : target;
+                // The launch stage must first coast with zero throttle. The
+                // automatic stage controller separates it before the apoapsis
+                // window and only the explicitly selected transfer stage may
+                // perform this insertion burn.
+                if (!transferStageActive && !circularisationBurnInProgress)
+                {
+                    throttle = 0d;
+                    _guidance.Phase = needsCircularisation ? "coast_to_apoapsis" : "orbit_achieved";
+                }
+                else if (!needsCircularisation && !circularisationBurnInProgress)
+                {
+                    throttle = 0d;
+                    _guidance.CircularisationBurnCompleted = true;
+                    _guidance.Phase = "orbit_achieved";
+                }
+                else if (_guidance.CircularisationBurnCompleted)
+                {
+                    throttle = 0d;
+                    _guidance.Phase = "circularisation_coast";
+                }
+                else
+                {
+                    // Begin early enough to account for a realistic finite
+                    // burn. Waiting until timeToAp <= 5 s starts far too late
+                    // for a 650 kN transfer engine and forces the burn to
+                    // continue well past apoapsis.
+                    double estimatedTargetDeltaV;
+                    double estimatedBurnDuration = EstimateCircularisationBurnDuration(
+                        vessel,
+                        _guidance.TargetApoapsis,
+                        _guidance.TargetPeriapsis,
+                        out estimatedTargetDeltaV);
+                    // Center a finite prograde impulse on apoapsis. KSP's
+                    // currentStage is the next staging cursor, so the
+                    // transfer engine can be selected before the burn starts;
+                    // the old fixed 60 s gate often ignited a 50-60 s burn
+                    // more than 40 s before apoapsis.
+                    double burnLeadTime = estimatedBurnDuration > 0d
+                        ? Math.Max(5d, estimatedBurnDuration * 0.5d)
+                        : 5d;
+                    if (!_guidance.CircularisationBurnStarted &&
+                        (timeToApoapsis <= Math.Min(60d, burnLeadTime) || transferBurnWindowMissed))
+                    {
+                        _guidance.CircularisationBurnDuration = estimatedBurnDuration;
+                        _guidance.CircularisationTargetDeltaV = estimatedTargetDeltaV;
+                        _guidance.CircularisationBurnAt = Planetarium.GetUniversalTime();
+                        _guidance.CircularisationStartApoapsis = apoapsis;
+                        _guidance.CircularisationBurnStarted = true;
+                    }
+
+                    if (_guidance.CircularisationBurnStarted)
+                    {
+                        double burnElapsed = Math.Max(0d, Planetarium.GetUniversalTime() - _guidance.CircularisationBurnAt);
+                        bool periapsisReached = periapsis >= _guidance.TargetPeriapsis - periapsisTolerance;
+                        bool burnTimeReached = _guidance.CircularisationBurnDuration > 0d &&
+                            burnElapsed >= _guidance.CircularisationBurnDuration;
+                        if (periapsisReached)
+                        {
+                            throttle = 0d;
+                            _guidance.CircularisationBurnCompleted = true;
+                            _guidance.Phase = "orbit_achieved";
+                        }
+                        else if (_guidance.CircularisationTrimStarted)
+                        {
+                            double trimElapsed = Math.Max(0d, Planetarium.GetUniversalTime() - _guidance.CircularisationTrimAt);
+                            bool trimTimeReached = _guidance.CircularisationTrimDuration > 0d &&
+                                trimElapsed >= _guidance.CircularisationTrimDuration;
+                            if (trimTimeReached)
+                            {
+                                throttle = 0d;
+                                _guidance.CircularisationBurnCompleted = true;
+                                _guidance.Phase = "circularisation_coast";
+                            }
+                            else
+                            {
+                                throttle = 1d;
+                                _guidance.Phase = "circularisation_trim";
+                            }
+                        }
+                        else if (burnTimeReached)
+                        {
+                            // A timed burn is only an initial estimate. If the
+                            // measured PeA is still below target, use one short
+                            // feedback trim while the vessel is still close to
+                            // the current apoapsis. This compensates for thrust
+                            // curves, steering lag, and the mass change during
+                            // the primary burn without allowing a later orbit
+                            // to restart the burn loop.
+                            double trimDeltaV;
+                            double trimDuration = EstimateFiniteBurnDuration(
+                                vessel,
+                                EstimateCircularisationResidualDeltaV(vessel, _guidance.TargetApoapsis, _guidance.TargetPeriapsis, out trimDeltaV));
+                            bool nearApoapsis = IsNearApoapsisForTrim(vessel, _guidance.TargetApoapsis, apoapsisTolerance);
+                            if (nearApoapsis && trimDeltaV > 0.5d && trimDuration > 0d)
+                            {
+                                _guidance.CircularisationTrimStarted = true;
+                                _guidance.CircularisationTrimAt = Planetarium.GetUniversalTime();
+                                _guidance.CircularisationTrimDuration = trimDuration;
+                                _guidance.CircularisationTrimTargetDeltaV = trimDeltaV;
+                                throttle = 1d;
+                                _guidance.Phase = "circularisation_trim";
+                            }
+                            else
+                            {
+                                throttle = 0d;
+                                _guidance.CircularisationBurnCompleted = true;
+                                _guidance.Phase = "circularisation_coast";
+                            }
+                        }
+                        else
+                        {
+                            // This is a timed prograde impulse. Do not keep
+                            // recalculating throttle from a lagging PeA after
+                            // the vehicle has passed apoapsis; that was the
+                            // runaway condition seen in the previous run.
+                            throttle = 1d;
+                            _guidance.Phase = "circularisation_burn";
+                        }
+                    }
+                    else
+                    {
+                        throttle = 0d;
+                        _guidance.Phase = "coast_to_apoapsis";
+                    }
+                }
             }
             else if (apoapsis > _guidance.TargetApoapsis * 0.85d)
             {
@@ -754,7 +994,12 @@ namespace KspMcp
                     // full throttle to an unusually high-TWR stack. The
                     // apoapsis error above remains the stricter limiter near
                     // the target orbit.
-                    double targetTwr = altitude < 1000d ? 1.35d : (altitude < 10000d ? 1.55d : 1.75d);
+                    double targetTwr;
+                    if (altitude < 1000d) targetTwr = 1.35d;
+                    else if (altitude < 10000d) targetTwr = 1.55d;
+                    else if (altitude < 25000d) targetTwr = 1.85d;
+                    else if (altitude < 40000d) targetTwr = 2.05d;
+                    else targetTwr = 2.20d;
                     double twrThrottle = targetTwr * mass * gravity / thrust;
                     throttle = Math.Min(throttle, ClampDouble(twrThrottle, 0.15d, 1d));
                 }
@@ -797,6 +1042,8 @@ namespace KspMcp
             {
                 bridge.RecordEvent("flight.maneuver_burn.started", new Dictionary<string, object>
                 {
+                    { "vessel_id", vessel == null ? null : vessel.id.ToString() },
+                    { "vessel_name", vessel == null ? null : vessel.vesselName },
                     { "node_index", _guidance.BurnNodeIndex },
                     { "ut", _guidance.BurnUt },
                     { "delta_v", _guidance.BurnDeltaV },
@@ -868,6 +1115,8 @@ namespace KspMcp
                     KspMcpBridge bridge = KspMcpBridge.Instance;
                     if (bridge != null) bridge.RecordEvent("flight.maneuver_burn.completed", new Dictionary<string, object>
                     {
+                        { "vessel_id", vessel == null ? null : vessel.id.ToString() },
+                        { "vessel_name", vessel == null ? null : vessel.vesselName },
                         { "node_index", _guidance.BurnNodeIndex },
                         { "ut", _guidance.BurnUt },
                         { "duration", _guidance.BurnDuration },
@@ -888,6 +1137,13 @@ namespace KspMcp
         private static double AvailableGuidanceThrust(Vessel vessel)
         {
             if (vessel == null) return 0d;
+            // KSP exposes currentStage as the next staging cursor. The live
+            // engine is normally on that cursor, while a freshly launched
+            // vessel can still report one cursor above it. Prefer the live
+            // cursor first so transfer-stage burns do not accidentally use
+            // the terminal/descent engine one stage lower.
+            double currentStageThrust = SumStageThrust(vessel, vessel.currentStage);
+            if (currentStageThrust > 0d) return currentStageThrust;
             double thrust = NumberMember(vessel, "availableThrust");
             if (thrust > 0d) return thrust;
             return EstimateActiveThrust(vessel);
@@ -896,6 +1152,8 @@ namespace KspMcp
         private static double EstimateActiveThrust(Vessel vessel)
         {
             if (vessel == null || vessel.parts == null) return 0d;
+            double currentStageThrust = SumStageThrust(vessel, vessel.currentStage);
+            if (currentStageThrust > 0d) return currentStageThrust;
             int nextStage = Math.Max(0, vessel.currentStage - 1);
             double total = SumStageThrust(vessel, nextStage);
             if (total > 0d) return total;
@@ -962,6 +1220,8 @@ namespace KspMcp
                 KspMcpBridge bridge = KspMcpBridge.Instance;
                 if (bridge != null) bridge.RecordEvent("flight.ignition.guidance", new Dictionary<string, object>
                 {
+                    { "vessel_id", vessel == null ? null : vessel.id.ToString() },
+                    { "vessel_name", vessel == null ? null : vessel.vesselName },
                     { "stage", targetStage },
                     { "staging_cursor", vessel.currentStage }
                 });
@@ -1127,6 +1387,8 @@ namespace KspMcp
                     KspMcpBridge bridge = KspMcpBridge.Instance;
                     if (bridge != null) bridge.RecordEvent("flight.landing.gear_commanded", new Dictionary<string, object>
                     {
+                        { "vessel_id", vessel == null ? null : vessel.id.ToString() },
+                        { "vessel_name", vessel == null ? null : vessel.vesselName },
                         { "altitude", altitude },
                         { "terrain_altitude", vessel.terrainAltitude }
                     });
@@ -1273,19 +1535,34 @@ namespace KspMcp
 
         private void ApplyDirectionControl(FlightCtrlState state, Vessel vessel, Vector3d target, double throttle, double targetPitch)
         {
-            if (target.sqrMagnitude < 0.0001d) target = vessel.transform.forward;
+            Transform controlTransform = ControlTransform(vessel);
+            if (controlTransform == null) controlTransform = vessel == null ? null : vessel.transform;
+            if (controlTransform == null) return;
+            if (target.sqrMagnitude < 0.0001d) target = controlTransform.forward;
             target.Normalize();
-            Vector3 local = vessel.transform.InverseTransformDirection((Vector3)target);
-            Vector3 localAngularVelocity = vessel.transform.InverseTransformDirection((Vector3)VectorMember(vessel, "angularVelocity"));
-            double forward = Math.Max(0.1d, local.z);
-            double pitchError = Math.Atan2(local.y, forward);
-            double yawError = Math.Atan2(local.x, forward);
-            float pitch = Clamp((float)(pitchError * 2.2d - localAngularVelocity.x * 0.35d), -1f, 1f);
-            float yaw = Clamp((float)(yawError * 2.2d - localAngularVelocity.y * 0.35d), -1f, 1f);
+            // KSP stack parts use their local +Y axis for the attachment and
+            // longitudinal axis. ReferenceTransform is KSP's selected
+            // control frame, but its Unity +Z forward axis is a transverse
+            // frame axis for a normally oriented rocket. Treat +Y (the
+            // reference transform's up axis) as the controllable nose axis;
+            // this is the axis that points away from the engines and matches
+            // the stock command-part orientation.
+            Vector3 local = controlTransform.InverseTransformDirection((Vector3)target);
+            Vector3 localAngularVelocity = controlTransform.InverseTransformDirection((Vector3)VectorMember(vessel, "angularVelocity"));
+            double nose = Math.Max(0.1d, local.y);
+            double pitchError = Math.Atan2(local.z, nose);
+            double yawError = Math.Atan2(local.x, nose);
+            // FlightCtrlState uses the opposite pitch sign from the local
+            // +X rotation convention: a positive pitch command moves the
+            // +Y rocket nose toward local -Z.  Positive yaw moves the nose
+            // toward local +X.  Match the empirically verified KSP mapping
+            // so the feedback closes toward the target instead of diverging.
+            float pitch = Clamp((float)(-pitchError * 2.2d + localAngularVelocity.x * 0.2d), -1f, 1f);
+            float yaw = Clamp((float)(yawError * 2.2d + localAngularVelocity.z * 0.2d), -1f, 1f);
             state.mainThrottle = Clamp((float)throttle, 0f, 1f);
             state.pitch = pitch;
             state.yaw = yaw;
-            state.roll = Clamp(-localAngularVelocity.z * 0.25f, -1f, 1f);
+            state.roll = Clamp(-localAngularVelocity.y * 0.25f, -1f, 1f);
             _guidance.LastThrottle = state.mainThrottle;
             _guidance.LastPitch = state.pitch;
             _guidance.LastYaw = state.yaw;
@@ -1300,30 +1577,104 @@ namespace KspMcp
         private static double DirectionErrorDegrees(Vessel vessel, Vector3d target)
         {
             if (vessel == null || target.sqrMagnitude < 0.0001d) return 180d;
+            Transform controlTransform = ControlTransform(vessel);
+            if (controlTransform == null) return 180d;
             target.Normalize();
-            Vector3 local = vessel.transform.InverseTransformDirection((Vector3)target);
-            double forward = Math.Max(0.0001d, local.z);
-            double lateral = Math.Sqrt(local.x * local.x + local.y * local.y);
-            return Math.Abs(Math.Atan2(lateral, forward) * 180d / Math.PI);
+            Vector3 local = controlTransform.InverseTransformDirection((Vector3)target);
+            double nose = Math.Max(0.0001d, local.y);
+            double lateral = Math.Sqrt(local.x * local.x + local.z * local.z);
+            return Math.Abs(Math.Atan2(lateral, nose) * 180d / Math.PI);
+        }
+
+        private static Transform ControlTransform(Vessel vessel)
+        {
+            if (vessel == null) return null;
+            try
+            {
+                Transform reference = vessel.ReferenceTransform;
+                if (reference != null) return reference;
+            }
+            catch (Exception) { }
+            return vessel.transform;
+        }
+
+        private static Dictionary<string, object> ControlFrameSnapshot(Vessel vessel)
+        {
+            Transform physical = vessel == null ? null : vessel.transform;
+            Transform control = ControlTransform(vessel);
+            if (physical == null || control == null) return null;
+            Vector3d surfaceNormal = SurfaceNormal(vessel);
+            Vector3d surfaceEasting = SurfaceEasting(vessel);
+            Vector3d surfacePrograde = SurfacePrograde(vessel);
+            Vector3d launchTarget = surfaceNormal;
+            Vector3 localLaunchTarget = control.InverseTransformDirection((Vector3)launchTarget);
+            return new Dictionary<string, object>
+            {
+                { "source", control == physical ? "vessel_transform" : "reference_transform" },
+                { "forward", JsonUtil.Vector3Object(control.forward) },
+                { "up", JsonUtil.Vector3Object(control.up) },
+                { "right", JsonUtil.Vector3Object(control.right) },
+                { "vessel_forward", JsonUtil.Vector3Object(physical.forward) },
+                { "vessel_up", JsonUtil.Vector3Object(physical.up) },
+                { "vessel_right", JsonUtil.Vector3Object(physical.right) },
+                { "surface_normal", JsonUtil.Vector3Object(surfaceNormal) },
+                { "surface_easting", JsonUtil.Vector3Object(surfaceEasting) },
+                { "surface_prograde", JsonUtil.Vector3Object(surfacePrograde) },
+                { "local_surface_normal", JsonUtil.Vector3Object(localLaunchTarget) },
+                { "longitudinal_axis", "reference_up_y" },
+                { "ascent_direction", "surface_prograde" }
+            };
         }
 
         private void TryAutomaticStage(Vessel vessel)
         {
             if (_guidance == null || vessel == null || vessel.currentStage <= 0) return;
-            _lastGuidanceStageAt = Planetarium.GetUniversalTime();
+            double now = Planetarium.GetUniversalTime();
+            _lastGuidanceStageAt = now;
+
+            // A custom stage action changes the cursor immediately, while
+            // engine ignition and decoupler physics settle over subsequent
+            // FixedUpdate ticks.  Give that newly active row a short grace
+            // period so a requested burn cannot cascade through the next
+            // separator before its engine has had a chance to light.
+            if (vessel.currentStage == _lastAutomaticStageActivatedCursor &&
+                now - _lastAutomaticStageActivatedAt < 2d) return;
+
             // KSP exposes currentStage as the staging cursor. The action
             // that Space/StageManager will trigger next is one lower, and
-            // parts carry that lower number in inverseStage.
+            // parts carry that lower number in inverseStage. The important
+            // distinction is that currentStage is also the row that was just
+            // activated and is still burning. Looking only at the next row
+            // makes the already-enabled future engines look like permission
+            // to advance every 0.25 seconds.
             int stagingCursorBefore = vessel.currentStage;
             int nextStage = Math.Max(0, stagingCursorBefore - 1);
+            // A staging cursor can bounce back to the previous row after a
+            // separator fires. A successful target row is a one-shot action
+            // for this guidance session; do not re-ignite it if KSP exposes
+            // the old cursor again several seconds later.
+            if (_automaticStageTargetsActivated.Contains(nextStage)) return;
             Dictionary<string, object> nextStageSummary = StageActionSummary(vessel, nextStage);
-            bool currentStageHasEngine = false;
-            bool currentStageHasAction = false;
+            double timeToApoapsis = vessel.orbit == null ? double.PositiveInfinity : NumberMember(vessel.orbit, "timeToAp");
+            double apoapsis = vessel.orbit == null ? 0d : NumberMember(vessel.orbit, "ApA");
+            double targetApoapsis = _guidance.Profile == "ascent" ? _guidance.TargetApoapsis : 0d;
+            double apoapsisTolerance = targetApoapsis > 0d ? Math.Max(500d, targetApoapsis * 0.02d) : double.PositiveInfinity;
+            bool apoapsisSeparationWindow = _guidance.Profile == "ascent" &&
+                _guidance.AscentLaunchStageCursor != int.MinValue &&
+                stagingCursorBefore == _guidance.AscentLaunchStageCursor &&
+                string.Equals(_guidance.Phase, "coast_to_apoapsis", StringComparison.OrdinalIgnoreCase) &&
+                // Separate before the upper-stage burn needs to start. A
+                // 45-second lead is enough for the tested large stack and
+                // still leaves the launch stage safely above its target ApA.
+                timeToApoapsis <= 45d &&
+                apoapsis >= targetApoapsis - apoapsisTolerance;
+            bool activeStageEnginePending = false;
+            bool nextStageHasEngine = false;
+            bool nextStageEngineReady = false;
+            bool nextStageIgnited = false;
+            bool nextStageHasAction = false;
             bool hasLowerAction = false;
-            bool currentStageLiveEngine = false;
-            bool currentStageIgnited = false;
             bool anyIgnitedEngine = false;
-            bool anyIgnitedLiveEngine = false;
             foreach (Part part in vessel.parts)
             {
                 if (part == null || part.Modules == null) continue;
@@ -1336,50 +1687,93 @@ namespace KspMcp
                         moduleName.IndexOf("Separator", StringComparison.OrdinalIgnoreCase) >= 0 ||
                         moduleName.IndexOf("Seperator", StringComparison.OrdinalIgnoreCase) >= 0;
                     if (!isEngine && !isDecoupler) continue;
-                    if (part.inverseStage == nextStage) currentStageHasAction = true;
+                    if (part.inverseStage == nextStage) nextStageHasAction = true;
                     else if (part.inverseStage >= 0 && part.inverseStage < nextStage) hasLowerAction = true;
                     if (!isEngine) continue;
                     bool flameout = BoolMember(module, "flameout");
                     bool operational = BoolMember(module, "isOperational");
                     bool ignited = BoolMember(module, "engineIgnited");
                     bool enabled = BoolMember(module, "moduleIsEnabled") || BoolMember(module, "isEnabled");
+                    double finalThrust = Math.Max(0d, NumberMember(module, "finalThrust"));
+                    double requestedThrottle = NumberMember(module, "requestedThrottle");
+                    double currentThrottle = NumberMember(module, "currentThrottle");
                     if (ignited) anyIgnitedEngine = true;
-                    if (ignited && !flameout) anyIgnitedLiveEngine = true;
-                    if (part.inverseStage != nextStage) continue;
-                    currentStageHasEngine = true;
-                    if (ignited) currentStageIgnited = true;
-                    if (!flameout && (operational || ignited || enabled)) currentStageLiveEngine = true;
+                    if (part.inverseStage == stagingCursorBefore)
+                    {
+                        // isOperational remains true for a staged engine even
+                        // when the throttle is zero during an apoapsis coast.
+                        // It is not evidence that the current row is still
+                        // producing thrust.  Gate the hold on actual thrust,
+                        // or on a not-yet-ignited engine that is receiving a
+                        // burn request.  This lets an exhausted/coasting row
+                        // advance while still protecting the ignition window.
+                        bool producingThrust = finalThrust > 0.5d;
+                        bool ignitionPending = !ignited && operational &&
+                            (requestedThrottle > 0.05d || currentThrottle > 0.05d);
+                        if (!flameout && (producingThrust || ignitionPending))
+                        {
+                            activeStageEnginePending = true;
+                        }
+                    }
+                    if (part.inverseStage == nextStage)
+                    {
+                        nextStageHasEngine = true;
+                        if (ignited) nextStageIgnited = true;
+                        if (!flameout && (operational || ignited || enabled)) nextStageEngineReady = true;
+                    }
                 }
             }
-            // Do not gate ignition on speed.  A correctly staged vessel can
-            // still be at (or very near) zero surface speed immediately
-            // after launch, and waiting for motion here would leave the
-            // engines disabled forever.
-            if (currentStageHasEngine && !currentStageIgnited && _guidance.LastThrottle > 0.05d)
+
+            // Do not gate ignition on speed. A correctly staged vessel can
+            // still be at (or very near) zero surface speed immediately after
+            // launch. More importantly, never inspect only nextStage while
+            // the current cursor still owns a non-flameout engine. This is
+            // the invariant that prevents premature staging and separation.
+            if (activeStageEnginePending) return;
+
+            // The next row is the one that should be ignited now. Stage()
+            // invokes the actual part actions and synchronously moves KSP's
+            // staging cursor, which is more reliable for editor-created
+            // ModuleEnginesFX vessels than repeatedly calling StageManager.
+            if (nextStageHasEngine && nextStageEngineReady && !nextStageIgnited &&
+                (_guidance.LastThrottle > 0.05d || apoapsisSeparationWindow))
             {
-                bool activated = ActivateNextStageRaw();
+                // KSP can briefly expose the previous staging cursor again
+                // while a decoupler and its child vessel settle. If the same
+                // lower row was just activated, do not issue a second Stage()
+                // call during that cursor bounce.
+                if (_lastAutomaticStageActivatedCursor == nextStage &&
+                    now - _lastAutomaticStageActivatedAt < 4d) return;
+                // Avoid hammering a row if a modded action did not move the
+                // cursor. Retry after a short backoff, but never emit a false
+                // ignition event for an unchanged cursor.
+                if (stagingCursorBefore == _lastAutomaticStageCommandCursor && now - _lastAutomaticStageCommandAt < 2.0d) return;
+                _lastAutomaticStageCommandCursor = stagingCursorBefore;
+                _lastAutomaticStageCommandAt = now;
+                bool activated = false;
+                try
+                {
+                    Stage();
+                    activated = vessel.currentStage != stagingCursorBefore;
+                }
+                catch (Exception exception) { _guidance.LastError = exception.Message; }
                 if (!activated)
                 {
-                    // A few editor-created or modded vessels do not expose
-                    // a working StageManager action for ModuleEnginesFX.
-                    // Reuse the deterministic per-part staging fallback so
-                    // ignition is still possible without visual interaction.
-                    try
-                    {
-                        Stage();
-                        activated = true;
-                    }
-                    catch (Exception exception)
-                    {
-                        _guidance.LastError = exception.Message;
-                    }
+                    // Keep a reflection fallback for stock/modded setups
+                    // where the custom action path is unavailable.
+                    activated = ActivateNextStageRaw() && vessel.currentStage != stagingCursorBefore;
                 }
                 if (activated)
                 {
+                    _automaticStageTargetsActivated.Add(nextStage);
+                    _lastAutomaticStageActivatedCursor = vessel.currentStage;
+                    _lastAutomaticStageActivatedAt = now;
                     if (_guidance != null) _guidance.Phase = "automatic_ignition";
                     KspMcpBridge bridge = KspMcpBridge.Instance;
                     if (bridge != null) bridge.RecordEvent("flight.ignition.automatic", new Dictionary<string, object>
                     {
+                        { "vessel_id", vessel == null ? null : vessel.id.ToString() },
+                        { "vessel_name", vessel == null ? null : vessel.vesselName },
                         { "stage", nextStage },
                         { "staging_cursor_before", stagingCursorBefore },
                         { "staging_cursor_after", vessel.currentStage },
@@ -1391,30 +1785,36 @@ namespace KspMcp
                 }
                 return;
             }
-            // Once a previously activated stage is still ignited and has not
-            // flamed out, its inverseStage is usually greater than
-            // Vessel.currentStage because KSP has already moved the staging
-            // cursor down. Do not count a future engine that is merely
-            // enabled as "live"; doing so can prevent a pure decoupler stage
-            // from ever firing.
-            if (anyIgnitedEngine && anyIgnitedLiveEngine) return;
-            if (currentStageHasEngine && currentStageLiveEngine && currentStageIgnited) return;
+
             // Empty staging rows are legal in KSP. Advance through one when
             // a lower actionable stage exists instead of leaving guidance
             // permanently parked on an empty cursor.
-            if (!currentStageHasAction && !hasLowerAction) return;
+            if (!nextStageHasAction && !hasLowerAction) return;
             // Do not advance an untouched prelaunch/upper-stage cursor while
             // the guidance controller is intentionally coasting at zero
             // throttle. A stage following a real flameout remains eligible
             // because anyIgnitedEngine is still true in that case.
             if (!anyIgnitedEngine && _guidance.LastThrottle <= 0.05d) return;
+            if (stagingCursorBefore == _lastAutomaticStageCommandCursor && now - _lastAutomaticStageCommandAt < 2.0d) return;
+            _lastAutomaticStageCommandCursor = stagingCursorBefore;
+            _lastAutomaticStageCommandAt = now;
             try
             {
                 Stage();
+                if (vessel.currentStage == stagingCursorBefore)
+                {
+                    _guidance.LastError = "automatic stage action did not advance the staging cursor";
+                    return;
+                }
+                _automaticStageTargetsActivated.Add(nextStage);
+                _lastAutomaticStageActivatedCursor = vessel.currentStage;
+                _lastAutomaticStageActivatedAt = now;
                 if (_guidance != null) _guidance.Phase = "automatic_stage";
                 KspMcpBridge bridge = KspMcpBridge.Instance;
                 if (bridge != null) bridge.RecordEvent("flight.stage.automatic", new Dictionary<string, object>
                 {
+                    { "vessel_id", vessel == null ? null : vessel.id.ToString() },
+                    { "vessel_name", vessel == null ? null : vessel.vesselName },
                     { "stage", nextStage },
                     { "staging_cursor_before", stagingCursorBefore },
                     { "staging_cursor_after", vessel.currentStage },
@@ -1458,6 +1858,99 @@ namespace KspMcp
             };
         }
 
+        private static double EstimateCircularisationBurnDuration(Vessel vessel, double targetApoapsis, double targetPeriapsis, out double targetDeltaV)
+        {
+            targetDeltaV = 0d;
+            if (vessel == null || vessel.mainBody == null || vessel.mainBody.gravParameter <= 0d) return 30d;
+            double bodyRadius = Math.Max(1d, vessel.mainBody.Radius);
+            double currentRadius = Math.Max(bodyRadius + 1d, bodyRadius + Math.Max(0d, vessel.altitude));
+            double apoapsisRadius = Math.Max(currentRadius, bodyRadius + Math.Max(0d, targetApoapsis));
+            double periapsisRadius = Math.Max(bodyRadius + 1d, bodyRadius + Math.Max(0d, targetPeriapsis));
+            double orbitRadiusSum = Math.Max(2d, apoapsisRadius + periapsisRadius);
+            double targetSpeedSquared = vessel.mainBody.gravParameter *
+                (2d / currentRadius - 2d / orbitRadiusSum);
+            double targetSpeed = targetSpeedSquared > 0d ? Math.Sqrt(targetSpeedSquared) : 0d;
+            double currentSpeed = vessel.obt_velocity.sqrMagnitude > 0.01d ? vessel.obt_velocity.magnitude : 0d;
+            targetDeltaV = Math.Max(0d, targetSpeed - currentSpeed);
+            double thrust = AvailableGuidanceThrust(vessel);
+            double mass = Math.Max(0.001d, vessel.GetTotalMass());
+            double acceleration = thrust / mass;
+            if (targetDeltaV <= 1d || acceleration <= 0.1d) return targetDeltaV <= 1d ? 0d : 30d;
+
+            // Acceleration increases as propellant is consumed. The factor is
+            // intentionally conservative so the impulse ends before the
+            // transfer stage can drive the vehicle onto an escape trajectory.
+            double effectiveAcceleration = Math.Max(0.1d, acceleration * 1.25d);
+            double duration = targetDeltaV / effectiveAcceleration * 1.15d;
+            return ClampDouble(duration, 5d, 120d);
+        }
+
+        private static double EstimateCircularisationResidualDeltaV(Vessel vessel, double targetApoapsis, double targetPeriapsis, out double targetDeltaV)
+        {
+            targetDeltaV = 0d;
+            if (vessel == null || vessel.mainBody == null || vessel.mainBody.gravParameter <= 0d) return 0d;
+            double bodyRadius = Math.Max(1d, vessel.mainBody.Radius);
+            double currentRadius = Math.Max(bodyRadius + 1d, bodyRadius + Math.Max(0d, vessel.altitude));
+            double apoapsisRadius = Math.Max(currentRadius, bodyRadius + Math.Max(0d, targetApoapsis));
+            double periapsisRadius = Math.Max(bodyRadius + 1d, bodyRadius + Math.Max(0d, targetPeriapsis));
+            double radiusSum = Math.Max(2d, apoapsisRadius + periapsisRadius);
+            double targetSpeedSquared = vessel.mainBody.gravParameter *
+                (2d / currentRadius - 2d / radiusSum);
+            double targetSpeed = targetSpeedSquared > 0d ? Math.Sqrt(targetSpeedSquared) : 0d;
+            double currentSpeed = vessel.obt_velocity.sqrMagnitude > 0.01d ? vessel.obt_velocity.magnitude : 0d;
+            targetDeltaV = Math.Max(0d, targetSpeed - currentSpeed);
+            return targetDeltaV;
+        }
+
+        private static double EstimateFiniteBurnDuration(Vessel vessel, double deltaV)
+        {
+            if (vessel == null || deltaV <= 0d) return 0d;
+            double thrust = AvailableGuidanceThrust(vessel);
+            double mass = Math.Max(0.001d, vessel.GetTotalMass());
+            double acceleration = thrust / mass;
+            if (acceleration <= 0.1d) return 0d;
+            return ClampDouble(deltaV / acceleration * 1.10d, 0.25d, 15d);
+        }
+
+        private static bool IsNearApoapsisForTrim(Vessel vessel, double targetApoapsis, double tolerance)
+        {
+            if (vessel == null) return false;
+            double altitude = Math.Max(0d, vessel.altitude);
+            double verticalSpeed = Math.Abs(vessel.verticalSpeed);
+            double altitudeWindow = Math.Max(2000d, tolerance * 3d);
+            return altitude >= targetApoapsis - altitudeWindow && verticalSpeed <= 35d;
+        }
+
+        private static int DetectAscentLaunchStageCursor(Vessel vessel)
+        {
+            if (vessel == null) return int.MinValue;
+            string situation = vessel.situation.ToString();
+            if (!string.Equals(situation, "PRELAUNCH", StringComparison.OrdinalIgnoreCase)) return int.MinValue;
+            return Math.Max(0, vessel.currentStage - 1);
+        }
+
+        private static int DetectAscentTransferStageCursor(Vessel vessel, int launchStageCursor)
+        {
+            if (vessel == null || launchStageCursor == int.MinValue || launchStageCursor <= 0) return int.MinValue;
+            for (int stage = launchStageCursor - 1; stage >= 0; stage--)
+            {
+                if (StageContainsEngine(vessel, stage)) return stage;
+            }
+            return int.MinValue;
+        }
+
+        private bool IsAscentTransferStageActive(Vessel vessel)
+        {
+            if (_guidance == null || !string.Equals(_guidance.Profile, "ascent", StringComparison.OrdinalIgnoreCase)) return true;
+            if (vessel == null || _guidance.AscentTransferStageCursor == int.MinValue) return false;
+            if (vessel.currentStage == _guidance.AscentTransferStageCursor) return true;
+            // A separator may make KSP expose the old cursor again even
+            // though the lower engine has already ignited.  The automatic
+            // stage controller records successful target rows as one-shot
+            // activations; reuse that authoritative fact for burn guidance.
+            return _automaticStageTargetsActivated.Contains(_guidance.AscentTransferStageCursor);
+        }
+
         private static bool ActivateNextStageRaw()
         {
             MethodInfo method = typeof(KSP.UI.Screens.StageManager).GetMethod("ActivateNextStage", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static);
@@ -1477,7 +1970,13 @@ namespace KspMcp
         private static Vector3d AscentTargetVector(Vessel vessel, double pitchDegrees)
         {
             Vector3d up = SurfaceNormal(vessel);
-            Vector3d east = SurfaceEasting(vessel);
+            // In KSP's body frame the vector returned by GetSurfaceEasting is
+            // the opposite of the inertial prograde direction used by the
+            // stock orbit solver.  Launching along it produces a 180-degree
+            // retrograde orbit once the rocket's velocity dominates Kerbin's
+            // surface rotation.  Keep the raw vector in telemetry, but use
+            // its verified prograde counterpart for ascent guidance.
+            Vector3d east = SurfacePrograde(vessel);
             double radians = pitchDegrees * Math.PI / 180d;
             Vector3d result = up * Math.Sin(radians) + east * Math.Cos(radians);
             if (result.sqrMagnitude < 0.0001d) return up;
@@ -1511,6 +2010,14 @@ namespace KspMcp
             return InvokeBodyVector(vessel, "GetSurfaceEasting", fallback);
         }
 
+        private static Vector3d SurfacePrograde(Vessel vessel)
+        {
+            Vector3d easting = SurfaceEasting(vessel);
+            if (easting.sqrMagnitude < 0.0001d) return easting;
+            easting.Normalize();
+            return -easting;
+        }
+
         private static Vector3d InvokeBodyVector(Vessel vessel, string methodName, Vector3d fallback)
         {
             if (vessel == null || vessel.mainBody == null) return fallback;
@@ -1535,16 +2042,34 @@ namespace KspMcp
         {
             EnsureFlight();
             _sasEnabled = JsonUtil.Boolean(args, "enabled", false);
-            FireGroup("SAS", _sasEnabled);
-            return new Dictionary<string, object> { { "sas", _sasEnabled }, { "state", Snapshot() } };
+            Vessel vessel = FlightGlobals.ActiveVessel;
+            bool actionGroupApplied = SetVesselActionGroupState(vessel, "SAS", _sasEnabled);
+            // Some KSP revisions do not expose the vessel action-group
+            // state through the same API. Keep the old action invocation as
+            // a compatibility fallback, but do not fire both paths because
+            // that would toggle SAS twice on versions that support SetGroup.
+            if (!actionGroupApplied) FireGroup("SAS", _sasEnabled);
+            return new Dictionary<string, object>
+            {
+                { "sas", _sasEnabled },
+                { "stock_action_group_applied", actionGroupApplied },
+                { "state", Snapshot() }
+            };
         }
 
         public Dictionary<string, object> SetRcs(Dictionary<string, object> args)
         {
             EnsureFlight();
             _rcsEnabled = JsonUtil.Boolean(args, "enabled", false);
-            FireGroup("RCS", _rcsEnabled);
-            return new Dictionary<string, object> { { "rcs", _rcsEnabled }, { "state", Snapshot() } };
+            Vessel vessel = FlightGlobals.ActiveVessel;
+            bool actionGroupApplied = SetVesselActionGroupState(vessel, "RCS", _rcsEnabled);
+            if (!actionGroupApplied) FireGroup("RCS", _rcsEnabled);
+            return new Dictionary<string, object>
+            {
+                { "rcs", _rcsEnabled },
+                { "stock_action_group_applied", actionGroupApplied },
+                { "state", Snapshot() }
+            };
         }
 
         public Dictionary<string, object> Stage()
@@ -1601,6 +2126,8 @@ namespace KspMcp
                 KspMcpBridge bridge = KspMcpBridge.Instance;
                 if (bridge != null) bridge.RecordEvent("flight.stage.activated", new Dictionary<string, object>
                 {
+                    { "vessel_id", vessel == null ? null : vessel.id.ToString() },
+                    { "vessel_name", vessel == null ? null : vessel.vesselName },
                     { "stage_before", before },
                     { "stage_activated", target },
                     { "custom_activation", invoked },
@@ -1628,6 +2155,8 @@ namespace KspMcp
             KspMcpBridge bridgeAfter = KspMcpBridge.Instance;
             if (bridgeAfter != null) bridgeAfter.RecordEvent("flight.stage.activated", new Dictionary<string, object>
             {
+                { "vessel_id", vessel == null ? null : vessel.id.ToString() },
+                { "vessel_name", vessel == null ? null : vessel.vesselName },
                 { "stage_before", before },
                 { "stage_activated", target },
                 { "custom_activation", false },
@@ -1934,8 +2463,48 @@ namespace KspMcp
             return new Dictionary<string, object> { { "control_released", true }, { "controls", ControlSnapshot() } };
         }
 
+        public Dictionary<string, object> ReturnToEditor(Dictionary<string, object> args)
+        {
+            EnsureFlight();
+            string mode = JsonUtil.String(args, "editor_mode", "VAB").ToUpperInvariant();
+            EditorFacility facility;
+            if (mode == "VAB") facility = EditorFacility.VAB;
+            else if (mode == "SPH") facility = EditorFacility.SPH;
+            else throw new KspMcpException("invalid_editor_mode", "editor_mode must be VAB or SPH", mode);
+
+            // A revert/recovery can leave the active flight vessel alive for
+            // a few frames. Release MCP control before KSP restores the editor
+            // so no stale throttle or steering lease crosses the scene change.
+            _guidance = null;
+            _lease.Clear();
+            _leaseUntil = 0d;
+            try
+            {
+                FlightDriver.ReturnToEditor(facility);
+                KspMcpBridge bridge = KspMcpBridge.Instance;
+                if (bridge != null) bridge.RecordEvent("flight.return_to_editor.requested", new Dictionary<string, object>
+                {
+                    { "editor_mode", mode },
+                    { "entry", "mcp" }
+                });
+                return new Dictionary<string, object>
+                {
+                    { "return_requested", true },
+                    { "editor_mode", mode },
+                    { "method", "ReturnToEditor" }
+                };
+            }
+            catch (Exception exception)
+            {
+                throw new KspMcpException("return_to_editor_failed", "KSP could not return to the editor: " + exception.Message, null);
+            }
+        }
+
         public Dictionary<string, object> Recover()
         {
+            _guidance = null;
+            _lease.Clear();
+            _leaseUntil = 0d;
             MethodInfo[] methods = typeof(FlightDriver).GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static);
             foreach (string name in new[] { "RevertToPrelaunch", "RevertToLaunch", "RecoverVessel" })
             {
@@ -1983,6 +2552,7 @@ namespace KspMcp
                 { "position", JsonUtil.Vector3dObject(vessel.GetWorldPos3D()) },
                 { "velocity", JsonUtil.Vector3dObject(vessel.obt_velocity) },
                 { "orientation", JsonUtil.QuaternionObject(vessel.transform.rotation) },
+                { "control_frame", ControlFrameSnapshot(vessel) },
                 { "controls", CurrentControlState(vessel.ctrlState) },
                 { "control_lease", ControlSnapshot() },
                 { "guidance", GuidanceStatus() },
@@ -2050,6 +2620,7 @@ namespace KspMcp
                 { "position", JsonUtil.Vector3dObject(vessel.GetWorldPos3D()) },
                 { "velocity", JsonUtil.Vector3dObject(vessel.obt_velocity) },
                 { "orientation", JsonUtil.QuaternionObject(vessel.transform.rotation) },
+                { "control_frame", ControlFrameSnapshot(vessel) },
                 { "controls", CurrentControlState(vessel.ctrlState) },
                 { "control_lease", ControlSnapshot() },
                 { "guidance", GuidanceStatus() },
@@ -2128,6 +2699,50 @@ namespace KspMcp
                 }
             }
             throw new KspMcpException("action_unavailable", "KSP BaseAction.FireAction is not available", null);
+        }
+
+        private static bool SetVesselActionGroupState(Vessel vessel, string groupName, bool enabled)
+        {
+            if (vessel == null) return false;
+            KSPActionGroup group;
+            if (!TryParseGroup(groupName, out group)) return false;
+            const BindingFlags flags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
+            try
+            {
+                object actionGroups = null;
+                PropertyInfo property = vessel.GetType().GetProperty("ActionGroups", flags);
+                if (property != null) actionGroups = property.GetValue(vessel, null);
+                if (actionGroups == null)
+                {
+                    FieldInfo field = vessel.GetType().GetField("ActionGroups", flags);
+                    if (field != null) actionGroups = field.GetValue(vessel);
+                }
+                if (actionGroups == null) return false;
+
+                foreach (MethodInfo method in actionGroups.GetType().GetMethods(flags))
+                {
+                    if (!string.Equals(method.Name, "SetGroup", StringComparison.OrdinalIgnoreCase)) continue;
+                    ParameterInfo[] parameters = method.GetParameters();
+                    if (parameters.Length != 2) continue;
+                    method.Invoke(actionGroups, new object[] { group, enabled });
+                    return true;
+                }
+
+                // A few KSP builds expose the collection as an indexed
+                // property rather than SetGroup. Support that shape too.
+                foreach (PropertyInfo indexed in actionGroups.GetType().GetProperties(flags))
+                {
+                    ParameterInfo[] parameters = indexed.GetIndexParameters();
+                    if (parameters.Length != 1 || !indexed.CanWrite) continue;
+                    indexed.SetValue(actionGroups, enabled, new object[] { group });
+                    return true;
+                }
+            }
+            catch (Exception exception)
+            {
+                KspMcpBridge.Log("could not set vessel action group " + groupName + ": " + exception.Message);
+            }
+            return false;
         }
 
         private static bool TryParseGroup(string name, out KSPActionGroup group)
@@ -2448,3 +3063,4 @@ namespace KspMcp
         }
     }
 }
+

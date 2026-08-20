@@ -118,12 +118,31 @@ TOOLS: list[dict[str, Any]] = [
         ["scene"],
     ),
     _tool(
+        "ksp_game_list_saves",
+        "List real KSP save folders that can be loaded through the bridge; this is read-only and needs no visual UI.",
+    ),
+    _tool(
+        "ksp_game_load_save",
+        "Load one real KSP save through GamePersistence and request the Space Center scene, avoiding title-screen Computer Use.",
+        {"save_folder": {"type": "string"}},
+        ["save_folder"],
+    ),
+    _tool(
         "ksp_parts_list",
         "List the actual parts loaded by the running KSP instance, including attachment nodes and modules.",
         {
             "query": {"type": "string"},
             "include_modules": {"type": "boolean"},
             "limit": {"type": "integer", "minimum": 1, "maximum": 1000},
+        },
+    ),
+    _tool(
+        "ksp_editor_enter",
+        "Enter the real KSP VAB or SPH editor through the in-game bridge without visual UI automation.",
+        {
+            "editor_mode": {"type": "string", "enum": ["VAB", "SPH"]},
+            "save_folder": {"type": "string", "description": "Optional save folder to load first when KSP is at the title screen."},
+            "timeout": {"type": "number", "minimum": 1, "maximum": 60},
         },
     ),
     _tool(
@@ -140,6 +159,11 @@ TOOLS: list[dict[str, Any]] = [
             "require_connected": {"type": "boolean"},
             "live": {"type": "boolean"},
             "wait_for_completion": {"type": "boolean"},
+            "pace": {
+                "type": "string",
+                "enum": ["visible", "balanced", "fast"],
+                "description": "Frame pacing for live construction: visible=one part per Unity frame, balanced=4, fast=16.",
+            },
             "parts_per_frame": {"type": "integer", "minimum": 1, "maximum": 16},
         },
         ["craft"],
@@ -239,8 +263,11 @@ TOOLS: list[dict[str, Any]] = [
     _tool("ksp_editor_clear", "Clear every part from the current editor craft."),
     _tool(
         "ksp_editor_launch",
-        "Launch the current validated editor craft. Requires confirm=true to make the irreversible transition.",
-        {"confirm": {"type": "boolean"}},
+        "Launch the current validated editor craft. Requires confirm=true. By default, MCP also clears occupied launch pads through KSP's stock recovery callback; set auto_clear_launchpad=false to leave the stock dialog open.",
+        {
+            "confirm": {"type": "boolean"},
+            "auto_clear_launchpad": {"type": "boolean"},
+        },
         ["confirm"],
     ),
     _tool("ksp_flight_state", "Read active-vessel telemetry, resources, engines, current stage, controls, and orbital values."),
@@ -370,6 +397,11 @@ TOOLS: list[dict[str, Any]] = [
     ),
     _tool("ksp_flight_abort", "Fire the stock Abort action group."),
     _tool("ksp_flight_clear_control", "Release the MCP fly-by-wire control lease and return control to KSP/player input."),
+    _tool(
+        "ksp_flight_return_to_editor",
+        "Return from the current flight to the real VAB or SPH editor through KSP's native FlightDriver path, without visual UI automation.",
+        {"editor_mode": {"type": "string", "enum": ["VAB", "SPH"]}},
+    ),
     _tool("ksp_flight_recover", "Request recovery/revert of the current flight when KSP allows it."),
 ]
 
@@ -490,15 +522,32 @@ class KspMcpApplication:
             return self.bridge.call_batch(normalised)
         if name == "ksp_wait_for_scene":
             return self.bridge.wait_for_scene(str(args["scene"]), float(args.get("timeout", 30.0)))
+        if name == "ksp_game_list_saves":
+            return self.bridge.call("game.list_saves", {})
+        if name == "ksp_game_load_save":
+            save_folder = str(args.get("save_folder", "")).strip()
+            if not save_folder:
+                raise ValueError("ksp_game_load_save requires save_folder")
+            requested = self.bridge.call("game.load_save", {"save_folder": save_folder})
+            status = self.bridge.wait_for_scene("SPACECENTER", 30.0)
+            if isinstance(status, dict):
+                status["save_request"] = requested
+            return status
         if name == "ksp_parts_list":
             return self.bridge.call("parts.list", args)
+        if name == "ksp_editor_enter":
+            requested = self.bridge.call("editor.enter", args)
+            status = self.bridge.wait_for_scene("EDITOR", float(args.get("timeout", 30.0)))
+            if isinstance(status, dict):
+                status["scene_request"] = requested
+            return status
         if name == "ksp_editor_new":
             return self.bridge.call("editor.new", args)
         if name == "ksp_editor_get_craft":
             return self.bridge.call("editor.snapshot", {})
         if name == "ksp_editor_apply_craft":
             craft = validate_craft_document(args["craft"], require_connected=bool(args.get("require_connected", False)))
-            craft.pop("warnings", None)
+            preflight_warnings = list(craft.pop("warnings", []))
             # Live, frame-sliced construction is the default for MCP callers:
             # it keeps Unity responsive and exposes progress to a visionless
             # client through ksp_editor_job_status and ksp_realtime_state.
@@ -507,10 +556,20 @@ class KspMcpApplication:
             if "parts_per_frame" in args:
                 craft["parts_per_frame"] = int(args["parts_per_frame"])
             elif live:
-                # Make the performance/visibility tradeoff explicit on the
-                # wire instead of relying on a hidden plugin default.
-                 craft["parts_per_frame"] = 12
-            return self.bridge.call("editor.apply_craft", craft)
+                # Visible pacing is the safe default: every Unity frame adds
+                # one part, so a human can actually watch a rocket grow and a
+                # visionless model can correlate the event stream with the
+                # editor part count.  Callers that value throughput can use
+                # pace=balanced/fast or set parts_per_frame explicitly.
+                pace = str(args.get("pace", "visible")).strip().lower()
+                pace_values = {"visible": 1, "balanced": 4, "fast": 16}
+                if pace not in pace_values:
+                    raise ValueError("pace must be visible, balanced, or fast")
+                craft["parts_per_frame"] = pace_values[pace]
+            result = self.bridge.call("editor.apply_craft", craft)
+            if preflight_warnings and isinstance(result, dict):
+                result["preflight_warnings"] = preflight_warnings
+            return result
         if name == "ksp_editor_job_status":
             return self.bridge.call("editor.job_status", args)
         if name == "ksp_editor_cancel_job":
@@ -609,6 +668,8 @@ class KspMcpApplication:
             return self.bridge.call("flight.abort", {})
         if name == "ksp_flight_clear_control":
             return self.bridge.call("flight.clear_control", {})
+        if name == "ksp_flight_return_to_editor":
+            return self.bridge.call("flight.return_to_editor", args)
         if name == "ksp_flight_recover":
             return self.bridge.call("flight.recover", {})
         raise KeyError(f"unknown tool: {name}")
@@ -649,7 +710,7 @@ def handle_message(app: KspMcpApplication, message: dict[str, Any]) -> dict[str,
             {
                 "protocolVersion": str(params.get("protocolVersion", "2024-11-05")),
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "kerbal-space-program", "version": "0.3.2"},
+                "serverInfo": {"name": "kerbal-space-program", "version": "0.3.4"},
                 "instructions": (
                     "Use ksp_realtime_state for compact no-visual state. Build in VAB/SPH with "
                     "ksp_editor_new and live ksp_editor_apply_craft, then poll "
@@ -729,3 +790,4 @@ def main(argv: list[str] | None = None) -> None:
     if args.self_test:
         raise SystemExit(_self_test())
     run_stdio()
+

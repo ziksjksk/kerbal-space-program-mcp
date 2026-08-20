@@ -163,3 +163,4 @@ class BridgeClient:
             code="timeout",
             details=last_status,
         )
+

@@ -7,7 +7,7 @@
 
 建造链路支持从空白编辑器开始创建火箭，也支持一次性提交完整的部件树；粒度较细的工具可以继续增删零件、移动/旋转、重新连接、设置阶段和动作组。飞行链路支持发射后的状态读取、油门和姿态控制、SAS/RCS、分级、时间加速、单部件动作、紧急中止和回收。
 
-0.3.2 在 0.3.1 的低延迟 HTTP 复用、紧凑遥测和事件游标、分帧异步建造、真实零件性能分析、星体模型、原生轨道节点和有限燃烧控制之上继续强化可复用性：`/api/v1/telemetry` 直接读取线程安全缓存，`ksp_wait_for_event` 使用桥内短暂条件等待，事件到达立即唤醒而不是让 MCP 以固定间隔反复轮询；插件同时兼容 KSP 零件名的点号/下划线形式；仓库新增可直接提交给 `ksp_editor_apply_craft` 的 Duna/火星类三阶段星际任务蓝图。指导计划可以在飞行中更新远点/近点、自动分级、齿轮和着陆目标；节点燃烧会先确认姿态再点火并在必要时补偿对准时间；着陆指导会自动放齿轮、使用制动距离和局部 TWR，并可选用目标经纬度修正水平速度。无视觉模型可以通过事件游标观察“哪个零件刚生成、何时点火、何时分级、当前是否正在对准/燃烧/下降/接地”，用户仍能在 KSP 中看到部件逐帧出现。
+0.3.4 是当前可用的人机协同版本：在低延迟 HTTP 复用、紧凑遥测和事件游标、分帧异步建造、真实零件性能分析、星体模型、原生轨道节点和有限燃烧控制之上，补齐了真实 KSP 存档加载、`.craft` 反射加载兼容、编辑器根部件同步、显式控制核心检查和实时建造事件。`/api/v1/telemetry` 直接读取线程安全缓存，`ksp_wait_for_event` 使用桥内短暂条件等待；无视觉模型可以通过事件游标观察“哪个零件刚生成、当前阶段、发动机/资源状态和飞行事件”，人仍可在 KSP 画面中随时接管油门、姿态、分级和节点操作。仓库提供可直接提交给 `ksp_editor_apply_craft` 的四阶段 Duna/火星类任务蓝图。
 
 当前目标平台是 KSP 1.12.x（KSP 1.x 的 `Assembly-CSharp.dll` API）。KSP 2 使用另一套 API，不能直接使用这个插件。
 
@@ -79,7 +79,7 @@ python -m server
 1. 调用 `ksp_status` 确认已经进入 VAB/SPH。
 2. 调用 `ksp_parts_list` 查看当前游戏实例实际加载的零件名称和连接节点。
 3. 调用 `ksp_editor_new` 清空编辑器。
-4. 用 `ksp_editor_apply_craft` 提交完整部件树。MCP 默认使用分帧 live 模式，立即返回 `job_id`，默认每个 Unity 帧生成 12 个部件；需要更明显的逐件展示时传 `parts_per_frame=1`，需要更快完成时可以提高到 16。每个部件会通过 `editor.build.part_added` 事件进入实时事件游标。
+4. 用 `ksp_editor_apply_craft` 提交完整部件树。MCP 默认使用分帧 live 模式，立即返回 `job_id`，默认每个 Unity 帧生成 4 个部件；需要逐件展示时传 `parts_per_frame=1`，需要更快完成时可以提高到 16。每个部件会通过 `editor.build.part_added` 事件进入实时事件游标。
 5. 用 `ksp_editor_job_status` 读取 `completed/total`，并把最近的 `event_cursor` 交给 `ksp_wait_for_event`；事件一到就用 `ksp_realtime_state` 读取增量事件和当前部件数，直到任务进入 `completed`。
 6. 调用 `ksp_editor_analyze` 读取真实零件质量、推力、TWR、近似 Δv、质心/推力中心和分级风险。
 7. 用 `ksp_editor_validate` 检查控制核心、发动机、连接关系、阶段和成本，再用 `ksp_editor_save` 保存 `.craft` 文件。
@@ -134,7 +134,7 @@ ksp_editor_apply_craft(...)
 - `stage 0` 可以作为最终载荷/分离动作，因此允许没有发动机；但 `stage > 0` 如果含有分离器却没有后续发动机，会被拒绝。
 - KSP 原生对舱体、适配器和油箱等被动零件使用 `inverseStage=-1` 是正常状态，不会被误判成非法分级；真正带发动机或分离动作的零件仍必须有有效阶段号。
 
-推荐的两级大型火箭参考结构采用：Mk1 指令舱、上级 Mainsail、下级 Mammoth、两组燃料箱和两个分离器；星际任务可以从 `examples/duna_interplanetary.json` 开始。重新安装 0.3.2 后应先通过 `ksp_editor_validate`、`ksp_editor_analyze`、`ksp_wait_for_event` 和 `ksp_realtime_state` 做游戏内烟测；当前工作区的运行实例仍是旧版桥，因此这里不把尚未重新验证的游戏内点火/分离结果写成已实测事实。
+大型火箭可以从 `examples/duna_interplanetary.json` 开始：它包含显式 `probeCoreOcto2.v2` 控制源、化学助推级、核热转移级、末端着陆推进级和有效分离链。安装 0.3.4 后应先通过 `ksp_editor_validate`、`ksp_editor_analyze`、`ksp_wait_for_event` 和 `ksp_realtime_state` 做游戏内烟测。本机已经验证该蓝图可以被 MCP 分帧构建、校验、保存并重新加载为 28 个部件；自动飞行仍是可停止的实验性闭环，发射后的点火/分离/轨道阶段建议由 MCP 持续读取遥测并允许人接管。
 
 完整部件格式如下：
 
@@ -177,11 +177,11 @@ ksp_editor_apply_craft(...)
 
 Δv 是工程估算，不是完整的飞行仿真：它明确排除了阻力、转向损失、节流曲线、跨级供料变化和大气变化。真正发射前仍要同时通过 `ksp_editor_analyze` 和 `ksp_editor_validate`，并用遥测观察实际 TWR、垂直速度、燃料和级号。
 
-### 实时飞行指导
+### 实时飞行指导（人机协同）
 
 新增的 `ksp_flight_guidance_start` 在游戏帧内运行闭环指导，支持 `ascent`、`orbit`、`landing` 和 `node_burn` 四种 profile；`ksp_flight_guidance_stop` 立即释放控制，`ksp_flight_guidance_status` 返回当前阶段、目标、控制输出和剩余时间。启动必须传 `confirm=true`，默认允许自动分级，但不会绕过发射工具的确认门槛。
 
-当前指导器的职责是提供可观测、可停止的基础闭环：上升阶段按海拔执行重力转弯并以目标远点收油，轨道阶段按远点/近点和原生轨道遥测执行圆化修正，节点燃烧阶段根据原生节点向量进行对准和有限燃烧，着陆阶段先把正近点降到与星体相交，再按相对地表反向速度、制动距离和垂直速度控制下降。它不是全任务级别的“保证成功”黑盒；去 Duna 的转移窗口精确求解、跨影响球捕获、再入热/气动控制和地形避障仍需要模型逐段规划。模型应持续调用 `ksp_realtime_state`，发现燃料、姿态或垂直速度异常时先停止指导或 Abort。
+当前指导器的职责是提供可观测、可停止的基础闭环：上升阶段按海拔执行重力转弯并以目标远点收油，轨道阶段按远点/近点和原生轨道遥测执行圆化修正，节点燃烧阶段根据原生节点向量进行对准和有限燃烧，着陆阶段先把正近点降到与星体相交，再按相对地表反向速度、制动距离和垂直速度控制下降。它不是全任务级别的“保证成功”黑盒；去 Duna 的转移窗口精确求解、跨影响球捕获、再入热/气动控制和地形避障仍需要模型逐段规划。模型应持续调用 `ksp_realtime_state`，发现燃料、姿态或垂直速度异常时先停止指导或 Abort；任何阶段都可以由人使用 KSP 原生界面接管。
 
 ## 重要边界
 
@@ -205,3 +205,4 @@ python -m server --self-test
 ## API 依据
 
 插件使用 KSP 1.x 的 `EditorLogic`、`ShipConstruct`、`Part`、`AttachNode`、`Vessel` 和 `FlightCtrlState` 接口。火箭设计和轨道流程参考 KSP 官方 [KSPedia 手册](https://www.kerbalspaceprogram.com/files/KSPedia-XB1.pdf)；控制器的“导航/制导/控制分层”和上升/着陆状态机参考 NASA 的 [Guidance, Navigation & Control](https://www.nasa.gov/reference/jsc-guidance-navigation-control-subsystems/) 以及 [Rocket Control](https://www1.grc.nasa.gov/beginners-guide-to-aeronautics/rocket-control/)。KSP API 的公开文档可参考 [KSPDocsSite](https://kspmoddinglibs.github.io/KSPDocsSite/) 以及 [XML Documentation for the KSP API](https://anatid.github.io/XML-Documentation-for-the-KSP-API/)。
+

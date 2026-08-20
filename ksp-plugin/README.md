@@ -72,7 +72,7 @@ GET http://127.0.0.1:8765/api/v1/telemetry?since=0&limit=256&include_events=true
 
 ### 分帧建造
 
-`editor.apply_craft` 可以传 `live=true` 和 `parts_per_frame`（1–16）。默认每个 Unity 帧生成 12 个部件；插件会返回 `job_id`，在后续 Unity 帧中逐个或按小批次生成部件，并为每个部件发出 `editor.build.part_added` 事件；用下面的命令读取进度：
+`editor.apply_craft` 可以传 `live=true` 和 `parts_per_frame`（1–16）。默认每个 Unity 帧生成 4 个部件；插件会返回 `job_id`，在后续 Unity 帧中逐个或按小批次生成部件，并为每个部件发出 `editor.build.part_added` 事件；用下面的命令读取进度：
 
 ```json
 {"command":"editor.job_status","args":{"job_id":"build-1"}}
@@ -82,7 +82,7 @@ GET http://127.0.0.1:8765/api/v1/telemetry?since=0&limit=256&include_events=true
 
 实时任务可以通过 editor.cancel_job 停止，已经生成的部件会保留，便于无视觉客户端先检查当前结构再决定清空或继续。flight.maneuver_burn_start 是节点执行层：它根据原生节点的 Δv、实时质量和估算可用推力计算有限燃烧窗口，在 OnFlyByWire 中依次执行对准、点火和燃烧阶段；调用方应继续读取 telemetry，完成后使用 flight.guidance_stop 释放控制。
 
-### 游戏帧内指导器
+### 游戏帧内指导器（可由人接管）
 
 ```json
 {
@@ -104,6 +104,7 @@ GET http://127.0.0.1:8765/api/v1/telemetry?since=0&limit=256&include_events=true
 
 `flight.bodies` 读取 KSP 的星体参数和 patched-conic 轨道；MCP 端的 `ksp_flight_transfer_plan` 会用这些数据计算透明的圆共面 Hohmann 估算。`flight.maneuver_nodes` 读取原生节点，`flight.add_maneuver_node` 和 `flight.clear_maneuver_nodes` 都要求确认参数，避免把规划误变成执行。节点 Δv 使用 radial-plus、normal-plus、prograde 坐标，单位为 m/s。
 
-`profile=orbit` 会在尚未入轨时使用上升制导，获得目标远点后在远点抬升近点；若近点高于目标，则在近点执行逆行降轨。`profile=landing` 会先执行简单脱轨决策，再使用相对地表速度、制动距离、局部重力、地形高度和垂直速度调节油门；进入低空后会自动发送齿轮下放命令，也可以传 `target_latitude`、`target_longitude` 让水平速度向指定地点收敛。两者是可停止、可在线调整的游戏内闭环，不会把近似轨道模型误报成完整的 Duna 任务保证；完整转移窗口搜索、再入气动模型和地形避障仍需模型逐段检查。
+`profile=orbit` 会在尚未入轨时使用上升制导，获得目标远点后在远点抬升近点；若近点高于目标，则在近点执行逆行降轨。`profile=landing` 会先执行简单脱轨决策，再使用相对地表速度、制动距离、局部重力、地形高度和垂直速度调节油门；进入低空后会自动发送齿轮下放命令，也可以传 `target_latitude`、`target_longitude` 让水平速度向指定地点收敛。两者是可停止、可在线调整的游戏内闭环，不会把近似轨道模型误报成完整的 Duna 任务保证；完整转移窗口搜索、再入气动模型和地形避障仍需模型逐段检查。指导器不是权限锁，用户可以随时在 KSP 中手动控制，停止指导后由原生界面继续飞行。
 
 编辑器建造请求支持 `snap_to_node`。默认值为 `true`，会按父子 AttachNode 自动对齐位置和方向；若要保留传入的世界坐标和四元数，可以显式传 `false`。对称复制不依赖游戏当前的 UI 对称模式：MCP 文档中的每个零件都是显式实例，因此插件会在生成单个零件时暂时关闭 UI 对称，避免多出未登记的零件。
+

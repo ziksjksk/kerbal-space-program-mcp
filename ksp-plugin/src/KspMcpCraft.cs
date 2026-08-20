@@ -13,6 +13,9 @@ namespace KspMcp
         private const string IdPrefix = "ksp-mcp-id=";
         private const string CustomDataPrefix = "ksp-mcp-data=";
         private const float EditorRootHeight = 50f;
+        private static readonly FieldInfo EditorRootPartField = typeof(EditorLogic).GetField(
+            "rootPart",
+            BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
         private readonly Dictionary<string, Part> _partsById = new Dictionary<string, Part>(StringComparer.Ordinal);
         private readonly Dictionary<Part, string> _idsByPart = new Dictionary<Part, string>();
         private readonly Dictionary<string, int> _requestedStages = new Dictionary<string, int>(StringComparer.Ordinal);
@@ -28,6 +31,13 @@ namespace KspMcp
         private int _jobCounter;
         private BuildJob _buildJob;
         private bool _deferStageRestoration;
+        private bool _launchAutoClearPending;
+        private int _launchAutoClearFrames;
+        private int _launchAutoClearAttempts;
+        private static string _lastLaunchInvocationError;
+
+        private const int LaunchAutomationDelayFrames = 3;
+        private const int LaunchAutomationTimeoutFrames = 180;
 
         private sealed class BuildJob
         {
@@ -38,6 +48,8 @@ namespace KspMcp
             public string State;
             public string Error;
             public int Completed;
+            public int FrameIndex;
+            public float StartedRealtime;
             public string LastPartId;
             public string LastPartName;
         }
@@ -49,6 +61,7 @@ namespace KspMcp
 
         public void Tick()
         {
+            TickPendingLaunch();
             TickBuildJob();
             if (!_loadPending) return;
 
@@ -75,12 +88,89 @@ namespace KspMcp
             _loadPending = false;
         }
 
+        private void TickPendingLaunch()
+        {
+            if (!_launchAutoClearPending) return;
+
+            // Once KSP has accepted the launch request, scene transition is
+            // the authoritative completion signal. Do not keep touching the
+            // editor after the vessel has entered flight.
+            if (HighLogic.LoadedScene != GameScenes.EDITOR)
+            {
+                _launchAutoClearPending = false;
+                KspMcpBridge bridge = KspMcpBridge.Instance;
+                if (bridge != null)
+                {
+                    bridge.RecordEvent("editor.launch.scene_transition", new Dictionary<string, object>
+                    {
+                        { "scene", KspMcpBridge.SceneName() }
+                    });
+                }
+                return;
+            }
+
+            _launchAutoClearFrames++;
+            if (_launchAutoClearAttempts == 0 && _launchAutoClearFrames >= LaunchAutomationDelayFrames)
+            {
+                _launchAutoClearAttempts++;
+                if (InvokeProceedWithVesselLaunch())
+                {
+                    KspMcpBridge bridge = KspMcpBridge.Instance;
+                    if (bridge != null)
+                    {
+                        bridge.RecordEvent("editor.launchpad.auto_clear_requested", new Dictionary<string, object>
+                        {
+                            { "attempt", _launchAutoClearAttempts },
+                            { "policy", "recover_obstructing_vessels_then_proceed" }
+                        });
+                    }
+                }
+                else
+                {
+                    _launchAutoClearPending = false;
+                    KspMcpBridge bridge = KspMcpBridge.Instance;
+                    if (bridge != null)
+                    {
+                        bridge.RecordEvent("editor.launch.failed", new Dictionary<string, object>
+                        {
+                            { "reason", "could_not_invoke_proceed_with_vessel_launch" }
+                        });
+                    }
+                }
+                return;
+            }
+
+            if (_launchAutoClearAttempts > 0 && _launchAutoClearFrames >= LaunchAutomationTimeoutFrames)
+            {
+                _launchAutoClearPending = false;
+                KspMcpBridge bridge = KspMcpBridge.Instance;
+                if (bridge != null)
+                {
+                    bridge.RecordEvent("editor.launch.failed", new Dictionary<string, object>
+                    {
+                        { "reason", "editor_scene_did_not_transition_after_auto_clear" },
+                        { "frames_waited", _launchAutoClearFrames }
+                    });
+                }
+            }
+        }
+
         private void TickBuildJob()
         {
             if (_buildJob == null || (_buildJob.State != "queued" && _buildJob.State != "running")) return;
             if (!IsEditorAvailable) return;
 
+            // KSP's editor attachPart path can refresh/re-parent the Part
+            // instances between Unity frames.  Reconcile the id map before
+            // resolving the next batch so a child whose parent was added on
+            // the previous frame is still discoverable by its persisted MCP
+            // id.  Without this, a frame-sliced build could stop at N-1 with
+            // a misleading parent-order error even though the craft is a
+            // valid acyclic tree.  This is once per frame (rather than once
+            // per part) to retain the latency benefit of live construction.
+            SyncPartMap();
             _buildJob.State = "running";
+            _buildJob.FrameIndex++;
             int budget = Math.Max(1, Math.Min(16, _buildJob.PartsPerFrame));
             try
             {
@@ -113,6 +203,12 @@ namespace KspMcp
                                 { "job_id", _buildJob.Id },
                                 { "part_id", _buildJob.LastPartId },
                                 { "part", _buildJob.LastPartName },
+                                { "parent_id", JsonUtil.String(part, "parent_id", null) },
+                                { "parent_attach_node", JsonUtil.String(part, "parent_attach_node", null) },
+                                { "attach_node", JsonUtil.String(part, "attach_node", null) },
+                                { "stage", JsonUtil.Integer(part, "stage", 0) },
+                                { "frame_index", _buildJob.FrameIndex },
+                                { "part_index", _buildJob.Completed },
                                 { "completed", _buildJob.Completed },
                                 { "total", _buildJob.Total }
                             });
@@ -136,7 +232,10 @@ namespace KspMcp
                         { "job_id", _buildJob.Id },
                         { "completed", _buildJob.Completed },
                         { "total", _buildJob.Total },
-                        { "state", _buildJob.Pending.Count == 0 ? "completed" : "running" }
+                        { "state", _buildJob.Pending.Count == 0 ? "completed" : "running" },
+                        { "frame_index", _buildJob.FrameIndex },
+                        { "last_part_id", _buildJob.LastPartId },
+                        { "last_part", _buildJob.LastPartName }
                     });
                 }
 
@@ -147,6 +246,17 @@ namespace KspMcp
                     FireEditorModified();
                     _buildJob.State = "completed";
                     _buildJob.Completed = _buildJob.Total;
+                    if (progressBridge != null)
+                    {
+                        progressBridge.RecordEvent("editor.build.completed", new Dictionary<string, object>
+                        {
+                            { "job_id", _buildJob.Id },
+                            { "total", _buildJob.Total },
+                            { "parts_per_frame", _buildJob.PartsPerFrame },
+                            { "frame_index", _buildJob.FrameIndex },
+                            { "elapsed_seconds", Math.Max(0f, Time.realtimeSinceStartup - _buildJob.StartedRealtime) }
+                        });
+                    }
                 }
             }
             catch (Exception exception)
@@ -309,7 +419,7 @@ namespace KspMcp
             SetShipMetadata();
             FireEditorModified();
 
-            int partsPerFrame = Math.Max(1, Math.Min(16, JsonUtil.Integer(args, "parts_per_frame", 12)));
+            int partsPerFrame = Math.Max(1, Math.Min(16, JsonUtil.Integer(args, "parts_per_frame", 1)));
             _jobCounter++;
             _buildJob = new BuildJob
             {
@@ -320,6 +430,8 @@ namespace KspMcp
                 State = "queued",
                 Error = null,
                 Completed = 0,
+                FrameIndex = 0,
+                StartedRealtime = Time.realtimeSinceStartup,
                 LastPartId = null,
                 LastPartName = null
             };
@@ -363,6 +475,7 @@ namespace KspMcp
                 { "parts_per_frame", _buildJob.PartsPerFrame },
                 { "last_part_id", _buildJob.LastPartId },
                 { "last_part", _buildJob.LastPartName },
+                { "frame_index", _buildJob.FrameIndex },
                 { "error", _buildJob.Error }
             };
         }
@@ -515,6 +628,7 @@ namespace KspMcp
                 EditorLogic.fetch.ship.Add(instance);
                 instance.setParent(null);
                 instance.SetHierarchyRoot(instance);
+                SetEditorRootPart(instance);
             }
 
             SetStageInternal(instance, requestedStage);
@@ -871,6 +985,60 @@ namespace KspMcp
             }
         }
 
+        private static object ReadMemberValue(object target, string memberName)
+        {
+            if (target == null || string.IsNullOrEmpty(memberName)) return null;
+            try
+            {
+                Type type = target.GetType();
+                while (type != null)
+                {
+                    FieldInfo field = type.GetField(memberName, BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                    if (field != null) return field.GetValue(target);
+                    PropertyInfo property = type.GetProperty(memberName, BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                    if (property != null && property.CanRead) return property.GetValue(target, null);
+                    type = type.BaseType;
+                }
+            }
+            catch (Exception) { }
+            return null;
+        }
+
+        private static int ReadIntegerMember(object target, string memberName, int fallback)
+        {
+            object value = ReadMemberValue(target, memberName);
+            if (value == null) return fallback;
+            try { return Convert.ToInt32(value); }
+            catch (Exception) { return fallback; }
+        }
+
+        private static int SafePartCrewCount(Part part)
+        {
+            object crew = ReadMemberValue(part, "protoModuleCrew");
+            IEnumerable enumerable = crew as IEnumerable;
+            if (enumerable == null) return 0;
+            int count = 0;
+            try
+            {
+                foreach (object member in enumerable) if (member != null) count++;
+            }
+            catch (Exception) { }
+            return count;
+        }
+
+        private static bool LooksLikeProbeCore(Part part)
+        {
+            if (part == null) return false;
+            string name = part.name ?? "";
+            try
+            {
+                if (part.partInfo != null) name += " " + (part.partInfo.name ?? "");
+            }
+            catch (Exception) { }
+            string compact = name.ToLowerInvariant().Replace("_", "").Replace("-", "").Replace(".", "");
+            return compact.Contains("probecore") || compact.Contains("probestack");
+        }
+
         public Dictionary<string, object> Validate()
         {
             EnsureEditor();
@@ -880,12 +1048,14 @@ namespace KspMcp
             int roots = 0;
             int engines = 0;
             int commandModules = 0;
+            int controlSources = 0;
             int decouplers = 0;
             double totalMass = 0d;
             double totalPropellantMass = 0d;
             var stagePartCounts = new Dictionary<int, int>();
             var stageEngineCounts = new Dictionary<int, int>();
             var stageCommandCounts = new Dictionary<int, int>();
+            var stageControlCounts = new Dictionary<int, int>();
             var stageDecouplerCounts = new Dictionary<int, int>();
 
             foreach (Part part in EditorLogic.fetch.ship.parts)
@@ -898,11 +1068,13 @@ namespace KspMcp
 
                 bool hasStagedActionModule = false;
                 bool hasCommandModule = part.isControllable;
+                bool hasUsableCommandModule = false;
 
                 int partStage = part.inverseStage < 0 ? 0 : part.inverseStage;
                 if (!stagePartCounts.ContainsKey(partStage)) stagePartCounts[partStage] = 0;
                 if (!stageEngineCounts.ContainsKey(partStage)) stageEngineCounts[partStage] = 0;
                 if (!stageCommandCounts.ContainsKey(partStage)) stageCommandCounts[partStage] = 0;
+                if (!stageControlCounts.ContainsKey(partStage)) stageControlCounts[partStage] = 0;
                 if (!stageDecouplerCounts.ContainsKey(partStage)) stageDecouplerCounts[partStage] = 0;
                 stagePartCounts[partStage]++;
 
@@ -928,8 +1100,25 @@ namespace KspMcp
                         if (moduleName.IndexOf("Command", StringComparison.OrdinalIgnoreCase) >= 0)
                         {
                             hasCommandModule = true;
+                            int minimumCrew = ReadIntegerMember(module, "minimumCrew", -1);
+                            int crewCount = SafePartCrewCount(part);
+                            bool usable = minimumCrew >= 0
+                                ? crewCount >= minimumCrew
+                                : (LooksLikeProbeCore(part) || crewCount > 0);
+                            if (usable) hasUsableCommandModule = true;
                         }
                     }
+                }
+
+                // A command module with minimumCrew > 0 is not a control
+                // source until the editor craft has a crew roster.  This is
+                // the distinction KSP's native launch dialog makes and is
+                // why merely counting ModuleCommand used to give a false
+                // green preflight result for an empty Mk1 pod.
+                if (!hasCommandModule && part.isControllable)
+                {
+                    hasCommandModule = true;
+                    hasUsableCommandModule = true;
                 }
 
                 // A controllable part can expose both isControllable and a
@@ -940,6 +1129,11 @@ namespace KspMcp
                 {
                     commandModules++;
                     stageCommandCounts[partStage]++;
+                }
+                if (hasUsableCommandModule)
+                {
+                    controlSources++;
+                    stageControlCounts[partStage]++;
                 }
 
                 if (part.parent != null && part.parent.FindAttachNodeByPart(part) == null)
@@ -959,6 +1153,14 @@ namespace KspMcp
             if (roots != 1 && EditorLogic.fetch.ship.parts.Count > 0) errors.Add("craft has " + roots + " root parts; a rocket must have exactly one connected root");
             if (!SafeAreAllPartsConnected()) errors.Add("KSP reports that not all parts are connected");
             if (commandModules == 0) errors.Add("craft has no controllable command module");
+            if (controlSources == 0)
+            {
+                errors.Add("craft has no usable command source; add a probe core or assign crew to a crew-required command pod");
+            }
+            else if (controlSources < commandModules)
+            {
+                warnings.Add("some command modules require crew; the counted control source(s) are the only ones guaranteed to control this craft");
+            }
             if (engines == 0) warnings.Add("craft has no engine module");
             else if (totalPropellantMass <= 0d) errors.Add("craft has engines but no usable propellant resources");
             if (decouplers == 0) warnings.Add("craft has no decoupler/separator; this may be intentional");
@@ -976,6 +1178,7 @@ namespace KspMcp
                     { "part_count", stagePartCounts[stage] },
                     { "engine_count", stageEngines },
                     { "command_module_count", stageCommandCounts[stage] },
+                    { "control_source_count", stageControlCounts[stage] },
                     { "decoupler_count", stageDecouplers }
                 });
 
@@ -1005,6 +1208,7 @@ namespace KspMcp
                         { "root_count", roots },
                         { "engine_count", engines },
                         { "command_module_count", commandModules },
+                        { "control_source_count", controlSources },
                         { "decoupler_count", decouplers },
                         { "stage_summary", stageSummary },
                         { "mass_tonnes", totalMass },
@@ -1086,17 +1290,28 @@ namespace KspMcp
                     stageItem["vacuum_isp_s"] = (double)stageItem["vacuum_isp_s"] + vacuumThrust * vacuumIsp;
 
                     object transforms = MemberValue(module, "thrustTransforms");
-                    Transform thrustTransform = null;
+                    // Multi-nozzle engines (for example Size3EngineCluster)
+                    // expose one transform per nozzle. Using only the first
+                    // transform makes a symmetric engine look laterally
+                    // offset in a visionless preflight and can hide a real
+                    // thrust/COM problem behind a false one. Average all
+                    // available nozzle positions so the reported thrust
+                    // center matches the net force that KSP applies.
+                    Vector3 thrustPosition = part.transform.position;
+                    Vector3 thrustPositionSum = Vector3.zero;
+                    int thrustTransformCount = 0;
                     IEnumerable transformList = transforms as IEnumerable;
                     if (transformList != null)
                     {
                         foreach (object rawTransform in transformList)
                         {
-                            thrustTransform = rawTransform as Transform;
-                            if (thrustTransform != null) break;
+                            Transform currentTransform = rawTransform as Transform;
+                            if (currentTransform == null) continue;
+                            thrustPositionSum += currentTransform.position;
+                            thrustTransformCount++;
                         }
                     }
-                    Vector3 thrustPosition = thrustTransform == null ? part.transform.position : thrustTransform.position;
+                    if (thrustTransformCount > 0) thrustPosition = thrustPositionSum / thrustTransformCount;
                     centerThrustSum += thrustPosition * (float)vacuumThrust;
                     if (includeParts)
                     {
@@ -1132,6 +1347,7 @@ namespace KspMcp
             double seaTwr = totalMass <= 0d ? 0d : launchSeaLevelThrust / (totalMass * Gravity);
             double vacuumTwr = totalMass <= 0d ? 0d : launchVacuumThrust / (totalMass * Gravity);
             double comAboveThrust = centerMass.y - centerThrust.y;
+            double thrustLateralOffset = 0d;
             double estimatedDv = 0d;
 
             if (engineCount == 0)
@@ -1154,6 +1370,17 @@ namespace KspMcp
                 Vector3 localCenterMass = rootPart == null ? centerMass : rootPart.transform.InverseTransformPoint(centerMass);
                 Vector3 localCenterThrust = rootPart == null ? centerThrust : rootPart.transform.InverseTransformPoint(centerThrust);
                 comAboveThrust = localCenterMass.y - localCenterThrust.y;
+                thrustLateralOffset = Math.Sqrt(
+                    Math.Pow(localCenterMass.x - localCenterThrust.x, 2d) +
+                    Math.Pow(localCenterMass.z - localCenterThrust.z, 2d));
+                if (thrustLateralOffset > 0.50d)
+                {
+                    errors.Add("center of thrust is laterally offset from the center of mass by " + thrustLateralOffset.ToString("0.###") + " m; the launch stage may torque the rocket over");
+                }
+                else if (thrustLateralOffset > 0.10d)
+                {
+                    warnings.Add("center of thrust is laterally offset from the center of mass by " + thrustLateralOffset.ToString("0.###") + " m; verify engine symmetry and attachment alignment");
+                }
                 if (comAboveThrust <= 0.05d)
                 {
                     errors.Add("center of mass is not above the center of thrust in the VAB vertical axis; the rocket may pitch over");
@@ -1191,7 +1418,24 @@ namespace KspMcp
                     estimatedDv += stageDv;
                     if (stageThrust > 0d && stageSeaTwr < 1.0d)
                     {
-                        errors.Add("stage " + stage + " estimated TWR is below 1.0");
+                        // The highest numbered engine stage is the stage KSP
+                        // fires from the launch pad.  Lower numbered stages
+                        // are reached only after their decouplers/staging
+                        // events, often in vacuum or on another body.  A
+                        // nuclear transfer stage or a Duna descent stage is
+                        // expected to have poor Kerbin sea-level TWR, so it
+                        // must not make an otherwise launch-capable craft
+                        // fail the launch preflight.  Keep the information as
+                        // a warning while retaining the hard error for the
+                        // actual initial launch stage.
+                        if (stage == launchStage)
+                        {
+                            errors.Add("stage " + stage + " estimated TWR is below 1.0");
+                        }
+                        else
+                        {
+                            warnings.Add("stage " + stage + " estimated Kerbin sea-level TWR is below 1.0; verify vacuum or target-body performance");
+                        }
                     }
                 }
             }
@@ -1225,6 +1469,7 @@ namespace KspMcp
                 { "delta_v_mps_estimate", estimatedDv },
                 { "center_of_mass", JsonUtil.Vector3Object(centerMass) },
                 { "center_of_thrust", JsonUtil.Vector3Object(centerThrust) },
+                { "thrust_lateral_offset_m", thrustLateralOffset },
                 { "com_above_thrust_m", totalVacuumThrust <= 0d ? 0d : comAboveThrust },
                 { "stage_summary", stageSummary },
                 { "engines", engineReports }
@@ -1367,7 +1612,31 @@ namespace KspMcp
             _idsByPart.Clear();
             _requestedStages.Clear();
             CaptureRequestedStages(path);
-            EditorLogic.LoadShipFromFile(path);
+            // The stock browser path is a thin wrapper around the ConfigNode
+            // callback.  Calling the callback directly avoids depending on a
+            // visible CraftBrowserDialog being open when the request came
+            // from an MCP-only client.
+            ConfigNode craftNode = ConfigNode.Load(path);
+            if (craftNode == null) throw new KspMcpException("craft_load_failed", "could not parse craft file: " + path, null);
+            try
+            {
+                bool callbackInvoked = false;
+                foreach (MethodInfo method in typeof(EditorLogic).GetMethods(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic))
+                {
+                    if (!string.Equals(method.Name, "ShipToLoadSelected", StringComparison.Ordinal)) continue;
+                    ParameterInfo[] parameters = method.GetParameters();
+                    if (parameters.Length != 2 || parameters[0].ParameterType != typeof(ConfigNode) || !parameters[1].ParameterType.IsEnum) continue;
+                    object loadType = Enum.Parse(parameters[1].ParameterType, "Normal");
+                    method.Invoke(EditorLogic.fetch, new object[] { craftNode, loadType });
+                    callbackInvoked = true;
+                    break;
+                }
+                if (!callbackInvoked) EditorLogic.LoadShipFromFile(path);
+            }
+            catch (Exception)
+            {
+                EditorLogic.LoadShipFromFile(path);
+            }
             _craftName = Path.GetFileNameWithoutExtension(path);
             _loadPending = true;
             _loadFrames = 0;
@@ -1386,6 +1655,10 @@ namespace KspMcp
         {
             EnsureEditor();
             if (!JsonUtil.Boolean(args, "confirm", false)) throw new KspMcpException("confirmation_required", "launch requires confirm=true", null);
+            _launchAutoClearPending = false;
+            _launchAutoClearFrames = 0;
+            _launchAutoClearAttempts = 0;
+            _lastLaunchInvocationError = null;
             Dictionary<string, object> validation = Validate();
             if (!(validation["valid"] is bool) || !(bool)validation["valid"])
             {
@@ -1403,11 +1676,21 @@ namespace KspMcp
                     { "analysis", analysis }
                 });
             }
-            if (!InvokeLaunchButton()) throw new KspMcpException("launch_failed", "could not invoke the KSP editor launch button", null);
+            if (!InvokeLaunchButton()) throw new KspMcpException("launch_failed", "could not invoke the KSP editor launch button", new Dictionary<string, object>
+            {
+                { "invocation_error", _lastLaunchInvocationError }
+            });
+            bool autoClearLaunchpad = JsonUtil.Boolean(args, "auto_clear_launchpad", true);
+            if (autoClearLaunchpad)
+            {
+                _launchAutoClearPending = true;
+            }
             return new Dictionary<string, object>
             {
                 { "launch_requested", true },
                 { "scene", KspMcpBridge.SceneName() },
+                { "auto_clear_launchpad", autoClearLaunchpad },
+                { "launchpad_policy", autoClearLaunchpad ? "recover_obstructing_vessels_then_proceed" : "stock_dialog" },
                 { "preflight", new Dictionary<string, object> { { "validation", validation }, { "analysis", analysis } } }
             };
         }
@@ -1590,6 +1873,13 @@ namespace KspMcp
             _expectedLoadPartCount = 0;
             if (IsEditorAvailable)
             {
+                // EditorLogic keeps its selected/root part separately from
+                // ShipConstruct.parts.  Destroying the old root without
+                // clearing that private field leaves a Unity-null reference
+                // behind; KSP's native pre-flight then reports
+                // NoControlSources even though the MCP snapshot still sees
+                // a ModuleCommand on the newly-built root.
+                SetEditorRootPart(null);
                 var parts = new List<Part>(EditorLogic.fetch.ship.parts);
                 foreach (Part part in parts)
                 {
@@ -1605,6 +1895,7 @@ namespace KspMcp
                     }
                 }
                 try { EditorLogic.fetch.ship.Clear(); } catch (Exception) { }
+                SetEditorRootPart(null);
             }
             _partsById.Clear();
             _idsByPart.Clear();
@@ -1635,6 +1926,11 @@ namespace KspMcp
                 root = candidate;
             }
             if (root == null) return;
+
+            // Keep KSP's editor root in sync with the MCP-maintained tree.
+            // The native Engineers Report and launch pipeline use this
+            // EditorLogic field, not only Part.parent/SetHierarchyRoot.
+            SetEditorRootPart(root);
 
             Vector3 position = root.transform.position;
             if (position.y < EditorRootHeight)
@@ -1669,6 +1965,19 @@ namespace KspMcp
             if (!float.IsPositiveInfinity(lowestY) && lowestY < floorClearance)
             {
                 root.transform.position += Vector3.up * (floorClearance - lowestY);
+            }
+        }
+
+        private static void SetEditorRootPart(Part root)
+        {
+            try
+            {
+                if (EditorLogic.fetch == null || EditorRootPartField == null) return;
+                EditorRootPartField.SetValue(EditorLogic.fetch, root);
+            }
+            catch (Exception exception)
+            {
+                KspMcpBridge.Log("could not synchronize EditorLogic.rootPart: " + exception.Message);
             }
         }
 
@@ -1776,6 +2085,19 @@ namespace KspMcp
 
         private Part FindPart(string id)
         {
+            // While a frame-sliced build is attaching several parts, the
+            // editor can keep a newly-created Part out of ShipConstruct.parts
+            // until the current attach operation has returned to Unity.  A
+            // normal sync at that moment would immediately discard the
+            // persisted id from _partsById, making the next child appear to
+            // have an unresolved parent.  Preserve the in-flight map during
+            // AddPartInternal; the next frame's TickBuildJob sync reconciles
+            // it with the live ShipConstruct once KSP has committed it.
+            if (_deferStageRestoration && id != null)
+            {
+                Part buildingPart;
+                if (_partsById.TryGetValue(id, out buildingPart) && buildingPart != null) return buildingPart;
+            }
             SyncPartMap();
             Part part;
             return id != null && _partsById.TryGetValue(id, out part) ? part : null;
@@ -1937,21 +2259,76 @@ namespace KspMcp
 
         private static bool InvokeLaunchButton()
         {
-            object button = EditorLogic.fetch == null ? null : (object)EditorLogic.fetch.launchBtn;
-            if (button == null) return false;
-            if (InvokeZeroArgument(button, "OnClick") || InvokeZeroArgument(button, "Click") || InvokeZeroArgument(button, "Invoke")) return true;
-
-            Type type = button.GetType();
-            foreach (string memberName in new[] { "onClick", "OnClick" })
+            try
             {
-                FieldInfo field = type.GetField(memberName, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
-                object callback = field == null ? null : field.GetValue(button);
-                if (callback != null && (InvokeZeroArgument(callback, "Invoke") || InvokeZeroArgument(callback, "OnClick"))) return true;
-                PropertyInfo property = type.GetProperty(memberName, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
-                callback = property == null ? null : property.GetValue(button, null);
-                if (callback != null && (InvokeZeroArgument(callback, "Invoke") || InvokeZeroArgument(callback, "OnClick"))) return true;
+                object button = EditorLogic.fetch == null ? null : (object)EditorLogic.fetch.launchBtn;
+                if (button == null) return false;
+                if (InvokeZeroArgument(button, "OnClick") || InvokeZeroArgument(button, "Click") || InvokeZeroArgument(button, "Invoke")) return true;
+
+                Type type = button.GetType();
+                foreach (string memberName in new[] { "onClick", "OnClick" })
+                {
+                    FieldInfo field = type.GetField(memberName, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                    object callback = field == null ? null : field.GetValue(button);
+                    if (callback != null && (InvokeZeroArgument(callback, "Invoke") || InvokeZeroArgument(callback, "OnClick"))) return true;
+                    PropertyInfo property = type.GetProperty(memberName, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                    callback = property == null ? null : property.GetValue(button, null);
+                    if (callback != null && (InvokeZeroArgument(callback, "Invoke") || InvokeZeroArgument(callback, "OnClick"))) return true;
+                }
+                return false;
             }
-            return false;
+            catch (TargetInvocationException exception)
+            {
+                Exception inner = exception.InnerException ?? exception;
+                _lastLaunchInvocationError = inner.GetType().FullName + ": " + inner.Message;
+                KspMcpBridge.Log("launch button failed: " + _lastLaunchInvocationError);
+                return false;
+            }
+            catch (Exception exception)
+            {
+                _lastLaunchInvocationError = exception.GetType().FullName + ": " + exception.Message;
+                KspMcpBridge.Log("launch button failed: " + _lastLaunchInvocationError);
+                return false;
+            }
+        }
+
+        private static bool InvokeProceedWithVesselLaunch()
+        {
+            if (EditorLogic.fetch == null) return false;
+            try
+            {
+                // KSP presents the launch-pad occupancy check as a native
+                // PopupDialog. The explicit MCP launch confirmation is the
+                // authorization boundary, so dismiss that visual dialog and
+                // invoke the same stock callback used by its "proceed"
+                // button. This keeps pad recovery and launch behavior inside
+                // the game API and removes a Computer Use dependency.
+                try { PopupDialog.ClearPopUps(); } catch (Exception exception) { KspMcpBridge.Log("could not clear launch popups: " + exception.Message); }
+                MethodInfo method = typeof(EditorLogic).GetMethod(
+                    "proceedWithVesselLaunch",
+                    BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance,
+                    null,
+                    Type.EmptyTypes,
+                    null);
+                if (method == null)
+                {
+                    KspMcpBridge.Log("EditorLogic.proceedWithVesselLaunch is unavailable");
+                    return false;
+                }
+                method.Invoke(EditorLogic.fetch, null);
+                return true;
+            }
+            catch (TargetInvocationException exception)
+            {
+                Exception inner = exception.InnerException ?? exception;
+                KspMcpBridge.Log("proceedWithVesselLaunch failed: " + inner.GetType().FullName + ": " + inner.Message);
+                return false;
+            }
+            catch (Exception exception)
+            {
+                KspMcpBridge.Log("proceedWithVesselLaunch failed: " + exception.GetType().FullName + ": " + exception.Message);
+                return false;
+            }
         }
 
         private static bool InvokeZeroArgument(object target, string methodName)
@@ -1972,3 +2349,4 @@ namespace KspMcp
         }
     }
 }
+

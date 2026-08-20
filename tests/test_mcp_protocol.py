@@ -112,6 +112,7 @@ class McpProtocolTests(unittest.TestCase):
         names = {item["name"] for item in response["result"]["tools"]}
         self.assertEqual(len(names), len(TOOLS))
         self.assertIn("ksp_editor_apply_craft", names)
+        self.assertIn("ksp_editor_enter", names)
         self.assertIn("ksp_flight_set_controls", names)
         self.assertIn("ksp_realtime_state", names)
         self.assertIn("ksp_wait_for_event", names)
@@ -122,6 +123,32 @@ class McpProtocolTests(unittest.TestCase):
         self.assertIn("ksp_flight_transfer_plan", names)
         self.assertIn("ksp_flight_maneuver_nodes", names)
         self.assertIn("ksp_flight_maneuver_burn_start", names)
+        self.assertIn("ksp_flight_return_to_editor", names)
+        self.assertIn("ksp_game_list_saves", names)
+        self.assertIn("ksp_game_load_save", names)
+
+    def test_game_save_tools_route_without_visual_ui(self):
+        saves = self.app.call_tool("ksp_game_list_saves", {})
+        self.assertEqual(saves["command"], "game.list_saves")
+        loaded = self.app.call_tool("ksp_game_load_save", {"save_folder": "MCP_VAB_Test"})
+        self.assertEqual(loaded["scene"], "SPACECENTER")
+        self.assertEqual(loaded["save_request"]["args"]["save_folder"], "MCP_VAB_Test")
+
+    def test_editor_enter_requests_scene_and_waits_for_editor(self):
+        response = handle_message(
+            self.app,
+            {
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "tools/call",
+                "params": {"name": "ksp_editor_enter", "arguments": {"editor_mode": "VAB", "timeout": 12}},
+            },
+        )
+        self.assertFalse(response["result"]["isError"])
+        result = response["result"]["structuredContent"]
+        self.assertEqual(result["scene"], "EDITOR")
+        self.assertEqual(result["timeout"], 12.0)
+        self.assertEqual(result["scene_request"]["command"], "editor.enter")
 
     def test_realtime_state_routes_to_compact_bridge(self):
         response = handle_message(
@@ -179,14 +206,33 @@ class McpProtocolTests(unittest.TestCase):
         )
         self.assertFalse(response["result"]["isError"])
         self.assertTrue(response["result"]["structuredContent"]["args"]["live"])
-        self.assertEqual(response["result"]["structuredContent"]["args"]["parts_per_frame"], 12)
+        self.assertEqual(response["result"]["structuredContent"]["args"]["parts_per_frame"], 1)
+
+    def test_live_craft_pacing_can_be_fast_without_manual_frame_budget(self):
+        response = handle_message(
+            self.app,
+            {
+                "jsonrpc": "2.0",
+                "id": 14,
+                "method": "tools/call",
+                "params": {
+                    "name": "ksp_editor_apply_craft",
+                    "arguments": {
+                        "pace": "fast",
+                        "craft": {"name": "fast", "parts": [{"id": "pod", "part": "probeCoreOcto2.v2"}]},
+                    },
+                },
+            },
+        )
+        self.assertFalse(response["result"]["isError"])
+        self.assertEqual(response["result"]["structuredContent"]["args"]["parts_per_frame"], 16)
 
     def test_initialize_reports_current_server_version(self):
         response = handle_message(
             self.app,
             {"jsonrpc": "2.0", "id": 12, "method": "initialize", "params": {}},
         )
-        self.assertEqual(response["result"]["serverInfo"]["version"], "0.3.2")
+        self.assertEqual(response["result"]["serverInfo"]["version"], "0.3.4")
 
     def test_live_build_can_be_cancelled(self):
         response = handle_message(
@@ -322,3 +368,4 @@ class McpProtocolTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

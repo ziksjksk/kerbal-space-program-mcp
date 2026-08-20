@@ -305,7 +305,10 @@ namespace KspMcp
                 case "status": return Status();
                 case "telemetry": return Telemetry(args);
                 case "batch": return Batch(args);
+                case "game.list_saves": return ListSaves();
+                case "game.load_save": return LoadSave(args);
                 case "parts.list": return _craft.ListAvailableParts(args);
+                case "editor.enter": return EnterEditor(args);
                 case "editor.new": return _craft.NewCraft(args);
                 case "editor.snapshot": return _craft.Snapshot();
                 case "editor.apply_craft": return _craft.ApplyCraft(args);
@@ -341,9 +344,249 @@ namespace KspMcp
                 case "flight.activate_part": return _flight.ActivatePart(args);
                 case "flight.abort": return _flight.Abort();
                 case "flight.clear_control": return _flight.ClearControl();
+                case "flight.return_to_editor": return _flight.ReturnToEditor(args);
                 case "flight.recover": return _flight.Recover();
                 default: throw new KspMcpException("unknown_command", "unknown command: " + command, null);
             }
+        }
+
+        private Dictionary<string, object> EnterEditor(Dictionary<string, object> args)
+        {
+            string mode = JsonUtil.String(args, "editor_mode", "VAB").ToUpperInvariant();
+            EditorFacility facility;
+            if (mode == "VAB") facility = EditorFacility.VAB;
+            else if (mode == "SPH") facility = EditorFacility.SPH;
+            else throw new KspMcpException("invalid_editor_mode", "editor_mode must be VAB or SPH", mode);
+
+            // EditorDriver can create an editor scene from the title screen,
+            // but KSP's save-dependent editor UI and launch path require a
+            // loaded Game object. Keep that bootstrap inside the bridge so a
+            // no-visual client does not need to click through Load Game first.
+            if (HighLogic.CurrentGame == null && JsonUtil.Get(args, "save_folder") != null)
+            {
+                LoadSave(args);
+            }
+            if (HighLogic.CurrentGame == null && HighLogic.LoadedScene == GameScenes.MAINMENU)
+            {
+                throw new KspMcpException("editor_enter_requires_save", "KSP is at the main menu without a loaded save; call game.load_save or pass save_folder to editor.enter", null);
+            }
+
+            if (HighLogic.LoadedScene == GameScenes.EDITOR)
+            {
+                return new Dictionary<string, object>
+                {
+                    { "scene_requested", "EDITOR" },
+                    { "editor_mode", mode },
+                    { "scene", SceneName() },
+                    { "already_in_editor", true }
+                };
+            }
+
+            try
+            {
+                // EditorDriver.StartEditor performs KSP's normal facility and
+                // scene initialisation. Calling HighLogic.LoadScene directly
+                // skips that setup and can leave EditorLogic unavailable.
+                EditorDriver.StartEditor(facility);
+                RecordEvent("editor.scene_requested", new Dictionary<string, object>
+                {
+                    { "scene", "EDITOR" },
+                    { "editor_mode", mode },
+                    { "entry", "mcp" }
+                });
+                return new Dictionary<string, object>
+                {
+                    { "scene_requested", "EDITOR" },
+                    { "editor_mode", mode },
+                    { "scene", SceneName() },
+                    { "already_in_editor", false }
+                };
+            }
+            catch (Exception exception)
+            {
+                throw new KspMcpException("editor_enter_failed", "KSP could not enter the editor: " + exception.Message, null);
+            }
+        }
+
+        private Dictionary<string, object> ListSaves()
+        {
+            string root = Path.Combine(KSPUtil.ApplicationRootPath, "saves");
+            var saves = new List<object>();
+            if (Directory.Exists(root))
+            {
+                foreach (string directory in Directory.GetDirectories(root))
+                {
+                    string persistent = Path.Combine(directory, "persistent.sfs");
+                    if (!File.Exists(persistent)) continue;
+                    DirectoryInfo info = new DirectoryInfo(directory);
+                    saves.Add(new Dictionary<string, object>
+                    {
+                        { "save_folder", info.Name },
+                        { "persistent_path", persistent },
+                        { "last_write_utc", File.GetLastWriteTimeUtc(persistent).ToString("o") }
+                    });
+                }
+            }
+            return new Dictionary<string, object>
+            {
+                { "scene", SceneName() },
+                { "current_save_folder", ReadStaticString(typeof(HighLogic), "SaveFolder") },
+                { "saves", saves }
+            };
+        }
+
+        private Dictionary<string, object> LoadSave(Dictionary<string, object> args)
+        {
+            if (HighLogic.LoadedScene == GameScenes.EDITOR || HighLogic.LoadedScene == GameScenes.FLIGHT)
+            {
+                throw new KspMcpException("game_load_unsafe", "load a save only from the main menu or space center", SceneName());
+            }
+
+            string saveFolder = JsonUtil.RequiredString(args, "save_folder");
+            string root = Path.Combine(KSPUtil.ApplicationRootPath, "saves", saveFolder);
+            string persistent = Path.Combine(root, "persistent.sfs");
+            if (!File.Exists(persistent))
+            {
+                throw new KspMcpException("save_not_found", "save folder does not contain persistent.sfs: " + saveFolder, persistent);
+            }
+
+            object loadedGame = null;
+            MethodInfo usedMethod = null;
+            string usedFileArgument = null;
+            Exception lastError = null;
+            var attempts = new List<string>();
+            // KSP 1.12's public signature is LoadGame(filename, saveFolder,
+            // ...).  filename is normally the logical save name "persistent",
+            // not the absolute path returned by File.Exists.  Keep the path
+            // and extension variants as compatibility fallbacks for forks.
+            string[] filenameCandidates = { "persistent", persistent, "persistent.sfs" };
+            foreach (string filename in filenameCandidates)
+            {
+                foreach (MethodInfo method in typeof(GamePersistence).GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static))
+                {
+                    if (!string.Equals(method.Name, "LoadGame", StringComparison.Ordinal)) continue;
+                    object[] invocation;
+                    if (!TryBuildLoadGameArguments(method.GetParameters(), filename, saveFolder, out invocation)) continue;
+                    try
+                    {
+                        loadedGame = method.Invoke(null, invocation);
+                        attempts.Add(filename + ": return=" + (loadedGame == null ? "null" : loadedGame.GetType().FullName));
+                        if (loadedGame != null)
+                        {
+                            SetStaticMember(typeof(HighLogic), "CurrentGame", loadedGame);
+                            usedMethod = method;
+                            usedFileArgument = filename;
+                        }
+                        if (HighLogic.CurrentGame != null) break;
+                    }
+                    catch (TargetInvocationException exception)
+                    {
+                        lastError = exception.InnerException ?? exception;
+                        attempts.Add(filename + ": error=" + lastError.GetType().FullName + ":" + lastError.Message);
+                    }
+                    catch (Exception exception)
+                    {
+                        lastError = exception;
+                        attempts.Add(filename + ": error=" + exception.GetType().FullName + ":" + exception.Message);
+                    }
+                }
+                if (HighLogic.CurrentGame != null) break;
+            }
+
+            if (usedMethod == null)
+            {
+                string message = lastError == null ? "KSP returned no Game from GamePersistence.LoadGame" : lastError.Message;
+                throw new KspMcpException("game_load_failed", "could not load save " + saveFolder + ": " + message, new Dictionary<string, object>
+                {
+                    { "attempts", attempts },
+                    { "persistent_path", persistent }
+                });
+            }
+            if (loadedGame != null) SetStaticMember(typeof(HighLogic), "CurrentGame", loadedGame);
+            SetStaticMember(typeof(HighLogic), "SaveFolder", saveFolder);
+            if (HighLogic.CurrentGame == null)
+            {
+                throw new KspMcpException("game_load_failed", "KSP returned no current game after loading save " + saveFolder, null);
+            }
+
+            HighLogic.LoadScene(GameScenes.SPACECENTER);
+            RecordEvent("game.save_loaded", new Dictionary<string, object>
+            {
+                { "save_folder", saveFolder },
+                { "scene", "SPACECENTER" },
+                { "method", usedMethod.ToString() }
+            });
+            return new Dictionary<string, object>
+            {
+                { "loaded", true },
+                { "save_folder", saveFolder },
+                { "scene_requested", "SPACECENTER" },
+                { "method", usedMethod.ToString() },
+                { "file_argument", usedFileArgument }
+            };
+        }
+
+        private static bool TryBuildLoadGameArguments(ParameterInfo[] parameters, string filename, string saveFolder, out object[] invocation)
+        {
+            invocation = null;
+            var values = new object[parameters.Length];
+            int stringIndex = 0;
+            for (int index = 0; index < parameters.Length; index++)
+            {
+                ParameterInfo parameter = parameters[index];
+                Type type = parameter.ParameterType;
+                if (type == typeof(string))
+                {
+                    string parameterName = (parameter.Name ?? "").ToLowerInvariant();
+                    values[index] = stringIndex == 0 && parameterName.IndexOf("folder", StringComparison.Ordinal) < 0
+                        ? filename
+                        : saveFolder;
+                    stringIndex++;
+                }
+                else if (type.IsEnum)
+                {
+                    try { values[index] = Enum.Parse(type, "OVERWRITE"); }
+                    catch (Exception) { return false; }
+                }
+                else if (type == typeof(bool)) values[index] = false;
+                else if (parameter.HasDefaultValue) values[index] = parameter.DefaultValue;
+                else return false;
+            }
+            invocation = values;
+            return true;
+        }
+
+        private static string ReadStaticString(Type type, string name)
+        {
+            object value = ReadStaticMember(type, name);
+            return value == null ? null : value.ToString();
+        }
+
+        private static object ReadStaticMember(Type type, string name)
+        {
+            BindingFlags flags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static;
+            try
+            {
+                PropertyInfo property = type.GetProperty(name, flags);
+                if (property != null && property.CanRead) return property.GetValue(null, null);
+                FieldInfo field = type.GetField(name, flags);
+                if (field != null) return field.GetValue(null);
+            }
+            catch (Exception) { }
+            return null;
+        }
+
+        private static void SetStaticMember(Type type, string name, object value)
+        {
+            BindingFlags flags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static;
+            PropertyInfo property = type.GetProperty(name, flags);
+            if (property != null && property.CanWrite)
+            {
+                property.SetValue(null, value, null);
+                return;
+            }
+            FieldInfo field = type.GetField(name, flags);
+            if (field != null && !field.IsInitOnly) field.SetValue(null, value);
         }
 
         private object Batch(Dictionary<string, object> args)
@@ -390,7 +633,7 @@ namespace KspMcp
             return new Dictionary<string, object>
             {
                 { "bridge", "ksp-mcp" },
-                { "bridge_version", "0.3.2" },
+                { "bridge_version", "0.3.4" },
                 { "scene", SceneName() },
                 { "endpoint", "http://" + _host + ":" + _port },
                 { "verbose_logging", _verboseLogging },
@@ -399,9 +642,9 @@ namespace KspMcp
                 { "flight", _flight.Snapshot() },
                 { "capabilities", new Dictionary<string, object>
                     {
-                        { "editor", new List<object> { "new", "snapshot", "apply", "add", "attach", "update", "remove", "stage", "action_group", "validate", "analyze", "save", "load", "launch", "job_status", "cancel_job" } },
-                        { "flight", new List<object> { "state", "compact_telemetry", "bodies", "maneuver_nodes", "add_maneuver_node", "clear_maneuver_nodes", "maneuver_burn_start", "guidance_start", "guidance_stop", "guidance_status", "guidance_update", "stage", "controls", "sas", "rcs", "warp", "activate_part", "abort", "recover" } },
-                        { "bridge", new List<object> { "telemetry", "batch" } }
+                        { "editor", new List<object> { "enter", "new", "snapshot", "apply", "add", "attach", "update", "remove", "stage", "action_group", "validate", "analyze", "save", "load", "launch", "job_status", "cancel_job" } },
+                        { "flight", new List<object> { "state", "compact_telemetry", "bodies", "maneuver_nodes", "add_maneuver_node", "clear_maneuver_nodes", "maneuver_burn_start", "guidance_start", "guidance_stop", "guidance_status", "guidance_update", "stage", "controls", "sas", "rcs", "warp", "activate_part", "abort", "clear_control", "return_to_editor", "recover" } },
+                        { "bridge", new List<object> { "telemetry", "batch", "game.list_saves", "game.load_save" } }
                     }
                 }
             };
@@ -516,7 +759,7 @@ namespace KspMcp
             Dictionary<string, object> nextCache = new Dictionary<string, object>
             {
                 { "sequence", _telemetrySequence },
-                { "bridge_version", "0.3.2" },
+                { "bridge_version", "0.3.4" },
                 { "captured_at", SafeUniversalTime() },
                 { "scene", SceneName() },
                 { "editor", _craft.CompactStatus() },
@@ -617,3 +860,4 @@ namespace KspMcp
         }
     }
 }
+
