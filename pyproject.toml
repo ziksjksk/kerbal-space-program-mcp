@@ -1,9 +1,10 @@
 [project]
 name = "kerbal-space-program-mcp"
-version = "0.3.2"
+version = "0.3.4"
 description = "MCP server and KSP 1.x bridge for building and flying rockets"
 requires-python = ">=3.10"
 dependencies = []
 
 [tool.ksp-mcp]
 default-url = "http://127.0.0.1:8765"
+

@@ -1,3 +1,5 @@
+Import-Clixml: Unexpected end of file has occurred. The following elements are not closed: En, DCT, Obj, En, DCT, Obj, En, DCT, Obj,
+Objs. Line 965, position 23.
 using System;
 using System.Collections;
 using System.Collections.Generic;
@@ -427,3 +429,4 @@ namespace KspMcp
         }
     }
 }
+

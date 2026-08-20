@@ -37,6 +37,24 @@ def _non_empty_string(value: Any, field: str) -> str:
     return value.strip()
 
 
+def _compact_part_name(value: str) -> str:
+    """Return a comparison-friendly KSP part name without punctuation."""
+
+    return "".join(character for character in value.lower() if character.isalnum())
+
+
+def _looks_like_probe_core(part_name: str) -> bool:
+    compact = _compact_part_name(part_name)
+    return "probecore" in compact or "probestack" in compact
+
+
+def _looks_like_crewed_command_part(part_name: str) -> bool:
+    compact = _compact_part_name(part_name)
+    if _looks_like_probe_core(part_name):
+        return False
+    return any(token in compact for token in ("pod", "cockpit", "landercabin", "commandchair"))
+
+
 def normalise_part_spec(raw: Mapping[str, Any], index: int | None = None) -> dict[str, Any]:
     if not isinstance(raw, Mapping):
         raise CraftValidationError("each part must be an object")
@@ -150,6 +168,25 @@ def validate_craft_document(
                 "the game may leave it unconnected"
             )
 
+    # A crewed pod is a valid KSP part, but a newly generated editor craft has
+    # no crew roster to populate.  KSP therefore shows its native "no control
+    # source" dialog at launch even though the part contains ModuleCommand.
+    # Keep this as a preflight warning (rather than rejecting every possible
+    # crewed save) and make the robust, visionless fix explicit: add a stock
+    # probe core or load a craft that already has crew assigned.
+    has_probe_core = any(_looks_like_probe_core(part["part"]) for part in parts)
+    if parts and not has_probe_core:
+        crewed_command_parts = [
+            part["id"] for part in parts if _looks_like_crewed_command_part(part["part"])
+        ]
+        if crewed_command_parts:
+            warnings.append(
+                "no explicit probe core found for crew-capable command part(s) "
+                + ", ".join(crewed_command_parts)
+                + "; KSP may require crew at launch. Add probeCoreOcto2.v2 (recommended for no-visual builds) "
+                "or load a craft with an assigned crew roster."
+            )
+
     return {
         "name": name.strip(),
         "description": description,
@@ -157,3 +194,4 @@ def validate_craft_document(
         "parts": parts,
         "warnings": warnings,
     }
+

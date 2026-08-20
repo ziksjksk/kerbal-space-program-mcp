@@ -29,3 +29,4 @@ New-Item -ItemType Directory -Force -Path $destination | Out-Null
 Copy-Item -Path (Join-Path $source '*') -Destination $destination -Recurse -Force
 Write-Host "Installed KspMcp to $destination"
 Write-Host 'Start KSP, then start the MCP server with: python -m server'
+

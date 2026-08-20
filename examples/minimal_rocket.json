@@ -1,6 +1,6 @@
 {
   "name": "MCP Minimal Rocket",
-  "description": "A three-part stock KSP test rocket built entirely through the MCP.",
+  "description": "A four-part stock KSP test rocket built entirely through the MCP, with an explicit probe core so it is controllable without relying on crew assignment.",
   "editor_mode": "VAB",
   "parts": [
     {
@@ -8,6 +8,15 @@
       "part": "mk1pod.v2",
       "position": [0, 0, 0],
       "rotation": [0, 0, 0, 1],
+      "stage": 0
+    },
+    {
+      "id": "probe-core",
+      "part": "probeCoreOcto2.v2",
+      "parent_id": "pod",
+      "parent_attach_node": "top",
+      "attach_node": "bottom",
+      "snap_to_node": true,
       "stage": 0
     },
     {
@@ -30,3 +39,4 @@
     }
   ]
 }
+

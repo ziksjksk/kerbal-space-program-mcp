@@ -1,28 +1,56 @@
 {
   "name": "MCP Duna Interplanetary Expedition",
-  "description": "A stock KSP 1.12.x three-stage reference vehicle for a Kerbin launch, Duna transfer, and powered terminal descent. The MCP must still inspect the live parts catalog and run in-game validation before launch.",
+  "description": "A stock KSP 1.12.x four-stage reference vehicle for a Kerbin launch, orbital insertion, Duna transfer, and powered terminal descent. It uses an explicit probe core, no-vision MCP staging, and four engines per chemical booster stage.",
   "editor_mode": "VAB",
   "mission": {
     "destination": "Duna",
-    "architecture": "core launch stage -> nuclear transfer stage -> powered terminal descent stage",
+    "architecture": "four-engine core launch stage -> four-engine orbital insertion stage -> nuclear transfer stage -> powered terminal descent stage",
     "staging_order": [
-      "stage 2: Size3 core engine and tanks",
-      "stage 1: transfer decoupler and nuclear engine",
-      "stage 0: terminal descent engine and command pod"
+      "stage 3: four Mainsails, four Size3 tanks, and the core engine mount",
+      "stage 2: separate the core, then use four orbital Mainsails and two Jumbo tanks",
+      "stage 1: separate the chemical insertion stage, then use the nuclear transfer engine",
+      "stage 0: separate the transfer stack, then use the Poodle descent engine"
     ],
     "required_runtime_checks": [
       "ksp_parts_list",
       "ksp_editor_validate",
       "ksp_editor_analyze",
-      "ksp_flight_guidance_start"
+      "ksp_editor_save",
+      "ksp_editor_launch",
+      "ksp_flight_guidance_start",
+      "ksp_realtime_state"
+    ],
+    "design_invariants": [
+      "The probe core is a real controllable command source and is included even when the crew pod is present.",
+      "All four engines of each chemical stage are attached when the craft is first built; no engine is removed and replaced later.",
+      "The immediate post-launch stage must have useful vacuum thrust, so the nuclear transfer stage is not used as the first upper stage.",
+      "The MCP must wait for editor build events and validate the live KSP tree before launch."
     ]
   },
   "parts": [
     {
       "id": "command-pod",
       "part": "mk1pod.v2",
-      "position": [0, 50, 0],
-      "rotation": [0, 0, 0, 1],
+      "position": [
+        0,
+        50,
+        0
+      ],
+      "rotation": [
+        0,
+        0,
+        0,
+        1
+      ],
+      "stage": 0
+    },
+    {
+      "id": "probe-core",
+      "part": "probeCoreOcto2.v2",
+      "parent_id": "command-pod",
+      "parent_attach_node": "top",
+      "attach_node": "bottom",
+      "snap_to_node": true,
       "stage": 0
     },
     {
@@ -71,8 +99,8 @@
       "stage": 1
     },
     {
-      "id": "transfer-tank-lower",
-      "part": "Rockomax64.BW",
+      "id": "transfer-engine",
+      "part": "nuclearEngine",
       "parent_id": "transfer-tank-upper",
       "parent_attach_node": "bottom",
       "attach_node": "top",
@@ -80,16 +108,7 @@
       "stage": 1
     },
     {
-      "id": "transfer-engine",
-      "part": "nuclearEngine",
-      "parent_id": "transfer-tank-lower",
-      "parent_attach_node": "bottom",
-      "attach_node": "top",
-      "snap_to_node": true,
-      "stage": 1
-    },
-    {
-      "id": "core-separator",
+      "id": "orbital-separator",
       "part": "Decoupler.2",
       "parent_id": "transfer-engine",
       "parent_attach_node": "bottom",
@@ -98,13 +117,94 @@
       "stage": 1
     },
     {
+      "id": "orbital-tank-upper",
+      "part": "Rockomax64.BW",
+      "parent_id": "orbital-separator",
+      "parent_attach_node": "bottom",
+      "attach_node": "top",
+      "snap_to_node": true,
+      "stage": 2
+    },
+    {
+      "id": "orbital-tank-lower",
+      "part": "Rockomax64.BW",
+      "parent_id": "orbital-tank-upper",
+      "parent_attach_node": "bottom",
+      "attach_node": "top",
+      "snap_to_node": true,
+      "stage": 2
+    },
+    {
+      "id": "orbital-adapter",
+      "part": "Size3To2Adapter.v2",
+      "parent_id": "orbital-tank-lower",
+      "parent_attach_node": "bottom",
+      "attach_node": "top",
+      "snap_to_node": true,
+      "stage": 2
+    },
+    {
+      "id": "orbital-engine-mount",
+      "part": "adapterEngines",
+      "parent_id": "orbital-adapter",
+      "parent_attach_node": "bottom",
+      "attach_node": "top",
+      "snap_to_node": true,
+      "stage": 2
+    },
+    {
+      "id": "orbital-mainsail-1",
+      "part": "liquidEngineMainsail.v2",
+      "parent_id": "orbital-engine-mount",
+      "parent_attach_node": "bottom01",
+      "attach_node": "top",
+      "snap_to_node": true,
+      "stage": 2
+    },
+    {
+      "id": "orbital-mainsail-2",
+      "part": "liquidEngineMainsail.v2",
+      "parent_id": "orbital-engine-mount",
+      "parent_attach_node": "bottom02",
+      "attach_node": "top",
+      "snap_to_node": true,
+      "stage": 2
+    },
+    {
+      "id": "orbital-mainsail-3",
+      "part": "liquidEngineMainsail.v2",
+      "parent_id": "orbital-engine-mount",
+      "parent_attach_node": "bottom03",
+      "attach_node": "top",
+      "snap_to_node": true,
+      "stage": 2
+    },
+    {
+      "id": "orbital-mainsail-4",
+      "part": "liquidEngineMainsail.v2",
+      "parent_id": "orbital-engine-mount",
+      "parent_attach_node": "bottom04",
+      "attach_node": "top",
+      "snap_to_node": true,
+      "stage": 2
+    },
+    {
+      "id": "core-separator",
+      "part": "Decoupler.2",
+      "parent_id": "orbital-mainsail-1",
+      "parent_attach_node": "bottom",
+      "attach_node": "top",
+      "snap_to_node": true,
+      "stage": 2
+    },
+    {
       "id": "core-adapter",
       "part": "Size3To2Adapter.v2",
       "parent_id": "core-separator",
       "parent_attach_node": "bottom",
       "attach_node": "top",
       "snap_to_node": true,
-      "stage": 2
+      "stage": 3
     },
     {
       "id": "core-tank-upper",
@@ -113,7 +213,7 @@
       "parent_attach_node": "bottom",
       "attach_node": "top",
       "snap_to_node": true,
-      "stage": 2
+      "stage": 3
     },
     {
       "id": "core-tank-lower",
@@ -122,16 +222,71 @@
       "parent_attach_node": "bottom",
       "attach_node": "top",
       "snap_to_node": true,
-      "stage": 2
+      "stage": 3
     },
     {
-      "id": "core-engine",
-      "part": "Size3EngineCluster",
+      "id": "core-tank-middle",
+      "part": "Size3LargeTank",
       "parent_id": "core-tank-lower",
       "parent_attach_node": "bottom",
       "attach_node": "top",
       "snap_to_node": true,
-      "stage": 2
+      "stage": 3
+    },
+    {
+      "id": "core-tank-fourth",
+      "part": "Size3LargeTank",
+      "parent_id": "core-tank-middle",
+      "parent_attach_node": "bottom",
+      "attach_node": "top",
+      "snap_to_node": true,
+      "stage": 3
+    },
+    {
+      "id": "core-engine-mount",
+      "part": "adapterEngines",
+      "parent_id": "core-tank-fourth",
+      "parent_attach_node": "bottom",
+      "attach_node": "top",
+      "snap_to_node": true,
+      "stage": 3
+    },
+    {
+      "id": "core-cluster",
+      "part": "Size3EngineCluster",
+      "parent_id": "core-engine-mount",
+      "parent_attach_node": "bottom01",
+      "attach_node": "top",
+      "snap_to_node": true,
+      "stage": 3
+    },
+    {
+      "id": "core-mainsail-2",
+      "part": "liquidEngineMainsail.v2",
+      "parent_id": "core-engine-mount",
+      "parent_attach_node": "bottom03",
+      "attach_node": "top",
+      "snap_to_node": true,
+      "stage": 3
+    },
+    {
+      "id": "core-mainsail-3",
+      "part": "liquidEngineMainsail.v2",
+      "parent_id": "core-engine-mount",
+      "parent_attach_node": "bottom04",
+      "attach_node": "top",
+      "snap_to_node": true,
+      "stage": 3
+    },
+    {
+      "id": "core-mainsail-1",
+      "part": "liquidEngineMainsail.v2",
+      "parent_id": "core-engine-mount",
+      "parent_attach_node": "bottom02",
+      "attach_node": "top",
+      "snap_to_node": true,
+      "stage": 3
     }
   ]
 }
+
