@@ -26,6 +26,7 @@ namespace KspMcp
         private string _lastTelemetryBody;
         private int _lastTelemetryStage = int.MinValue;
         private bool _lastTelemetryCommandable;
+        private bool _launchHandoffPending;
         private string _lastTelemetryGuidancePhase;
         private int _lastTelemetryIgnitedEngines = -1;
         private int _lastTelemetryOperationalEngines = -1;
@@ -164,7 +165,19 @@ namespace KspMcp
                     _lease.Clear();
                     _leaseUntil = 0d;
                 }
-                if (Planetarium.GetUniversalTime() > _guidance.EndsAt)
+                string activeSituation = active == null ? null : active.situation.ToString();
+                bool terminalVessel = string.Equals(activeSituation, "DEAD", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(activeSituation, "CRASHED", StringComparison.OrdinalIgnoreCase) ||
+                    (active != null && active.GetTotalMass() <= 0.0001d);
+                if (terminalVessel)
+                {
+                    _guidance.LastError = "active vessel is dead or has no remaining mass; guidance released";
+                    _guidance.Phase = "vessel_lost";
+                    _guidance = null;
+                    _lease.Clear();
+                    _leaseUntil = 0d;
+                }
+                else if (Planetarium.GetUniversalTime() > _guidance.EndsAt)
                 {
                     _guidance.LastError = "guidance time limit reached";
                     _guidance = null;
@@ -190,6 +203,7 @@ namespace KspMcp
             _lastTelemetryBody = null;
             _lastTelemetryStage = int.MinValue;
             _lastTelemetryCommandable = false;
+            _launchHandoffPending = false;
             _lastTelemetryGuidancePhase = null;
             _lastTelemetryIgnitedEngines = -1;
             _lastTelemetryOperationalEngines = -1;
@@ -346,8 +360,21 @@ namespace KspMcp
                 _lastTelemetryFlameoutEngines = flameout;
             }
 
-            if (string.Equals(previousSituation, "PRELAUNCH", StringComparison.OrdinalIgnoreCase) &&
-                !string.Equals(situation, "PRELAUNCH", StringComparison.OrdinalIgnoreCase))
+            bool leftPrelaunch = string.Equals(previousSituation, "PRELAUNCH", StringComparison.OrdinalIgnoreCase) &&
+                !string.Equals(situation, "PRELAUNCH", StringComparison.OrdinalIgnoreCase);
+            bool directLiftoff = leftPrelaunch &&
+                !string.Equals(situation, "LANDED", StringComparison.OrdinalIgnoreCase) &&
+                !string.Equals(situation, "SPLASHED", StringComparison.OrdinalIgnoreCase) &&
+                (vessel.altitude > vessel.terrainAltitude + 2d || vessel.verticalSpeed > 1d || vessel.srfSpeed > 5d);
+            if (string.Equals(situation, "PRELAUNCH", StringComparison.OrdinalIgnoreCase))
+            {
+                _launchHandoffPending = true;
+            }
+            bool handoffLiftoff = _launchHandoffPending &&
+                string.Equals(previousSituation, "LANDED", StringComparison.OrdinalIgnoreCase) &&
+                string.Equals(situation, "FLYING", StringComparison.OrdinalIgnoreCase) &&
+                (vessel.altitude > vessel.terrainAltitude + 2d || vessel.verticalSpeed > 1d || vessel.srfSpeed > 5d);
+            if (directLiftoff || handoffLiftoff)
             {
                 bridge.RecordEvent("flight.liftoff", new Dictionary<string, object>
                 {
@@ -357,12 +384,18 @@ namespace KspMcp
                     { "altitude", vessel.altitude },
                     { "surface_speed", vessel.srfSpeed }
                 });
+                _launchHandoffPending = false;
             }
             bool touchdown = string.Equals(situation, "LANDED", StringComparison.OrdinalIgnoreCase) ||
                 string.Equals(situation, "SPLASHED", StringComparison.OrdinalIgnoreCase);
             bool wasTouchdown = string.Equals(previousSituation, "LANDED", StringComparison.OrdinalIgnoreCase) ||
                 string.Equals(previousSituation, "SPLASHED", StringComparison.OrdinalIgnoreCase);
-            if (touchdown && !wasTouchdown && previousSituation != null)
+            // A stock launch can briefly report PRELAUNCH -> LANDED while
+            // the launch clamp/physics handoff settles. That is not a
+            // landing event and must not be presented as touchdown to a
+            // no-visual mission controller.
+            if (touchdown && !wasTouchdown && previousSituation != null &&
+                !string.Equals(previousSituation, "PRELAUNCH", StringComparison.OrdinalIgnoreCase))
             {
                 if (_guidance != null && _guidance.Profile == "landing")
                 {
@@ -510,6 +543,16 @@ namespace KspMcp
             {
                 throw new KspMcpException("invalid_guidance_profile", "supported profiles are ascent, orbit, landing, and node_burn", profile);
             }
+            Vessel activeVessel = FlightGlobals.ActiveVessel;
+            // A freshly-created KSP vessel commonly starts with one empty
+            // staging cursor above its highest engine row (for example,
+            // currentStage=4 while the launch engines are inverseStage=3).
+            // StartGuidance is the first no-visual command that can provide a
+            // throttle request, so prepare that row before preflight instead
+            // of rejecting a healthy rocket as engine-less or letting it fall
+            // from the launch pad with zero throttle.
+            int ascentLaunchStageCursor = profile == "ascent" ? DetectAscentLaunchStageCursor(activeVessel) : int.MinValue;
+            PrepareLaunchStageForGuidance(profile, activeVessel);
             Dictionary<string, object> preflight = GuidancePreflight(profile);
             bool hasLandingTarget = JsonUtil.Has(args, "target_latitude") || JsonUtil.Has(args, "target_longitude");
             if (hasLandingTarget && profile != "landing")
@@ -524,8 +567,6 @@ namespace KspMcp
             }
             double now = Planetarium.GetUniversalTime();
             double maxSeconds = Math.Max(5d, Math.Min(3600d, JsonUtil.Number(args, "max_seconds", profile == "landing" || profile == "node_burn" ? 600d : 240d)));
-            Vessel activeVessel = FlightGlobals.ActiveVessel;
-            int ascentLaunchStageCursor = profile == "ascent" ? DetectAscentLaunchStageCursor(activeVessel) : int.MinValue;
             _guidance = new GuidancePlan
             {
                 Profile = profile,
@@ -575,8 +616,17 @@ namespace KspMcp
             }
             _lease.Clear();
             _leaseUntil = 0d;
-            _sasEnabled = false;
-            try { FireGroup("SAS", false); } catch (Exception) { }
+            // Stock SAS is a useful second control loop for large stacks: the
+            // MCP still supplies the target direction and throttle, while
+            // KSP handles the high-inertia reaction-wheel/gimbal damping.
+            // Landing and node-burn profiles retain the direct controller,
+            // because they need precise retrograde/burn-vector alignment.
+            _sasEnabled = profile == "ascent" || profile == "orbit";
+            bool sasActionGroupApplied = SetVesselActionGroupState(activeVessel, "SAS", _sasEnabled);
+            if (!sasActionGroupApplied)
+            {
+                try { FireGroup("SAS", _sasEnabled); } catch (Exception) { }
+            }
             _lastGuidanceStageAt = now;
             _lastAutomaticStageCommandCursor = int.MinValue;
             _lastAutomaticStageCommandAt = double.NegativeInfinity;
@@ -654,6 +704,14 @@ namespace KspMcp
             _guidance = null;
             _lease.Clear();
             _leaseUntil = 0d;
+            if (_sasEnabled)
+            {
+                _sasEnabled = false;
+                if (!SetVesselActionGroupState(FlightGlobals.ActiveVessel, "SAS", false))
+                {
+                    try { FireGroup("SAS", false); } catch (Exception) { }
+                }
+            }
             return new Dictionary<string, object> { { "stopped", wasActive }, { "guidance", GuidanceStatus() } };
         }
 
@@ -837,13 +895,35 @@ namespace KspMcp
                 apoapsisAtInsertionWindow &&
                 vessel.verticalSpeed < -5d &&
                 altitude >= Math.Max(1000d, _guidance.TargetApoapsis - 15000d);
+            // Keep the early gravity turn shallow.  A frame-driven controller
+            // must tolerate the launch-pad handoff, flexible joints, and the
+            // stock reference transform settling; commanding a 20-degree
+            // turn by 5 km made the large test vehicle dive before the upper
+            // stage could be reached.  Later phases still converge toward a
+            // near-horizontal orbital attitude once the air is thin.
             double targetPitch = 90d;
-            if (altitude >= 500d && altitude < 5000d) targetPitch = 90d - (altitude - 500d) / 4500d * 20d;
-            else if (altitude >= 5000d && altitude < 20000d) targetPitch = 70d - (altitude - 5000d) / 15000d * 35d;
-            else if (altitude >= 20000d && altitude < 35000d) targetPitch = 35d - (altitude - 20000d) / 15000d * 25d;
-            else if (altitude >= 35000d) targetPitch = 10d;
+            if (altitude >= 8000d && altitude < 20000d) targetPitch = 85d - (altitude - 8000d) / 12000d * 15d;
+            else if (altitude >= 20000d && altitude < 35000d) targetPitch = 70d - (altitude - 20000d) / 15000d * 25d;
+            else if (altitude >= 35000d) targetPitch = 30d;
 
             Vector3d target = AscentTargetVector(vessel, targetPitch);
+            // The target vector is deliberately conservative, but a large
+            // editor-created stack can still lose vertical velocity while
+            // its reference transform settles or a flexible joint oscillates.
+            // If that happens below the upper atmosphere, prioritise altitude
+            // over horizontal efficiency: point back at the local normal and
+            // use full thrust until the climb is healthy again.  This is also
+            // the hand-off a human pilot would make when the rocket begins to
+            // fall, and prevents the no-visual controller from steering a
+            // recoverable ascent into terrain or water.
+            double targetAlignmentError = DirectionErrorDegrees(vessel, target);
+            bool verticalRecovery = altitude < 18000d &&
+                (vessel.verticalSpeed < 80d || targetAlignmentError > 35d);
+            if (verticalRecovery && !apoapsisAtInsertionWindow && !circularisationBurnInProgress)
+            {
+                target = SurfaceNormal(vessel);
+                targetPitch = 90d;
+            }
             double throttle = 1d;
             if (apoapsisAtInsertionWindow || circularisationBurnInProgress)
             {
@@ -1002,6 +1082,11 @@ namespace KspMcp
                     else targetTwr = 2.20d;
                     double twrThrottle = targetTwr * mass * gravity / thrust;
                     throttle = Math.Min(throttle, ClampDouble(twrThrottle, 0.15d, 1d));
+                }
+                if (verticalRecovery && !apoapsisAtInsertionWindow && !circularisationBurnInProgress)
+                {
+                    throttle = vessel.verticalSpeed < 0d ? 1d : Math.Max(throttle, 0.9d);
+                    _guidance.Phase = "vertical_recovery";
                 }
             }
 
@@ -1281,6 +1366,59 @@ namespace KspMcp
             return StartGuidance(copy);
         }
 
+        public Dictionary<string, object> StartMoonSoftLanding(Dictionary<string, object> args)
+        {
+            EnsureFlight();
+            if (!JsonUtil.Boolean(args, "confirm", false))
+            {
+                throw new KspMcpException("confirmation_required", "moon soft landing requires confirm=true", null);
+            }
+
+            Vessel vessel = FlightGlobals.ActiveVessel;
+            string requestedBody = JsonUtil.String(args, "target_body", "Mun");
+            string activeBody = vessel == null || vessel.mainBody == null ? "" : vessel.mainBody.bodyName;
+            string displayBody = vessel == null || vessel.mainBody == null ? "" : vessel.mainBody.theName;
+            bool bodyMatches = string.Equals(activeBody, requestedBody, StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(displayBody, requestedBody, StringComparison.OrdinalIgnoreCase);
+            if (!bodyMatches)
+            {
+                throw new KspMcpException("moon_landing_body_mismatch", "the active vessel must already be at the requested moon; use the transfer planner and a capture burn first", new Dictionary<string, object>
+                {
+                    { "active_body", activeBody },
+                    { "target_body", requestedBody }
+                });
+            }
+
+            string situation = vessel.situation.ToString();
+            if (string.Equals(situation, "PRELAUNCH", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(situation, "LANDED", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(situation, "SPLASHED", StringComparison.OrdinalIgnoreCase))
+            {
+                throw new KspMcpException("moon_landing_not_in_descent", "moon soft landing starts from a flying or orbital vessel, not a launch pad or an already landed vessel", situation);
+            }
+
+            var copy = new Dictionary<string, object>(args ?? new Dictionary<string, object>());
+            copy["profile"] = "landing";
+            copy["confirm"] = true;
+            if (!copy.ContainsKey("target_altitude")) copy["target_altitude"] = 10d;
+            Dictionary<string, object> result = StartGuidance(copy);
+            result["mission"] = "moon_soft_landing";
+            result["target_body"] = activeBody;
+            result["landing_controller"] = "powered_descent_with_stopping_distance_and_surface_velocity_feedback";
+
+            KspMcpBridge bridge = KspMcpBridge.Instance;
+            if (bridge != null) bridge.RecordEvent("flight.moon_landing.started", new Dictionary<string, object>
+            {
+                { "vessel_id", vessel == null ? null : vessel.id.ToString() },
+                { "vessel_name", vessel == null ? null : vessel.vesselName },
+                { "body", activeBody },
+                { "target_latitude", JsonUtil.Has(args, "target_latitude") ? (object)JsonUtil.Number(args, "target_latitude", 0d) : null },
+                { "target_longitude", JsonUtil.Has(args, "target_longitude") ? (object)JsonUtil.Number(args, "target_longitude", 0d) : null },
+                { "auto_stage", JsonUtil.Boolean(args, "auto_stage", true) }
+            });
+            return result;
+        }
+
         private void ApplyOrbitGuidance(FlightCtrlState state, Vessel vessel)
         {
             double altitude = Math.Max(0d, vessel.altitude);
@@ -1540,6 +1678,7 @@ namespace KspMcp
             if (controlTransform == null) return;
             if (target.sqrMagnitude < 0.0001d) target = controlTransform.forward;
             target.Normalize();
+            bool sasLocked = _sasEnabled && TryLockSasRotation(vessel, target);
             // KSP stack parts use their local +Y axis for the attachment and
             // longitudinal axis. ReferenceTransform is KSP's selected
             // control frame, but its Unity +Z forward axis is a transverse
@@ -1550,6 +1689,11 @@ namespace KspMcp
             Vector3 local = controlTransform.InverseTransformDirection((Vector3)target);
             Vector3 localAngularVelocity = controlTransform.InverseTransformDirection((Vector3)VectorMember(vessel, "angularVelocity"));
             double nose = Math.Max(0.1d, local.y);
+            // ReferenceTransform is rotated relative to the intuitive
+            // rocket frame: +Y is the controllable nose axis.  In the
+            // FlightCtrlState mapping used by this bridge, the local +Z
+            // error is corrected with the negative pitch input, while the
+            // local +X error is corrected with positive yaw input.
             double pitchError = Math.Atan2(local.z, nose);
             double yawError = Math.Atan2(local.x, nose);
             // FlightCtrlState uses the opposite pitch sign from the local
@@ -1557,12 +1701,23 @@ namespace KspMcp
             // +Y rocket nose toward local -Z.  Positive yaw moves the nose
             // toward local +X.  Match the empirically verified KSP mapping
             // so the feedback closes toward the target instead of diverging.
-            float pitch = Clamp((float)(-pitchError * 2.2d + localAngularVelocity.x * 0.2d), -1f, 1f);
-            float yaw = Clamp((float)(yawError * 2.2d + localAngularVelocity.z * 0.2d), -1f, 1f);
+            // Large editor-built stacks have slow, elastic attitude response.
+            // A high proportional gain with very little damping makes the
+            // vehicle overshoot the local-normal target, then saturate a
+            // gimbal in the opposite direction.  Use a deliberately damped
+            // PD controller so a no-visual launch remains recoverable while
+            // a human can still take over through the ordinary control lease.
+            float pitch = Clamp((float)(-pitchError * 1.2d - localAngularVelocity.x * 0.55d), -1f, 1f);
+            float yaw = Clamp((float)(yawError * 1.2d - localAngularVelocity.z * 0.55d), -1f, 1f);
             state.mainThrottle = Clamp((float)throttle, 0f, 1f);
-            state.pitch = pitch;
-            state.yaw = yaw;
-            state.roll = Clamp(-localAngularVelocity.y * 0.25f, -1f, 1f);
+            // FlightCtrlState.killRot is the actual per-frame SAS switch;
+            // changing only Vessel.ActionGroups is not sufficient on all KSP
+            // revisions, especially while another fly-by-wire callback owns
+            // the guidance loop.
+            state.killRot = sasLocked;
+            state.pitch = sasLocked ? 0f : pitch;
+            state.yaw = sasLocked ? 0f : yaw;
+            state.roll = sasLocked ? 0f : Clamp(-localAngularVelocity.y * 0.45f, -1f, 1f);
             _guidance.LastThrottle = state.mainThrottle;
             _guidance.LastPitch = state.pitch;
             _guidance.LastYaw = state.yaw;
@@ -1596,6 +1751,29 @@ namespace KspMcp
             }
             catch (Exception) { }
             return vessel.transform;
+        }
+
+        private static bool TryLockSasRotation(Vessel vessel, Vector3d target)
+        {
+            if (vessel == null || vessel.Autopilot == null || vessel.Autopilot.SAS == null) return false;
+            try
+            {
+                Vector3 forward = (Vector3)target;
+                if (forward.sqrMagnitude < 0.0001f) return false;
+                forward.Normalize();
+                Transform reference = ControlTransform(vessel);
+                if (reference == null) return false;
+                // The live reference transform already contains the correct
+                // KSP roll convention (and, on the launch pad, its +Y axis
+                // is exactly the surface normal).  Rotate that current axis
+                // directly toward the target and preserve its roll instead
+                // of reconstructing a quaternion with an assumed +/-90°
+                // reference-frame offset.
+                Quaternion desired = Quaternion.FromToRotation(reference.up, forward) * reference.rotation;
+                vessel.Autopilot.SAS.LockRotation(desired);
+                return true;
+            }
+            catch (Exception) { return false; }
         }
 
         private static Dictionary<string, object> ControlFrameSnapshot(Vessel vessel)
@@ -1856,6 +2034,59 @@ namespace KspMcp
                 { "engine_count", engines },
                 { "decoupler_count", decouplers }
             };
+        }
+
+        private void PrepareLaunchStageForGuidance(string profile, Vessel vessel)
+        {
+            if (vessel == null || (profile != "ascent" && profile != "orbit")) return;
+            string situation = vessel.situation.ToString();
+            if (!string.Equals(situation, "PRELAUNCH", StringComparison.OrdinalIgnoreCase)) return;
+            int before = vessel.currentStage;
+            if (before <= 0) return;
+            int target = before - 1;
+            Dictionary<string, object> summary = StageActionSummary(vessel, target);
+            int engineCount = (int)summary["engine_count"];
+            int decouplerCount = (int)summary["decoupler_count"];
+            if (engineCount <= 0)
+            {
+                if (decouplerCount > 0)
+                {
+                    throw new KspMcpException("guidance_initial_stage_unsafe", "the first staging row contains separation hardware but no engine; refusing to separate on the launch pad", summary);
+                }
+                throw new KspMcpException("guidance_initial_stage_missing", "the first staging row has no usable engine action", summary);
+            }
+
+            try
+            {
+                Stage();
+            }
+            catch (Exception exception)
+            {
+                throw new KspMcpException("guidance_initial_stage_failed", "could not activate the launch engine staging row: " + exception.Message, summary);
+            }
+            if (vessel.currentStage == before)
+            {
+                throw new KspMcpException("guidance_initial_stage_failed", "KSP did not advance the launch staging cursor", new Dictionary<string, object>
+                {
+                    { "stage_before", before },
+                    { "stage_target", target },
+                    { "engine_count", engineCount },
+                    { "decoupler_count", decouplerCount }
+                });
+            }
+
+            KspMcpBridge bridge = KspMcpBridge.Instance;
+            if (bridge != null) bridge.RecordEvent("flight.ignition.launch_prepared", new Dictionary<string, object>
+            {
+                { "vessel_id", vessel.id.ToString() },
+                { "vessel_name", vessel.vesselName },
+                { "stage_before", before },
+                { "stage_activated", target },
+                { "stage_after", vessel.currentStage },
+                { "engine_count", engineCount },
+                { "decoupler_count", decouplerCount },
+                { "reason", "guidance_start_on_prelaunch_vessel" }
+            });
         }
 
         private static double EstimateCircularisationBurnDuration(Vessel vessel, double targetApoapsis, double targetPeriapsis, out double targetDeltaV)
@@ -3063,4 +3294,3 @@ namespace KspMcp
         }
     }
 }
-

@@ -72,7 +72,7 @@ GET http://127.0.0.1:8765/api/v1/telemetry?since=0&limit=256&include_events=true
 
 ### 分帧建造
 
-`editor.apply_craft` 可以传 `live=true` 和 `parts_per_frame`（1–16）。默认每个 Unity 帧生成 4 个部件；插件会返回 `job_id`，在后续 Unity 帧中逐个或按小批次生成部件，并为每个部件发出 `editor.build.part_added` 事件；用下面的命令读取进度：
+`editor.apply_craft` 可以传 `live=true` 和 `parts_per_frame`（1–16）。默认每个 Unity 帧生成 4 个部件；插件会返回 `job_id`，在后续 Unity 帧中逐个或按小批次生成部件，并为每个部件发出 `editor.build.part_added` 事件；无视觉客户端使用默认值即可，人要看清逐件动画时传 1，大型火箭或空间站只需要结构完成时传 16。用下面的命令读取进度：
 
 ```json
 {"command":"editor.job_status","args":{"job_id":"build-1"}}
@@ -106,5 +106,6 @@ GET http://127.0.0.1:8765/api/v1/telemetry?since=0&limit=256&include_events=true
 
 `profile=orbit` 会在尚未入轨时使用上升制导，获得目标远点后在远点抬升近点；若近点高于目标，则在近点执行逆行降轨。`profile=landing` 会先执行简单脱轨决策，再使用相对地表速度、制动距离、局部重力、地形高度和垂直速度调节油门；进入低空后会自动发送齿轮下放命令，也可以传 `target_latitude`、`target_longitude` 让水平速度向指定地点收敛。两者是可停止、可在线调整的游戏内闭环，不会把近似轨道模型误报成完整的 Duna 任务保证；完整转移窗口搜索、再入气动模型和地形避障仍需模型逐段检查。指导器不是权限锁，用户可以随时在 KSP 中手动控制，停止指导后由原生界面继续飞行。
 
-编辑器建造请求支持 `snap_to_node`。默认值为 `true`，会按父子 AttachNode 自动对齐位置和方向；若要保留传入的世界坐标和四元数，可以显式传 `false`。对称复制不依赖游戏当前的 UI 对称模式：MCP 文档中的每个零件都是显式实例，因此插件会在生成单个零件时暂时关闭 UI 对称，避免多出未登记的零件。
+月球软着陆使用 `ksp_moon_landing_plan` 和 `ksp_flight_moon_soft_landing_start` 两个 MCP 工具：前者只读当前星体/卫星数据，后者要求 `confirm=true` 且要求活动飞船已经位于目标月球。空间站使用 `ksp_station_build` 生成可继续对接的 10 部件核心；它不是封闭的一体化模型，便于人直接补太阳能板、实验舱和推进模块。
 
+编辑器建造请求支持 `snap_to_node`。默认值为 `true`，会按父子 AttachNode 自动对齐位置和方向；若要保留传入的世界坐标和四元数，可以显式传 `false`。对称复制不依赖游戏当前的 UI 对称模式：MCP 文档中的每个零件都是显式实例，因此插件会在生成单个零件时暂时关闭 UI 对称，避免多出未登记的零件。

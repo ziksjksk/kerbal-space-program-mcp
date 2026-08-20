@@ -123,6 +123,9 @@ class McpProtocolTests(unittest.TestCase):
         self.assertIn("ksp_flight_transfer_plan", names)
         self.assertIn("ksp_flight_maneuver_nodes", names)
         self.assertIn("ksp_flight_maneuver_burn_start", names)
+        self.assertIn("ksp_moon_landing_plan", names)
+        self.assertIn("ksp_flight_moon_soft_landing_start", names)
+        self.assertIn("ksp_station_build", names)
         self.assertIn("ksp_flight_return_to_editor", names)
         self.assertIn("ksp_game_list_saves", names)
         self.assertIn("ksp_game_load_save", names)
@@ -206,7 +209,7 @@ class McpProtocolTests(unittest.TestCase):
         )
         self.assertFalse(response["result"]["isError"])
         self.assertTrue(response["result"]["structuredContent"]["args"]["live"])
-        self.assertEqual(response["result"]["structuredContent"]["args"]["parts_per_frame"], 1)
+        self.assertEqual(response["result"]["structuredContent"]["args"]["parts_per_frame"], 4)
 
     def test_live_craft_pacing_can_be_fast_without_manual_frame_budget(self):
         response = handle_message(
@@ -232,7 +235,32 @@ class McpProtocolTests(unittest.TestCase):
             self.app,
             {"jsonrpc": "2.0", "id": 12, "method": "initialize", "params": {}},
         )
-        self.assertEqual(response["result"]["serverInfo"]["version"], "0.3.4")
+        self.assertEqual(response["result"]["serverInfo"]["version"], "0.4.0")
+
+    def test_moon_landing_command_needs_confirmation(self):
+        response = handle_message(
+            self.app,
+            {
+                "jsonrpc": "2.0",
+                "id": 15,
+                "method": "tools/call",
+                "params": {
+                    "name": "ksp_flight_moon_soft_landing_start",
+                    "arguments": {"confirm": False},
+                },
+            },
+        )
+        self.assertTrue(response["result"]["isError"])
+        self.assertIn("confirm=true", response["result"]["content"][0]["text"])
+
+    def test_station_build_routes_generated_connected_craft(self):
+        result = self.app.call_tool("ksp_station_build", {"live": True, "pace": "fast"})
+        self.assertEqual(result["mission"], "space_station_core")
+        self.assertEqual(result["part_count"], 10)
+        self.assertEqual(result["editor"]["command"], "editor.new")
+        self.assertEqual(result["build"]["command"], "editor.apply_craft")
+        self.assertTrue(result["build"]["args"]["live"])
+        self.assertEqual(result["build"]["args"]["parts_per_frame"], 16)
 
     def test_live_build_can_be_cancelled(self):
         response = handle_message(
@@ -368,4 +396,3 @@ class McpProtocolTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

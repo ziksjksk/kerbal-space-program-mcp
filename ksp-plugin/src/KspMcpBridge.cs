@@ -333,6 +333,7 @@ namespace KspMcp
                 case "flight.clear_maneuver_nodes": return _flight.ClearManeuverNodes(args);
                 case "flight.maneuver_burn_start": return _flight.StartManeuverBurn(args);
                 case "flight.guidance_start": return _flight.StartGuidance(args);
+                case "flight.moon_soft_landing_start": return _flight.StartMoonSoftLanding(args);
                 case "flight.guidance_stop": return _flight.StopGuidance();
                 case "flight.guidance_status": return _flight.GuidanceStatus();
                 case "flight.guidance_update": return _flight.UpdateGuidance(args);
@@ -633,7 +634,7 @@ namespace KspMcp
             return new Dictionary<string, object>
             {
                 { "bridge", "ksp-mcp" },
-                { "bridge_version", "0.3.4" },
+                { "bridge_version", "0.4.0" },
                 { "scene", SceneName() },
                 { "endpoint", "http://" + _host + ":" + _port },
                 { "verbose_logging", _verboseLogging },
@@ -643,7 +644,7 @@ namespace KspMcp
                 { "capabilities", new Dictionary<string, object>
                     {
                         { "editor", new List<object> { "enter", "new", "snapshot", "apply", "add", "attach", "update", "remove", "stage", "action_group", "validate", "analyze", "save", "load", "launch", "job_status", "cancel_job" } },
-                        { "flight", new List<object> { "state", "compact_telemetry", "bodies", "maneuver_nodes", "add_maneuver_node", "clear_maneuver_nodes", "maneuver_burn_start", "guidance_start", "guidance_stop", "guidance_status", "guidance_update", "stage", "controls", "sas", "rcs", "warp", "activate_part", "abort", "clear_control", "return_to_editor", "recover" } },
+                        { "flight", new List<object> { "state", "compact_telemetry", "bodies", "maneuver_nodes", "add_maneuver_node", "clear_maneuver_nodes", "maneuver_burn_start", "guidance_start", "moon_soft_landing_start", "guidance_stop", "guidance_status", "guidance_update", "stage", "controls", "sas", "rcs", "warp", "activate_part", "abort", "clear_control", "return_to_editor", "recover" } },
                         { "bridge", new List<object> { "telemetry", "batch", "game.list_saves", "game.load_save" } }
                     }
                 }
@@ -759,7 +760,7 @@ namespace KspMcp
             Dictionary<string, object> nextCache = new Dictionary<string, object>
             {
                 { "sequence", _telemetrySequence },
-                { "bridge_version", "0.3.4" },
+                { "bridge_version", "0.4.0" },
                 { "captured_at", SafeUniversalTime() },
                 { "scene", SceneName() },
                 { "editor", _craft.CompactStatus() },
@@ -860,4 +861,3 @@ namespace KspMcp
         }
     }
 }
-

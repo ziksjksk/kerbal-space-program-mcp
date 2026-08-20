@@ -1257,7 +1257,12 @@ namespace KspMcp
                 totalPropellantMass += partPropellant;
                 centerMassSum += part.transform.position * (float)partMass;
 
-                int stage = part.inverseStage < 0 ? 0 : part.inverseStage;
+                // Keep KSP's passive inverseStage=-1 visible in analysis.
+                // Passive tanks, command modules, and adapters are not an
+                // engine stage; folding them into stage 0 made the no-visual
+                // report look as if stage 0 owned their mass and produced
+                // misleading lower-stage TWR warnings.
+                int stage = part.inverseStage;
                 Dictionary<string, object> stageItem = GetStageData(stageData, stage);
                 stageItem["part_count"] = (int)stageItem["part_count"] + 1;
                 stageItem["part_mass_tonnes"] = (double)stageItem["part_mass_tonnes"] + partMass;
@@ -1407,12 +1412,14 @@ namespace KspMcp
                     }
                     double stageSeaTwr = remainingMass <= 0d ? 0d : stageSeaThrust / (remainingMass * Gravity);
                     double stageVacuumTwr = remainingMass <= 0d ? 0d : stageThrust / (remainingMass * Gravity);
+                    double stageSeaIsp = stageSeaThrust <= 0d ? 0d : (double)item["sea_isp_s"] / Math.Max(0.001d, stageSeaThrust);
                     double stageVacuumIsp = (double)item["vacuum_isp_s"] <= 0d ? 0d : (double)item["vacuum_isp_s"] / Math.Max(0.001d, stageThrust);
                     double finalMass = Math.Max(0.001d, remainingMass - stagePropellant);
                     double stageDv = stageVacuumIsp <= 0d || remainingMass <= finalMass ? 0d : stageVacuumIsp * Gravity * Math.Log(remainingMass / finalMass);
                     item["remaining_mass_tonnes"] = remainingMass;
                     item["twr_sea_level"] = stageSeaTwr;
                     item["twr_vacuum"] = stageVacuumTwr;
+                    item["sea_isp_s"] = stageSeaIsp;
                     item["vacuum_isp_s"] = stageVacuumIsp;
                     item["delta_v_mps_estimate"] = stageDv;
                     estimatedDv += stageDv;
@@ -1932,19 +1939,33 @@ namespace KspMcp
             // EditorLogic field, not only Part.parent/SetHierarchyRoot.
             SetEditorRootPart(root);
 
-            Vector3 position = root.transform.position;
-            if (position.y < EditorRootHeight)
+            // During a frame-sliced build the native editor can briefly use a
+            // newly-created root whose children have not been attached yet.
+            // Keep that transient root well above the floor so the editor
+            // never renders a partially-built craft underground.
+            //
+            // At a completed build/load/save boundary, do not leave the
+            // entire craft at this temporary height. KSP's stock launch path
+            // consumes the ShipConstruct transforms when it creates the
+            // vessel; a root kept at y=50 (or higher after a tall-assembly
+            // bounds check) makes the launched vessel start in mid-air and
+            // fall onto the pad before any MCP guidance can ignite it.
+            if (!inspectBounds)
             {
-                position.y = EditorRootHeight;
-                root.transform.position = position;
+                Vector3 position = root.transform.position;
+                if (position.y < EditorRootHeight)
+                {
+                    position.y = EditorRootHeight;
+                    root.transform.position = position;
+                }
+                return;
             }
 
-            // The fixed root-height guard prevents the common underground
-            // placement case while a build is in progress. At a completed
-            // build/load boundary, inspect actual renderer/collider bounds as
-            // well: tall or rotated assemblies can extend below the editor
-            // floor even when the root transform itself is above it.
-            if (!inspectBounds) return;
+            // Inspect actual renderer/collider bounds at a completed
+            // build/load boundary. This handles tall or rotated assemblies in
+            // both directions: shift the whole hierarchy down when it is
+            // floating above the VAB floor, and up when it is underground.
+            // Moving the root moves every attached child as one craft.
             float lowestY = float.PositiveInfinity;
             foreach (Part part in EditorLogic.fetch.ship.parts)
             {
@@ -1962,9 +1983,13 @@ namespace KspMcp
                 }
             }
             const float floorClearance = 0.5f;
-            if (!float.IsPositiveInfinity(lowestY) && lowestY < floorClearance)
+            if (!float.IsPositiveInfinity(lowestY))
             {
-                root.transform.position += Vector3.up * (floorClearance - lowestY);
+                float shift = floorClearance - lowestY;
+                if (Math.Abs(shift) > 0.01f)
+                {
+                    root.transform.position += Vector3.up * shift;
+                }
             }
         }
 
@@ -2349,4 +2374,3 @@ namespace KspMcp
         }
     }
 }
-

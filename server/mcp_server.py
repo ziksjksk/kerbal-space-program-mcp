@@ -10,6 +10,7 @@ from typing import Any, Callable
 
 from .bridge_client import BridgeClient, BridgeError
 from .craft_model import CraftValidationError, normalise_part_spec, validate_craft_document
+from .missions import MissionPlanError, build_space_station, plan_moon_landing
 from .orbital import OrbitalPlanError, plan_circular_hohmann_transfer
 
 
@@ -289,6 +290,17 @@ TOOLS: list[dict[str, Any]] = [
         ["destination_body"],
     ),
     _tool(
+        "ksp_moon_landing_plan",
+        "Read a live-data Kerbin-to-Mun (or current-body-to-moon) transfer estimate and the no-visual soft-landing handoff. This is read-only and does not create a node or burn.",
+        {
+            "target_body": {"type": "string", "description": "Defaults to Mun."},
+            "parking_altitude_m": {"type": "number", "minimum": 0},
+            "target_altitude_m": {"type": "number", "minimum": 0},
+            "landing_latitude": {"type": "number", "minimum": -90, "maximum": 90},
+            "landing_longitude": {"type": "number", "minimum": -180, "maximum": 180},
+        },
+    ),
+    _tool(
         "ksp_flight_maneuver_nodes",
         "Read native KSP patched-conic maneuver nodes, including node-coordinate delta-v, burn vector, timing, and next-patch orbit.",
     ),
@@ -318,6 +330,21 @@ TOOLS: list[dict[str, Any]] = [
             "target_apoapsis": {"type": "number", "minimum": 1000},
             "target_periapsis": {"type": "number", "minimum": 0},
             "target_altitude": {"type": "number", "minimum": 10},
+            "auto_stage": {"type": "boolean"},
+            "max_seconds": {"type": "number", "minimum": 5, "maximum": 3600},
+            "confirm": {"type": "boolean"},
+        },
+        ["confirm"],
+    ),
+    _tool(
+        "ksp_flight_moon_soft_landing_start",
+        "Start the game-side Mun powered-descent controller after the vessel is at Mun. It checks the active body, then reuses the observable landing guidance loop; confirm=true is required.",
+        {
+            "target_body": {"type": "string", "description": "Defaults to Mun."},
+            "target_latitude": {"type": "number", "minimum": -90, "maximum": 90},
+            "target_longitude": {"type": "number", "minimum": -180, "maximum": 180},
+            "deploy_gear": {"type": "boolean"},
+            "gear_deploy_altitude": {"type": "number", "minimum": 100, "maximum": 10000},
             "auto_stage": {"type": "boolean"},
             "max_seconds": {"type": "number", "minimum": 5, "maximum": 3600},
             "confirm": {"type": "boolean"},
@@ -403,6 +430,19 @@ TOOLS: list[dict[str, Any]] = [
         {"editor_mode": {"type": "string", "enum": ["VAB", "SPH"]}},
     ),
     _tool("ksp_flight_recover", "Request recovery/revert of the current flight when KSP allows it."),
+    _tool(
+        "ksp_station_build",
+        "Generate and build a connected stock orbital-station core in the real VAB. The result is deliberately modular so a person or another MCP call can add solar arrays, labs, and extra modules. Live construction emits the same per-part events as rocket building.",
+        {
+            "name": {"type": "string"},
+            "template": {"type": "string", "enum": ["core"]},
+            "live": {"type": "boolean"},
+            "wait_for_completion": {"type": "boolean"},
+            "pace": {"type": "string", "enum": ["visible", "balanced", "fast"]},
+            "parts_per_frame": {"type": "integer", "minimum": 1, "maximum": 16},
+            "require_connected": {"type": "boolean"},
+        },
+    ),
 ]
 
 
@@ -556,12 +596,11 @@ class KspMcpApplication:
             if "parts_per_frame" in args:
                 craft["parts_per_frame"] = int(args["parts_per_frame"])
             elif live:
-                # Visible pacing is the safe default: every Unity frame adds
-                # one part, so a human can actually watch a rocket grow and a
-                # visionless model can correlate the event stream with the
-                # editor part count.  Callers that value throughput can use
-                # pace=balanced/fast or set parts_per_frame explicitly.
-                pace = str(args.get("pace", "visible")).strip().lower()
+                # Balanced pacing keeps the editor responsive and still
+                # exposes every part-added event.  Clients that need a slow
+                # human-readable animation can request visible=1 explicitly;
+                # fast=16 remains available for large station/rocket builds.
+                pace = str(args.get("pace", "balanced")).strip().lower()
                 pace_values = {"visible": 1, "balanced": 4, "fast": 16}
                 if pace not in pace_values:
                     raise ValueError("pace must be visible, balanced, or fast")
@@ -630,6 +669,29 @@ class KspMcpApplication:
                 target_altitude_m=float(args.get("target_altitude_m", 80_000.0)),
                 direction=str(args.get("direction", "prograde")),
             )
+        if name == "ksp_moon_landing_plan":
+            batch = self.bridge.call_batch(
+                [
+                    {"command": "flight.state", "args": {}},
+                    {"command": "flight.bodies", "args": {"query": ""}},
+                ]
+            )
+            if not isinstance(batch, dict) or not isinstance(batch.get("results"), list) or len(batch["results"]) < 2:
+                raise MissionPlanError("the bridge returned no paired flight state/body data")
+            state_item, bodies_item = batch["results"][0], batch["results"][1]
+            if not isinstance(state_item, dict) or not state_item.get("ok"):
+                raise MissionPlanError("flight.state failed while preparing the moon landing plan")
+            if not isinstance(bodies_item, dict) or not bodies_item.get("ok"):
+                raise MissionPlanError("flight.bodies failed while preparing the moon landing plan")
+            return plan_moon_landing(
+                bodies_payload=bodies_item.get("result") or {},
+                flight_payload=state_item.get("result") or {},
+                target_body=str(args.get("target_body", "Mun")),
+                parking_altitude_m=float(args.get("parking_altitude_m", 80_000.0)),
+                target_altitude_m=float(args.get("target_altitude_m", 15_000.0)),
+                landing_latitude=float(args.get("landing_latitude", 0.0)),
+                landing_longitude=float(args.get("landing_longitude", 0.0)),
+            )
         if name == "ksp_flight_maneuver_nodes":
             return self.bridge.call("flight.maneuver_nodes", {})
         if name == "ksp_flight_add_maneuver_node":
@@ -646,6 +708,10 @@ class KspMcpApplication:
             return self.bridge.call("flight.maneuver_burn_start", args)
         if name == "ksp_flight_guidance_start":
             return self.bridge.call("flight.guidance_start", args)
+        if name == "ksp_flight_moon_soft_landing_start":
+            if args.get("confirm") is not True:
+                raise ValueError("ksp_flight_moon_soft_landing_start requires confirm=true")
+            return self.bridge.call("flight.moon_soft_landing_start", args)
         if name == "ksp_flight_guidance_stop":
             return self.bridge.call("flight.guidance_stop", {})
         if name == "ksp_flight_guidance_status":
@@ -672,6 +738,38 @@ class KspMcpApplication:
             return self.bridge.call("flight.return_to_editor", args)
         if name == "ksp_flight_recover":
             return self.bridge.call("flight.recover", {})
+        if name == "ksp_station_build":
+            craft = build_space_station(
+                name=str(args.get("name", "MCP Orbital Station Core")),
+                template=str(args.get("template", "core")),
+            )
+            craft_document = validate_craft_document(
+                craft,
+                require_connected=bool(args.get("require_connected", True)),
+            )
+            preflight_warnings = list(craft_document.pop("warnings", []))
+            editor_result = self.bridge.call(
+                "editor.new",
+                {"name": craft_document["name"], "description": craft_document["description"], "editor_mode": "VAB"},
+            )
+            apply_args: dict[str, Any] = {
+                "craft": craft_document,
+                "require_connected": bool(args.get("require_connected", True)),
+                "live": bool(args.get("live", True)),
+            }
+            for key in ("wait_for_completion", "pace", "parts_per_frame"):
+                if key in args:
+                    apply_args[key] = args[key]
+            build_result = self.call_tool("ksp_editor_apply_craft", apply_args)
+            return {
+                "mission": "space_station_core",
+                "template": str(args.get("template", "core")),
+                "part_count": len(craft_document["parts"]),
+                "preflight_warnings": preflight_warnings,
+                "editor": editor_result,
+                "build": build_result,
+                "craft": craft_document,
+            }
         raise KeyError(f"unknown tool: {name}")
 
 
@@ -710,7 +808,7 @@ def handle_message(app: KspMcpApplication, message: dict[str, Any]) -> dict[str,
             {
                 "protocolVersion": str(params.get("protocolVersion", "2024-11-05")),
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "kerbal-space-program", "version": "0.3.4"},
+                "serverInfo": {"name": "kerbal-space-program", "version": "0.4.0"},
                 "instructions": (
                     "Use ksp_realtime_state for compact no-visual state. Build in VAB/SPH with "
                     "ksp_editor_new and live ksp_editor_apply_craft, then poll "
@@ -790,4 +888,3 @@ def main(argv: list[str] | None = None) -> None:
     if args.self_test:
         raise SystemExit(_self_test())
     run_stdio()
-

@@ -194,4 +194,3 @@ def validate_craft_document(
         "parts": parts,
         "warnings": warnings,
     }
-
