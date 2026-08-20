@@ -1,0 +1,102 @@
+{
+  "name": "MCP Orbital Station Core",
+  "description": "Stock KSP modular orbital station core with an explicit probe control source, six-way station hub, four lateral docking ports, service tank, battery, crew cabin, and axial docking port.",
+  "editor_mode": "VAB",
+  "mission": {
+    "type": "space_station_core",
+    "template": "core",
+    "assembly_notes": [
+      "validate and save the core before launch",
+      "use the four lateral ports for later modules",
+      "add solar arrays and science labs as connected follow-on modules"
+    ]
+  },
+  "parts": [
+    {
+      "id": "station-command",
+      "part": "probeCoreOcto2.v2",
+      "stage": 0
+    },
+    {
+      "id": "station-hub",
+      "part": "stationHub",
+      "parent_id": "station-command",
+      "parent_attach_node": "bottom",
+      "attach_node": "top",
+      "snap_to_node": true,
+      "stage": 0
+    },
+    {
+      "id": "station-port-right",
+      "part": "dockingPort2",
+      "parent_id": "station-hub",
+      "parent_attach_node": "right",
+      "attach_node": "bottom",
+      "snap_to_node": true,
+      "stage": 0
+    },
+    {
+      "id": "station-port-left",
+      "part": "dockingPort2",
+      "parent_id": "station-hub",
+      "parent_attach_node": "left",
+      "attach_node": "bottom",
+      "snap_to_node": true,
+      "stage": 0
+    },
+    {
+      "id": "station-port-front",
+      "part": "dockingPort2",
+      "parent_id": "station-hub",
+      "parent_attach_node": "front",
+      "attach_node": "bottom",
+      "snap_to_node": true,
+      "stage": 0
+    },
+    {
+      "id": "station-port-back",
+      "part": "dockingPort2",
+      "parent_id": "station-hub",
+      "parent_attach_node": "back",
+      "attach_node": "bottom",
+      "snap_to_node": true,
+      "stage": 0
+    },
+    {
+      "id": "station-service-tank",
+      "part": "fuelTankSmallFlat",
+      "parent_id": "station-hub",
+      "parent_attach_node": "bottom",
+      "attach_node": "top",
+      "snap_to_node": true,
+      "stage": 0
+    },
+    {
+      "id": "station-battery",
+      "part": "batteryBank",
+      "parent_id": "station-service-tank",
+      "parent_attach_node": "bottom",
+      "attach_node": "top",
+      "snap_to_node": true,
+      "stage": 0
+    },
+    {
+      "id": "station-habitat",
+      "part": "MK1CrewCabin",
+      "parent_id": "station-battery",
+      "parent_attach_node": "bottom",
+      "attach_node": "top",
+      "snap_to_node": true,
+      "stage": 0
+    },
+    {
+      "id": "station-port-axial",
+      "part": "dockingPort2",
+      "parent_id": "station-habitat",
+      "parent_attach_node": "bottom",
+      "attach_node": "top",
+      "snap_to_node": true,
+      "stage": 0
+    }
+  ]
+}

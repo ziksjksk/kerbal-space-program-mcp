@@ -55,4 +55,3 @@ $arguments += $sources
 & $compiler @arguments
 if ($LASTEXITCODE -ne 0) { throw "C# build failed with exit code $LASTEXITCODE" }
 Write-Host "Built $output"
-
