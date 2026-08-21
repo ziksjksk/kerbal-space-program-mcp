@@ -1,3 +1,4 @@
+Import-Clixml: N attribute was expected. Line 776, position 12.
 using System;
 using System.Collections.Generic;
 using System.Reflection;
@@ -13,6 +14,7 @@ namespace KspMcp
         private double _leaseUntil;
         private bool _sasEnabled;
         private bool _rcsEnabled;
+        private string _stockAutopilotMode;
         private GuidancePlan _guidance;
         private double _lastGuidanceStageAt;
         private int _lastAutomaticStageCommandCursor = int.MinValue;
@@ -53,6 +55,8 @@ namespace KspMcp
             public bool DeployGear;
             public bool GearCommanded;
             public bool TouchdownRecorded;
+            public bool FinalDescentLatched;
+            public double FinalDescentEnteredAt;
             public double StartedAt;
             public double EndsAt;
             public bool AutoStage;
@@ -68,6 +72,11 @@ namespace KspMcp
             public double CircularisationTrimAt;
             public double CircularisationTrimDuration;
             public double CircularisationTrimTargetDeltaV;
+            public bool DeorbitBurnStarted;
+            public bool DeorbitBurnCompleted;
+            public double IgnitionHoldUntil;
+            public double IgnitionHoldThrottle;
+            public int IgnitionAttempts;
             public string Phase;
             public string LastError;
             public double LastThrottle;
@@ -180,11 +189,32 @@ namespace KspMcp
                 else if (Planetarium.GetUniversalTime() > _guidance.EndsAt)
                 {
                     _guidance.LastError = "guidance time limit reached";
+                    _guidance.Phase = "guidance_timeout";
+                    TryDisableStockAutopilot(active);
+                    _lease.Clear();
+                    _leaseUntil = 0d;
                     _guidance = null;
                 }
-                else if (_guidance.AutoStage && Planetarium.GetUniversalTime() - _lastGuidanceStageAt > 0.25d)
+                if (_guidance != null)
                 {
-                    TryAutomaticStage(active);
+                    // A landing plan owns staging only until the first actual
+                    // contact.  KSP can report LANDED for a frame before the
+                    // touchdown transition is recorded; guard both signals so a
+                    // post-contact flameout/empty-stage check cannot fire a
+                    // recovery stage and launch the vehicle off the surface.
+                    bool landingContact = string.Equals(_guidance.Profile, "landing", StringComparison.OrdinalIgnoreCase) &&
+                        (_guidance.TouchdownRecorded ||
+                         string.Equals(activeSituation, "LANDED", StringComparison.OrdinalIgnoreCase) ||
+                         string.Equals(activeSituation, "SPLASHED", StringComparison.OrdinalIgnoreCase));
+                    if (landingContact)
+                    {
+                        _guidance.AutoStage = false;
+                        TryDisableStockAutopilot(active);
+                    }
+                    else if (_guidance.AutoStage && Planetarium.GetUniversalTime() - _lastGuidanceStageAt > 0.25d)
+                    {
+                        TryAutomaticStage(active);
+                    }
                 }
             }
             RecordTelemetryTransitions(active);
@@ -196,6 +226,7 @@ namespace KspMcp
             _hookedVessel = null;
             _lease.Clear();
             _leaseUntil = 0d;
+            _stockAutopilotMode = null;
             _guidance = null;
             _haveTelemetryIdentity = false;
             _lastTelemetryVesselId = null;
@@ -397,11 +428,17 @@ namespace KspMcp
             if (touchdown && !wasTouchdown && previousSituation != null &&
                 !string.Equals(previousSituation, "PRELAUNCH", StringComparison.OrdinalIgnoreCase))
             {
+                bool softTouchdown = Math.Abs(vessel.verticalSpeed) <= 8d && vessel.srfSpeed <= 8d;
                 if (_guidance != null && _guidance.Profile == "landing")
                 {
-                    _guidance.Phase = "touchdown";
+                    _guidance.Phase = softTouchdown ? "touchdown" : "hard_contact_recovery";
                     _guidance.LastThrottle = 0d;
                     _guidance.TouchdownRecorded = true;
+                    _guidance.AutoStage = false;
+                    if (!softTouchdown)
+                    {
+                        _guidance.LastError = "contact detected above soft-landing limits; automatic staging is locked";
+                    }
                 }
                 bridge.RecordEvent("flight.touchdown", new Dictionary<string, object>
                 {
@@ -411,6 +448,9 @@ namespace KspMcp
                     { "terrain_altitude", vessel.terrainAltitude },
                     { "vertical_speed", vessel.verticalSpeed },
                     { "surface_speed", vessel.srfSpeed },
+                    { "soft_touchdown", softTouchdown },
+                    { "contact_classification", softTouchdown ? "soft" : "hard" },
+                    { "soft_velocity_limit_mps", 8d },
                     { "guidance_profile", _guidance == null ? null : _guidance.Profile }
                 });
             }
@@ -566,7 +606,13 @@ namespace KspMcp
                 throw new KspMcpException("invalid_guidance_target", "landing target latitude must be -90..90 and longitude must be -180..180", null);
             }
             double now = Planetarium.GetUniversalTime();
-            double maxSeconds = Math.Max(5d, Math.Min(3600d, JsonUtil.Number(args, "max_seconds", profile == "landing" || profile == "node_burn" ? 600d : 240d)));
+            // A Mun landing must be able to wait through the deorbit coast and
+            // the long ballistic descent at real time.  The no-visual control
+            // loop deliberately forbids time warp while it owns the vessel,
+            // so a 600-second default can release a healthy lander before the
+            // powered-descent window.  Keep the explicit caller limit intact,
+            // but make the safe default long enough for a normal Mun approach.
+            double maxSeconds = Math.Max(5d, Math.Min(3600d, JsonUtil.Number(args, "max_seconds", profile == "landing" || profile == "node_burn" ? 1800d : 240d)));
             _guidance = new GuidancePlan
             {
                 Profile = profile,
@@ -580,6 +626,8 @@ namespace KspMcp
                 DeployGear = JsonUtil.Boolean(args, "deploy_gear", profile == "landing"),
                 GearCommanded = false,
                 TouchdownRecorded = false,
+                FinalDescentLatched = false,
+                FinalDescentEnteredAt = 0d,
                 StartedAt = now,
                 EndsAt = now + maxSeconds,
                 AutoStage = JsonUtil.Boolean(args, "auto_stage", true),
@@ -595,6 +643,11 @@ namespace KspMcp
                 CircularisationTrimAt = 0d,
                 CircularisationTrimDuration = 0d,
                 CircularisationTrimTargetDeltaV = 0d,
+                DeorbitBurnStarted = false,
+                DeorbitBurnCompleted = false,
+                IgnitionHoldUntil = 0d,
+                IgnitionHoldThrottle = 0d,
+                IgnitionAttempts = 0,
                 Phase = "initialising",
                 LastError = null,
                 BurnCompletionRecorded = false,
@@ -623,9 +676,14 @@ namespace KspMcp
             // because they need precise retrograde/burn-vector alignment.
             _sasEnabled = profile == "ascent" || profile == "orbit";
             bool sasActionGroupApplied = SetVesselActionGroupState(activeVessel, "SAS", _sasEnabled);
-            if (!sasActionGroupApplied)
+            // SetGroup updates the saved action-group state, but on this KSP
+            // build it does not drive the live FlightCtrlState SAS switch.
+            // Fire the action as well so the stock autopilot actually owns
+            // the attitude loop in the running flight scene.
+            try { FireGroup("SAS", _sasEnabled); }
+            catch (Exception exception)
             {
-                try { FireGroup("SAS", _sasEnabled); } catch (Exception) { }
+                if (!sasActionGroupApplied) KspMcpBridge.Log("could not fire SAS action group: " + exception.Message);
             }
             _lastGuidanceStageAt = now;
             _lastAutomaticStageCommandCursor = int.MinValue;
@@ -704,6 +762,7 @@ namespace KspMcp
             _guidance = null;
             _lease.Clear();
             _leaseUntil = 0d;
+            TryDisableStockAutopilot(FlightGlobals.ActiveVessel);
             if (_sasEnabled)
             {
                 _sasEnabled = false;
@@ -786,6 +845,19 @@ namespace KspMcp
         {
             if (_guidance == null) return new Dictionary<string, object> { { "active", false } };
             double now = Planetarium.GetUniversalTime();
+            Vessel activeVessel = null;
+            object autopilot = null;
+            object stockSas = null;
+            try
+            {
+                activeVessel = FlightGlobals.ActiveVessel;
+                if (activeVessel != null && activeVessel.Autopilot != null)
+                {
+                    autopilot = activeVessel.Autopilot;
+                    stockSas = activeVessel.Autopilot.SAS;
+                }
+            }
+            catch (Exception) { }
             return new Dictionary<string, object>
             {
                 { "active", true },
@@ -801,6 +873,8 @@ namespace KspMcp
                 { "gear_deploy_altitude", _guidance.GearDeployAltitude },
                 { "gear_commanded", _guidance.GearCommanded },
                 { "touchdown_recorded", _guidance.TouchdownRecorded },
+                { "final_descent_active", _guidance.FinalDescentLatched },
+                { "final_descent_entered_at", _guidance.FinalDescentEnteredAt },
                 { "auto_stage", _guidance.AutoStage },
                 { "circularisation_burn_started", _guidance.CircularisationBurnStarted },
                 { "circularisation_burn_completed", _guidance.CircularisationBurnCompleted },
@@ -817,6 +891,12 @@ namespace KspMcp
                 { "circularisation_trim_duration_seconds", _guidance.CircularisationTrimDuration },
                 { "circularisation_trim_remaining_seconds", _guidance.CircularisationTrimStarted && !_guidance.CircularisationBurnCompleted ? Math.Max(0d, _guidance.CircularisationTrimDuration - Math.Max(0d, now - _guidance.CircularisationTrimAt)) : 0d },
                 { "circularisation_trim_target_delta_v_mps", _guidance.CircularisationTrimTargetDeltaV },
+                { "deorbit_burn_started", _guidance.DeorbitBurnStarted },
+                { "deorbit_burn_completed", _guidance.DeorbitBurnCompleted },
+                { "ignition_hold_active", _guidance.IgnitionHoldUntil > now },
+                { "ignition_hold_remaining_seconds", Math.Max(0d, _guidance.IgnitionHoldUntil - now) },
+                { "ignition_hold_throttle", _guidance.IgnitionHoldThrottle },
+                { "ignition_attempts", _guidance.IgnitionAttempts },
                 { "seconds_remaining", Math.Max(0d, _guidance.EndsAt - now) },
                 { "last_throttle", _guidance.LastThrottle },
                 { "last_pitch", _guidance.LastPitch },
@@ -830,6 +910,11 @@ namespace KspMcp
                 { "burn_start_ut", _guidance.BurnStartAt },
                 { "burn_end_ut", _guidance.BurnEndAt },
                 { "burn_alignment_error_degrees", _guidance.LastAlignmentErrorDegrees },
+                { "stock_autopilot_mode", _stockAutopilotMode },
+                { "stock_autopilot_enabled", autopilot == null ? (object)null : BoolMember(autopilot, "Enabled") },
+                { "stock_autopilot_mode_actual", autopilot == null ? null : TextMember(autopilot, "Mode") },
+                { "stock_sas_can_engage", stockSas == null ? (object)null : InvokeBoolMethod(stockSas, "CanEngageSAS") },
+                { "stock_sas_fbw_connected", stockSas == null ? (object)null : BoolMember(stockSas, "FBWconnected") },
                 { "burn_ignition_recorded", _guidance.BurnIgnitionRecorded },
                 { "available_thrust_kN", _guidance.LastAvailableThrust },
                 { "twr", _guidance.LastTwr },
@@ -1497,11 +1582,24 @@ namespace KspMcp
 
         private void ApplyLandingGuidance(FlightCtrlState state, Vessel vessel)
         {
-            double altitude = Math.Max(0d, vessel.terrainAltitude);
+            // KSP's Vessel.terrainAltitude is the terrain elevation above the
+            // body's sea-level datum, not the vessel's altitude above the
+            // terrain. At 250 km over the Mun it is only a few kilometres,
+            // which previously made an orbital vessel look like a low-altitude
+            // descent vehicle and caused the controller to skip deorbit.
+            double absoluteAltitude = Math.Max(0d, vessel.altitude);
+            double terrainElevation = vessel.terrainAltitude;
+            double altitude = Math.Max(0d, absoluteAltitude - terrainElevation);
             double verticalSpeed = vessel.verticalSpeed;
             double surfaceSpeed = vessel.srfSpeed;
-            Vector3d velocity = vessel.srf_velocity;
-            Vector3d retrograde = velocity.sqrMagnitude > 0.01d ? -velocity.normalized : SurfaceNormal(vessel);
+            // Deorbit burns must use the vessel's inertial orbital velocity.
+            // srf_velocity is relative to the rotating body surface; using it
+            // for an orbital burn can add the body's rotation vector and turn
+            // a nominal retrograde burn into a trajectory that raises the
+            // apoapsis. Keep srf_velocity for surface-landing feedback below,
+            // but use obt_velocity for the orbital retrograde direction.
+            Vector3d orbitalVelocity = vessel.obt_velocity;
+            Vector3d retrograde = orbitalVelocity.sqrMagnitude > 0.01d ? -orbitalVelocity.normalized : SurfaceNormal(vessel);
 
             // Landing from orbit needs a deorbit decision before the
             // powered-descent loop. The old controller entered descent while
@@ -1528,30 +1626,93 @@ namespace KspMcp
                         { "vessel_id", vessel == null ? null : vessel.id.ToString() },
                         { "vessel_name", vessel == null ? null : vessel.vesselName },
                         { "altitude", altitude },
+                        { "absolute_altitude", absoluteAltitude },
                         { "terrain_altitude", vessel.terrainAltitude }
                     });
                 }
             }
-            if (!landed && altitude > 10000d && apoapsis > 20000d && periapsis > -1000d)
+            bool deorbitNeedsBurn = !_guidance.DeorbitBurnCompleted &&
+                (periapsis > -1000d || _guidance.DeorbitBurnStarted);
+            // KSP may clamp a low Mun orbit to its exact safety boundary, so a
+            // nominal 20 km orbit can arrive here as 19,999.98 m.  Requiring
+            // apoapsis to be strictly greater than 20,000 m skips the
+            // deorbit branch at that boundary and incorrectly labels the
+            // vessel as ballistic while it is still in a stable orbit.  A
+            // positive orbit is enough to enter the deorbit planner; the
+            // periapsis and altitude guards above still prevent this from
+            // taking over landed or non-orbital flight.
+            if (!landed && absoluteAltitude > 10000d && deorbitNeedsBurn &&
+                (apoapsis > 1000d || _guidance.DeorbitBurnStarted))
             {
                 double throttle = 0d;
-                if (timeToApoapsis > 15d)
+                double now = Planetarium.GetUniversalTime();
+                bool ignitionHold = _guidance.IgnitionHoldUntil > now;
+                bool burnAlreadyStarted = _guidance.DeorbitBurnStarted;
+                if (burnAlreadyStarted && periapsis <= -1000d)
+                {
+                    _guidance.DeorbitBurnCompleted = true;
+                    _guidance.Phase = "deorbit_burn_complete";
+                    KspMcpBridge completedBridge = KspMcpBridge.Instance;
+                    if (completedBridge != null) completedBridge.RecordEvent("flight.landing.deorbit_burn_completed", new Dictionary<string, object>
+                    {
+                        { "vessel_id", vessel == null ? null : vessel.id.ToString() },
+                        { "vessel_name", vessel == null ? null : vessel.vesselName },
+                        { "periapsis", periapsis },
+                        { "apoapsis", apoapsis }
+                    });
+                    TryDisableStockAutopilot(vessel);
+                    ApplyDirectionControl(state, vessel, retrograde, 0d, 0d);
+                    return;
+                }
+                // KSP resets timeToAp to the next orbit immediately after
+                // crossing apoapsis.  A time-only test therefore misses the
+                // burn window exactly at the event boundary.  The signed
+                // vertical speed is the second half of the predicate: once
+                // the vessel is descending, it has passed apoapsis even when
+                // timeToAp has wrapped to the next orbit.
+                bool pastApoapsis = timeToApoapsis <= 15d || verticalSpeed < -1d;
+                if (!pastApoapsis && !burnAlreadyStarted && !ignitionHold)
                 {
                     _guidance.Phase = "deorbit_coast_to_apoapsis";
                 }
                 else
                 {
                     double error = periapsis + 1000d;
-                    throttle = ClampDouble(error / Math.Max(5000d, Math.Abs(periapsis) + 10000d), 0.1d, 1d);
-                    _guidance.Phase = "deorbit_burn";
+                    double alignmentError = DirectionErrorDegrees(vessel, retrograde);
+                    bool attitudeReady = alignmentError <= 12d;
+                    throttle = attitudeReady
+                        ? ClampDouble(error / Math.Max(5000d, Math.Abs(periapsis) + 10000d), 0.1d, 1d)
+                        : 0d;
+                    _guidance.DeorbitBurnStarted = true;
+                    if (attitudeReady)
+                    {
+                        if (ignitionHold) throttle = Math.Max(throttle, _guidance.IgnitionHoldThrottle);
+                        _guidance.Phase = ignitionHold ? "automatic_ignition" : "deorbit_burn";
+                    }
+                    else
+                    {
+                        // Stage preparation may happen before stock SAS has
+                        // finished turning a large vehicle.  Never trade
+                        // orbital energy for attitude convergence: hold the
+                        // engine at zero until the retrograde error is small.
+                        _guidance.Phase = "deorbit_aligning";
+                    }
                 }
-                ApplyDirectionControl(state, vessel, retrograde, throttle, 0d);
+                ApplyDirectionControl(state, vessel, retrograde, throttle, 0d, "Retrograde");
                 return;
             }
 
-            if (altitude > 30000d && verticalSpeed > -80d)
+            // Keep a controlled descent speed at high altitude.  The old
+            // -80 m/s gate let the controller oscillate between
+            // coast_to_entry_burn and full-throttle braking: as soon as a
+            // burn slowed the vessel above -80 m/s, the next frame stopped
+            // the burn even though -80 m/s is still far too fast for a
+            // powered landing.  Use the same conservative target that the
+            // lower-altitude guidance loop uses instead.
+            if (altitude > 30000d && verticalSpeed > -30d)
             {
                 _guidance.Phase = "coast_to_entry_burn";
+                TryDisableStockAutopilot(vessel);
                 ApplyDirectionControl(state, vessel, retrograde, 0d, 0d);
                 return;
             }
@@ -1559,16 +1720,85 @@ namespace KspMcp
             double mass = Math.Max(0.001d, vessel.GetTotalMass());
             double thrust = AvailableGuidanceThrust(vessel);
             double maxAcceleration = thrust <= 0d ? 0d : thrust / mass;
-            double gravity = SurfaceGravity(vessel, altitude);
+            double gravity = SurfaceGravity(vessel, absoluteAltitude);
             double netBrakingAcceleration = Math.Max(0.1d, maxAcceleration - gravity);
             double downwardSpeed = Math.Max(0d, -verticalSpeed);
-            double stoppingDistance = downwardSpeed * downwardSpeed / (2d * netBrakingAcceleration);
+            double verticalStoppingDistance = downwardSpeed * downwardSpeed / (2d * netBrakingAcceleration);
+            // An orbital landing vehicle is still carrying substantial
+            // horizontal velocity after the deorbit burn.  Waiting only for
+            // the vertical stopping distance starts the powered burn far too
+            // late: on the Mun the vehicle can reach the ground while it is
+            // still moving hundreds of metres per second sideways.  Include
+            // the horizontal braking distance in the burn-window gate so the
+            // same closed loop can cancel orbital velocity before touchdown.
+            double horizontalStoppingDistance = surfaceSpeed * surfaceSpeed / (2d * netBrakingAcceleration);
+            double stoppingDistance = Math.Max(verticalStoppingDistance, horizontalStoppingDistance);
             double desiredVerticalSpeed = altitude > 5000d ? -30d : (altitude > 500d ? -10d : -2d);
-            double verticalCorrection = Math.Max(0d, (desiredVerticalSpeed - verticalSpeed) * 0.5d);
-            double horizontalBraking = surfaceSpeed * surfaceSpeed / Math.Max(20d, altitude * 2d);
-            bool burnWindow = altitude <= stoppingDistance * 1.35d + 250d || verticalSpeed < desiredVerticalSpeed || altitude < 1000d;
-            double requiredAcceleration = gravity + verticalCorrection;
-            if (burnWindow) requiredAcceleration += horizontalBraking;
+            // Allow the controller to command less than hover acceleration
+            // when the vehicle is descending too slowly or climbing.  Clamping
+            // this correction to zero made the powered loop settle at
+            // gravity-compensation throttle high above the surface instead
+            // of continuing toward the target descent speed.
+            double verticalCorrection = (desiredVerticalSpeed - verticalSpeed) * 0.5d;
+            // Surface speed contains both the radial and tangential velocity
+            // components.  The powered braking phase may use the total speed
+            // because Retrograde removes the complete velocity vector, but
+            // the final touchdown controller must only ask for tangential
+            // braking here.  Otherwise a vertical descent rate is incorrectly
+            // converted into a horizontal braking request.
+            Vector3d surfaceNormal = SurfaceNormal(vessel);
+            Vector3d horizontalVelocity = ProjectOnPlane(vessel.srf_velocity, surfaceNormal);
+            double horizontalSpeed = horizontalVelocity.magnitude;
+            double horizontalBraking = horizontalSpeed * horizontalSpeed / Math.Max(20d, altitude * 2d);
+            bool poweredDescentStarted =
+                string.Equals(_guidance.Phase, "suicide_burn_and_retrograde_braking", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(_guidance.Phase, "powered_descent", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(_guidance.Phase, "final_vertical_descent", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(_guidance.Phase, "final_hover_and_touchdown", StringComparison.OrdinalIgnoreCase);
+            // Once the powered burn has started, keep the burn window open
+            // until the touchdown controller takes over.  Recomputing only
+            // from the now-decreasing stopping distance can otherwise turn
+            // the engine off again immediately after a successful braking
+            // impulse.
+            bool burnWindow = poweredDescentStarted ||
+                altitude <= stoppingDistance * 1.35d + 250d ||
+                verticalSpeed < desiredVerticalSpeed ||
+                altitude < 1000d;
+            // Once translational speed is genuinely low, hand off to the
+            // surface-normal touchdown controller and latch that decision.
+            // A single speed threshold is not sufficient here: after the
+            // handoff, the commanded descent speed can briefly make total
+            // surface speed rise above the threshold again.  Without a latch
+            // the controller would alternate between Retrograde braking and
+            // vertical descent at high altitude, producing throttle and
+            // attitude oscillation.  The latch is reset with every new plan
+            // and remains active until touchdown or guidance stop.
+            const double finalDescentEntrySpeed = 12d;
+            if (burnWindow && !_guidance.FinalDescentLatched && surfaceSpeed <= finalDescentEntrySpeed)
+            {
+                _guidance.FinalDescentLatched = true;
+                _guidance.FinalDescentEnteredAt = Planetarium.GetUniversalTime();
+                KspMcpBridge latchBridge = KspMcpBridge.Instance;
+                if (latchBridge != null) latchBridge.RecordEvent("flight.landing.final_descent_latched", new Dictionary<string, object>
+                {
+                    { "vessel_id", vessel == null ? null : vessel.id.ToString() },
+                    { "vessel_name", vessel == null ? null : vessel.vesselName },
+                    { "surface_speed", surfaceSpeed },
+                    { "vertical_speed", verticalSpeed },
+                    { "altitude", absoluteAltitude },
+                    { "height_agl", altitude },
+                    { "entry_speed_limit_mps", finalDescentEntrySpeed }
+                });
+            }
+            bool lowSpeedVerticalLanding = burnWindow && (_guidance.FinalDescentLatched || surfaceSpeed <= finalDescentEntrySpeed);
+            double verticalDemand = Math.Max(0.1d, gravity + verticalCorrection);
+            // Never let the final vector lose all upward authority just
+            // because the vehicle is briefly climbing after a lateral
+            // correction.  A small upward component keeps the lander above
+            // the terrain while the horizontal component removes drift.
+            if (lowSpeedVerticalLanding) verticalDemand = Math.Max(verticalDemand, gravity * 0.65d);
+            double requiredAcceleration = verticalDemand;
+            if (burnWindow && !lowSpeedVerticalLanding) requiredAcceleration += horizontalBraking;
             _guidance.LastStoppingDistance = stoppingDistance;
             _guidance.LastAvailableThrust = thrust;
             _guidance.LastTwr = gravity <= 0d ? 0d : maxAcceleration / gravity;
@@ -1581,7 +1811,7 @@ namespace KspMcp
             {
                 _guidance.LastTargetDistance = targetDistance;
                 _guidance.LastTargetHorizontalSpeed = targetHorizontalSpeed;
-                if (burnWindow)
+                if (burnWindow && !lowSpeedVerticalLanding)
                 {
                     requiredAcceleration = Math.Sqrt(requiredAcceleration * requiredAcceleration + targetHorizontalAcceleration * targetHorizontalAcceleration);
                 }
@@ -1591,12 +1821,41 @@ namespace KspMcp
                 _guidance.LastTargetDistance = 0d;
                 _guidance.LastTargetHorizontalSpeed = 0d;
             }
-            double throttleCommand = maxAcceleration <= 0d ? 0d : ClampDouble(requiredAcceleration / maxAcceleration, 0d, 1d);
+            // In the final phase the old controller added horizontal braking
+            // to the throttle demand but still pointed the vehicle straight
+            // along the surface normal.  That can never cancel tangential
+            // velocity: it only makes the engine push harder vertically, and
+            // a small attitude error then grows into a lateral runaway near
+            // the ground.  Build one acceleration vector from the measured
+            // local-up demand and the opposite horizontal velocity instead.
+            // The vector is recomputed every frame, so this remains usable by
+            // an AI without a camera or visual target.
+            bool hasLandingTarget = _guidance.HasLandingTarget;
+            if (lowSpeedVerticalLanding && !hasLandingTarget && horizontalSpeed > 0.25d)
+            {
+                double finalHorizontalBraking = Math.Min(horizontalBraking, Math.Max(0.1d, maxAcceleration * 0.85d));
+                Vector3d touchdownAcceleration = surfaceNormal * verticalDemand - horizontalVelocity.normalized * finalHorizontalBraking;
+                if (touchdownAcceleration.sqrMagnitude > 0.0001d)
+                {
+                    requiredAcceleration = touchdownAcceleration.magnitude;
+                    targetThrust = touchdownAcceleration.normalized;
+                }
+            }
+            // Ballistic descent must really be ballistic.  Computing the
+            // gravity-compensation throttle outside the burn window made a
+            // high-altitude lander hover at a small positive throttle after
+            // deorbit, consuming propellant and never reaching the suicide
+            // burn boundary.  Only ask for thrust when stopping-distance or
+            // touchdown feedback says that braking is required.
+            double throttleCommand = !burnWindow || maxAcceleration <= 0d
+                ? 0d
+                : ClampDouble(requiredAcceleration / maxAcceleration, 0d, 1d);
 
             if (landed || (altitude <= 5d && Math.Abs(verticalSpeed) < 2.5d && surfaceSpeed < 3d))
             {
                 throttleCommand = 0d;
                 _guidance.Phase = "landed_or_hovering";
+                TryDisableStockAutopilot(vessel);
             }
             else if (maxAcceleration <= gravity)
             {
@@ -1604,11 +1863,48 @@ namespace KspMcp
                 _guidance.LastError = "available thrust is not greater than local gravity; controlled landing is not possible";
                 _guidance.Phase = "insufficient_landing_thrust";
             }
-            else if (!burnWindow) _guidance.Phase = "ballistic_descent";
-            else if (altitude > 1000d) _guidance.Phase = "suicide_burn_and_retrograde_braking";
+            else if (!burnWindow)
+            {
+                _guidance.Phase = "ballistic_descent";
+                TryDisableStockAutopilot(vessel);
+            }
+            else if (altitude > 1000d) _guidance.Phase = lowSpeedVerticalLanding ? "final_vertical_descent" : "suicide_burn_and_retrograde_braking";
             else if (altitude > 200d) _guidance.Phase = "powered_descent";
             else _guidance.Phase = "final_hover_and_touchdown";
-            ApplyDirectionControl(state, vessel, targetThrust, throttleCommand, 0d);
+            // The powered-descent vector contains target-translation data,
+            // but the first job of a suborbital lander is to remove its actual
+            // surface velocity.  KSP's native Retrograde mode has already
+            // been verified in this bridge's deorbit burn and tracks that
+            // measured velocity directly.  Use it for the locked braking
+            // window; retain the computed target vector for telemetry and
+            // later low-speed touchdown feedback.
+            // Keep the native Retrograde controller engaged while the lander
+            // has no explicit landing target.  This is the stable no-vision
+            // path: the stock controller points opposite the measured
+            // velocity all the way through touchdown, while MCP still owns
+            // the throttle, staging, gear, timeout, and safety decisions.
+            // A coordinate landing target is different: it needs the vector
+            // controller to add lateral translation, so only that path hands
+            // attitude ownership from stock Retrograde to MCP.
+            bool directFinalVector = lowSpeedVerticalLanding && hasLandingTarget;
+            Vector3d attitudeTarget = burnWindow
+                ? (directFinalVector ? targetThrust : retrograde)
+                : targetThrust;
+            string landingAutopilotMode = !burnWindow
+                ? null
+                : (directFinalVector ? null : "Retrograde");
+            // The coordinate-target final vector is owned by MCP.  Disable
+            // the previous stock Retrograde mode exactly once at that
+            // hand-off; calling Disable every frame makes KSP fight the
+            // direct PD loop, while never calling it leaves both writers
+            // active during the last descent.  The no-target path deliberately
+            // keeps Retrograde enabled because it is the more stable attitude
+            // loop for a large vehicle with no visual landing target.
+            if (directFinalVector && !string.IsNullOrEmpty(_stockAutopilotMode))
+            {
+                TryDisableStockAutopilot(vessel);
+            }
+            ApplyDirectionControl(state, vessel, attitudeTarget, throttleCommand, 0d, landingAutopilotMode);
         }
 
         private bool TryLandingTargetThrust(
@@ -1671,7 +1967,7 @@ namespace KspMcp
             catch (Exception) { return false; }
         }
 
-        private void ApplyDirectionControl(FlightCtrlState state, Vessel vessel, Vector3d target, double throttle, double targetPitch)
+        private void ApplyDirectionControl(FlightCtrlState state, Vessel vessel, Vector3d target, double throttle, double targetPitch, string stockAutopilotMode = null)
         {
             Transform controlTransform = ControlTransform(vessel);
             if (controlTransform == null) controlTransform = vessel == null ? null : vessel.transform;
@@ -1679,6 +1975,13 @@ namespace KspMcp
             if (target.sqrMagnitude < 0.0001d) target = controlTransform.forward;
             target.Normalize();
             bool sasLocked = _sasEnabled && TryLockSasRotation(vessel, target);
+            bool stockAutopilotActive = false;
+            if (!string.IsNullOrEmpty(stockAutopilotMode))
+            {
+                stockAutopilotActive = TrySetStockAutopilotMode(vessel, stockAutopilotMode);
+                sasLocked = stockAutopilotActive;
+                if (stockAutopilotActive) RefreshStockAutopilot(vessel);
+            }
             // KSP stack parts use their local +Y axis for the attachment and
             // longitudinal axis. ReferenceTransform is KSP's selected
             // control frame, but its Unity +Z forward axis is a transverse
@@ -1710,14 +2013,26 @@ namespace KspMcp
             float pitch = Clamp((float)(-pitchError * 1.2d - localAngularVelocity.x * 0.55d), -1f, 1f);
             float yaw = Clamp((float)(yawError * 1.2d - localAngularVelocity.z * 0.55d), -1f, 1f);
             state.mainThrottle = Clamp((float)throttle, 0f, 1f);
-            // FlightCtrlState.killRot is the actual per-frame SAS switch;
-            // changing only Vessel.ActionGroups is not sufficient on all KSP
-            // revisions, especially while another fly-by-wire callback owns
-            // the guidance loop.
-            state.killRot = sasLocked;
-            state.pitch = sasLocked ? 0f : pitch;
-            state.yaw = sasLocked ? 0f : yaw;
-            state.roll = sasLocked ? 0f : Clamp(-localAngularVelocity.y * 0.45f, -1f, 1f);
+            // Stock VesselAutopilot writes its PID result through
+            // Vessel.OnAutopilotUpdate before this bridge's OnFlyByWire
+            // callback.  Do not replace that result with zeroed controls:
+            // doing so leaves the telemetry mode saying Retrograde/RadialOut
+            // while the engines continue firing in the old attitude.  Keep
+            // the stock callback's pitch/yaw/roll/killRot values intact and
+            // only own throttle.  If stock autopilot is unavailable, retain
+            // the direct MCP PD fallback.
+            if (!stockAutopilotActive)
+            {
+                // FlightCtrlState.killRot is the actual per-frame SAS switch;
+                // changing only Vessel.ActionGroups is not sufficient on all KSP
+                // revisions, especially while another fly-by-wire callback owns
+                // the guidance loop.
+                state.killRot = sasLocked;
+                state.pitch = sasLocked ? 0f : pitch;
+                state.yaw = sasLocked ? 0f : yaw;
+                state.roll = sasLocked ? 0f : Clamp(-localAngularVelocity.y * 0.45f, -1f, 1f);
+            }
+            ApplyEngineThrottle(vessel, state.mainThrottle);
             _guidance.LastThrottle = state.mainThrottle;
             _guidance.LastPitch = state.pitch;
             _guidance.LastYaw = state.yaw;
@@ -1727,6 +2042,174 @@ namespace KspMcp
             double gravity = SurfaceGravity(vessel, Math.Max(0d, vessel.altitude));
             double mass = Math.Max(0.001d, vessel.GetTotalMass());
             _guidance.LastTwr = gravity <= 0d ? 0d : _guidance.LastAvailableThrust / (mass * gravity);
+        }
+
+        private static bool CanEngageStockAutopilot(Vessel vessel)
+        {
+            if (vessel == null || vessel.Autopilot == null) return false;
+            try
+            {
+                object sas = vessel.Autopilot.SAS;
+                // Some stock/modded revisions do not expose an SAS object;
+                // in that case the mode API itself is the only available
+                // capability probe.  When SAS is present, however, a false
+                // CanEngageSAS must be treated as a hard refusal so the MCP
+                // PD fallback remains in control.
+                return sas == null || InvokeBoolMethod(sas, "CanEngageSAS");
+            }
+            catch (Exception) { return false; }
+        }
+
+        private bool TrySetStockAutopilotMode(Vessel vessel, string modeName)
+        {
+            if (vessel == null || vessel.Autopilot == null || string.IsNullOrEmpty(modeName)) return false;
+            if (!CanEngageStockAutopilot(vessel))
+            {
+                _stockAutopilotMode = null;
+                return false;
+            }
+            // Remembering the last requested mode is not proof that KSP is
+            // still running it.  Probe-controlled vessels and vessels without
+            // an engageable SAS can leave the autopilot disabled while the
+            // requested mode string remains cached.  If we returned true in
+            // that state, ApplyDirectionControl would suppress the MCP PD
+            // fallback and the vehicle would drift with zero attitude input.
+            if (string.Equals(_stockAutopilotMode, modeName, StringComparison.OrdinalIgnoreCase))
+            {
+                bool enabled = BoolMember(vessel.Autopilot, "Enabled");
+                string actual = TextMember(vessel.Autopilot, "Mode");
+                if (enabled && string.Equals(actual, modeName, StringComparison.OrdinalIgnoreCase))
+                {
+                    RefreshStockAutopilot(vessel);
+                    return true;
+                }
+                _stockAutopilotMode = null;
+            }
+            try
+            {
+                bool sasActionGroupApplied = SetVesselActionGroupState(vessel, "SAS", true);
+                // KSP's action-group collection is not sufficient to turn on
+                // live SAS for every revision. Explicitly fire the group;
+                // this is what makes VesselAutopilot.OnAutopilotUpdate run.
+                try { FireGroup("SAS", true); }
+                catch (Exception exception)
+                {
+                    if (!sasActionGroupApplied) KspMcpBridge.Log("could not fire SAS action group: " + exception.Message);
+                }
+                const BindingFlags flags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
+                object autopilot = vessel.Autopilot;
+                foreach (MethodInfo method in autopilot.GetType().GetMethods(flags))
+                {
+                    if (!string.Equals(method.Name, "Enable", StringComparison.OrdinalIgnoreCase)) continue;
+                    ParameterInfo[] parameters = method.GetParameters();
+                    if (parameters.Length != 1 || !parameters[0].ParameterType.IsEnum) continue;
+                    object enumValue = Enum.Parse(parameters[0].ParameterType, modeName, true);
+                    object result = method.Invoke(autopilot, new object[] { enumValue });
+                    if (result is bool && !(bool)result) continue;
+                    RefreshStockAutopilot(vessel);
+                    bool enabled = BoolMember(autopilot, "Enabled");
+                    string actual = TextMember(autopilot, "Mode");
+                    if (!enabled || !CanEngageStockAutopilot(vessel) || !string.Equals(actual, modeName, StringComparison.OrdinalIgnoreCase))
+                    {
+                        _stockAutopilotMode = null;
+                        return false;
+                    }
+                    _stockAutopilotMode = modeName;
+                    return true;
+                }
+                foreach (MethodInfo method in autopilot.GetType().GetMethods(flags))
+                {
+                    if (!string.Equals(method.Name, "SetMode", StringComparison.OrdinalIgnoreCase)) continue;
+                    ParameterInfo[] parameters = method.GetParameters();
+                    if (parameters.Length != 1 || !parameters[0].ParameterType.IsEnum) continue;
+                    object enumValue = Enum.Parse(parameters[0].ParameterType, modeName, true);
+                    object result = method.Invoke(autopilot, new object[] { enumValue });
+                    if (result is bool && !(bool)result) continue;
+                    RefreshStockAutopilot(vessel);
+                    bool enabled = BoolMember(autopilot, "Enabled");
+                    string actual = TextMember(autopilot, "Mode");
+                    if (!enabled || !CanEngageStockAutopilot(vessel) || !string.Equals(actual, modeName, StringComparison.OrdinalIgnoreCase))
+                    {
+                        _stockAutopilotMode = null;
+                        return false;
+                    }
+                    _stockAutopilotMode = modeName;
+                    return true;
+                }
+            }
+            catch (Exception exception)
+            {
+                KspMcpBridge.Log("stock autopilot mode failed: " + modeName + ": " + exception.Message);
+            }
+            return false;
+        }
+
+        private void TryDisableStockAutopilot(Vessel vessel)
+        {
+            if (vessel == null || vessel.Autopilot == null || string.IsNullOrEmpty(_stockAutopilotMode))
+            {
+                _stockAutopilotMode = null;
+                return;
+            }
+            try
+            {
+                const BindingFlags flags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
+                MethodInfo disable = vessel.Autopilot.GetType().GetMethod("Disable", flags, null, Type.EmptyTypes, null);
+                if (disable != null) disable.Invoke(vessel.Autopilot, null);
+            }
+            catch (Exception exception)
+            {
+                KspMcpBridge.Log("stock autopilot disable failed: " + exception.Message);
+            }
+            try { FireGroup("SAS", false); } catch (Exception) { }
+            _stockAutopilotMode = null;
+        }
+
+        private static void RefreshStockAutopilot(Vessel vessel)
+        {
+            if (vessel == null || vessel.Autopilot == null) return;
+            try
+            {
+                const BindingFlags flags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
+                if (!BoolMember(vessel.Autopilot, "Enabled"))
+                {
+                    MethodInfo enable = vessel.Autopilot.GetType().GetMethod("Enable", flags, null, Type.EmptyTypes, null);
+                    if (enable != null) enable.Invoke(vessel.Autopilot, null);
+                }
+                MethodInfo update = vessel.Autopilot.GetType().GetMethod("Update", flags, null, Type.EmptyTypes, null);
+                if (update != null) update.Invoke(vessel.Autopilot, null);
+            }
+            catch (Exception exception)
+            {
+                KspMcpBridge.Log("stock autopilot refresh failed: " + exception.Message);
+            }
+        }
+
+        private static void ApplyEngineThrottle(Vessel vessel, float throttle)
+        {
+            if (vessel == null || vessel.parts == null) return;
+            const BindingFlags flags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
+            foreach (Part part in vessel.parts)
+            {
+                if (part == null || part.Modules == null) continue;
+                foreach (PartModule module in part.Modules)
+                {
+                    if (module == null || module.GetType().Name.IndexOf("ModuleEngines", StringComparison.OrdinalIgnoreCase) < 0) continue;
+                    bool staged = BoolMember(module, "staged");
+                    bool ignited = BoolMember(module, "engineIgnited");
+                    if (!staged && !ignited && throttle <= 0.001f) continue;
+                    SetMember(module, "requestedThrottle", Clamp(throttle, 0f, 1f));
+                    try
+                    {
+                        MethodInfo updateThrottle = module.GetType().GetMethod("UpdateThrottle", flags, null, Type.EmptyTypes, null);
+                        if (updateThrottle != null) updateThrottle.Invoke(module, null);
+                    }
+                    catch (Exception exception)
+                    {
+                        KspMcpBridge.Log("direct engine throttle update failed: " + exception.GetType().Name + ": " + exception.Message);
+                    }
+                }
+            }
         }
 
         private static double DirectionErrorDegrees(Vessel vessel, Vector3d target)
@@ -1758,6 +2241,14 @@ namespace KspMcp
             if (vessel == null || vessel.Autopilot == null || vessel.Autopilot.SAS == null) return false;
             try
             {
+                // A SAS object can exist while the current command source is
+                // not allowed to engage it (for example an uncrewed probe
+                // without the required connection/control state).  Treating
+                // the LockRotation call as success in that case suppresses
+                // the direct MCP PD fallback and leaves the vehicle with no
+                // attitude input at all.  Use the same capability probe as
+                // the stock autopilot path before claiming the lock.
+                if (!InvokeBoolMethod(vessel.Autopilot.SAS, "CanEngageSAS")) return false;
                 Vector3 forward = (Vector3)target;
                 if (forward.sqrMagnitude < 0.0001f) return false;
                 forward.Normalize();
@@ -1946,7 +2437,28 @@ namespace KspMcp
                     _automaticStageTargetsActivated.Add(nextStage);
                     _lastAutomaticStageActivatedCursor = vessel.currentStage;
                     _lastAutomaticStageActivatedAt = now;
-                    if (_guidance != null) _guidance.Phase = "automatic_ignition";
+                    if (_guidance != null)
+                    {
+                        _guidance.Phase = "automatic_ignition";
+                        _guidance.IgnitionAttempts++;
+                        // KSP may apply a custom engine activation one frame
+                        // before the new staging row sees FlightCtrlState.
+                        // Keep a positive throttle request alive for a short,
+                        // observable window so a no-visual client can wait
+                        // for engineIgnited instead of guessing from timing.
+                        _guidance.IgnitionHoldThrottle = Math.Max(0.35d, _guidance.LastThrottle);
+                        _guidance.IgnitionHoldUntil = now + 3d;
+                        KspMcpBridge ignitionBridge = KspMcpBridge.Instance;
+                        if (ignitionBridge != null) ignitionBridge.RecordEvent("flight.ignition.hold_started", new Dictionary<string, object>
+                        {
+                            { "vessel_id", vessel == null ? null : vessel.id.ToString() },
+                            { "vessel_name", vessel == null ? null : vessel.vesselName },
+                            { "stage", nextStage },
+                            { "throttle", _guidance.IgnitionHoldThrottle },
+                            { "duration_seconds", 3d },
+                            { "attempt", _guidance.IgnitionAttempts }
+                        });
+                    }
                     KspMcpBridge bridge = KspMcpBridge.Instance;
                     if (bridge != null) bridge.RecordEvent("flight.ignition.automatic", new Dictionary<string, object>
                     {
@@ -2224,6 +2736,16 @@ namespace KspMcp
             return mu / (radius * radius);
         }
 
+        private static double HeightAboveTerrain(Vessel vessel)
+        {
+            if (vessel == null) return 0d;
+            // Vessel.altitude is measured from the body's sea-level datum;
+            // terrainAltitude is the terrain elevation at the vessel's
+            // latitude/longitude. A visionless controller needs this explicit
+            // AGL value for gear, suicide-burn, and touchdown decisions.
+            return Math.Max(0d, Math.Max(0d, vessel.altitude) - vessel.terrainAltitude);
+        }
+
         private static Vector3d SurfaceNormal(Vessel vessel)
         {
             Vector3d fallback = vessel.GetWorldPos3D();
@@ -2275,11 +2797,14 @@ namespace KspMcp
             _sasEnabled = JsonUtil.Boolean(args, "enabled", false);
             Vessel vessel = FlightGlobals.ActiveVessel;
             bool actionGroupApplied = SetVesselActionGroupState(vessel, "SAS", _sasEnabled);
-            // Some KSP revisions do not expose the vessel action-group
-            // state through the same API. Keep the old action invocation as
-            // a compatibility fallback, but do not fire both paths because
-            // that would toggle SAS twice on versions that support SetGroup.
-            if (!actionGroupApplied) FireGroup("SAS", _sasEnabled);
+            // Some KSP revisions accept SetGroup but do not update the live
+            // FlightCtrlState. Fire the action in both cases so telemetry and
+            // the actual SAS controller agree.
+            try { FireGroup("SAS", _sasEnabled); }
+            catch (Exception)
+            {
+                if (!actionGroupApplied) throw;
+            }
             return new Dictionary<string, object>
             {
                 { "sas", _sasEnabled },
@@ -2413,6 +2938,21 @@ namespace KspMcp
         {
             int index = JsonUtil.Integer(args, "rate_index", 0);
             if (index < 0) index = 0;
+            // KSP physics/time-warp levels can advance orbital state without
+            // running a reliable OnFlyByWire control frame for every step.
+            // A no-visual controller must stay at real time while guidance is
+            // active so ignition, staging, burns, and touchdown cannot be
+            // skipped between callbacks.
+            if (_guidance != null && index > 0)
+            {
+                throw new KspMcpException("warp_unsafe_during_guidance", "guidance plans allow only real time; stop guidance before using time warp so a no-visual controller cannot skip ignition, staging, or touchdown events", new Dictionary<string, object>
+                {
+                    { "requested_rate_index", index },
+                    { "safe_max_rate_index", 0 },
+                    { "profile", _guidance.Profile },
+                    { "phase", _guidance.Phase }
+                });
+            }
             MethodInfo[] methods = typeof(TimeWarp).GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static);
             foreach (MethodInfo method in methods)
             {
@@ -2420,6 +2960,14 @@ namespace KspMcp
                 ParameterInfo[] parameters = method.GetParameters();
                 try
                 {
+                    if (parameters.Length == 3 &&
+                        parameters[0].ParameterType == typeof(int) &&
+                        parameters[1].ParameterType == typeof(bool) &&
+                        parameters[2].ParameterType == typeof(bool))
+                    {
+                        method.Invoke(null, new object[] { index, true, true });
+                        return new Dictionary<string, object> { { "rate_index", index }, { "set", true } };
+                    }
                     if (parameters.Length == 2 && parameters[0].ParameterType == typeof(int) && parameters[1].ParameterType == typeof(bool))
                     {
                         method.Invoke(null, new object[] { index, true });
@@ -2772,6 +3320,9 @@ namespace KspMcp
                 { "mission_time", vessel.missionTime },
                 { "altitude", vessel.altitude },
                 { "terrain_altitude", vessel.terrainAltitude },
+                { "height_agl", HeightAboveTerrain(vessel) },
+                { "altitude_semantics", "sea_level_datum" },
+                { "height_agl_semantics", "vessel_to_local_terrain" },
                 { "surface_speed", vessel.srfSpeed },
                 { "orbital_speed", vessel.obt_speed },
                 { "vertical_speed", vessel.verticalSpeed },
@@ -2840,6 +3391,9 @@ namespace KspMcp
                 { "mission_time", vessel.missionTime },
                 { "altitude", vessel.altitude },
                 { "terrain_altitude", vessel.terrainAltitude },
+                { "height_agl", HeightAboveTerrain(vessel) },
+                { "altitude_semantics", "sea_level_datum" },
+                { "height_agl_semantics", "vessel_to_local_terrain" },
                 { "surface_speed", vessel.srfSpeed },
                 { "orbital_speed", vessel.obt_speed },
                 { "vertical_speed", vessel.verticalSpeed },
@@ -3211,11 +3765,11 @@ namespace KspMcp
             try
             {
                 Type type = target.GetType();
-                FieldInfo field = type.GetField(name, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                FieldInfo field = FindField(type, name);
                 object value = field == null ? null : field.GetValue(target);
                 if (value == null)
                 {
-                    PropertyInfo property = type.GetProperty(name, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                    PropertyInfo property = FindProperty(type, name);
                     value = property == null ? null : property.GetValue(target, null);
                 }
                 if (value is IConvertible) return Convert.ToDouble(value);
@@ -3230,11 +3784,11 @@ namespace KspMcp
             try
             {
                 Type type = target.GetType();
-                FieldInfo field = type.GetField(name, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                FieldInfo field = FindField(type, name);
                 object value = field == null ? null : field.GetValue(target);
                 if (value == null)
                 {
-                    PropertyInfo property = type.GetProperty(name, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                    PropertyInfo property = FindProperty(type, name);
                     value = property == null ? null : property.GetValue(target, null);
                 }
                 if (value is Vector3d) return (Vector3d)value;
@@ -3249,13 +3803,45 @@ namespace KspMcp
             try
             {
                 Type type = target.GetType();
-                FieldInfo field = type.GetField(name, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                FieldInfo field = FindField(type, name);
                 object value = field == null ? null : field.GetValue(target);
                 if (value == null)
                 {
-                    PropertyInfo property = type.GetProperty(name, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                    PropertyInfo property = FindProperty(type, name);
                     value = property == null ? null : property.GetValue(target, null);
                 }
+                return value is bool && (bool)value;
+            }
+            catch (Exception) { return false; }
+        }
+
+        private static string TextMember(object target, string name)
+        {
+            try
+            {
+                if (target == null) return null;
+                Type type = target.GetType();
+                FieldInfo field = FindField(type, name);
+                object value = field == null ? null : field.GetValue(target);
+                if (value == null)
+                {
+                    PropertyInfo property = FindProperty(type, name);
+                    value = property == null ? null : property.GetValue(target, null);
+                }
+                return value == null ? null : value.ToString();
+            }
+            catch (Exception) { return null; }
+        }
+
+        private static bool InvokeBoolMethod(object target, string name)
+        {
+            try
+            {
+                if (target == null) return false;
+                const BindingFlags flags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
+                MethodInfo method = target.GetType().GetMethod(name, flags, null, Type.EmptyTypes, null);
+                if (method == null) return false;
+                object value = method.Invoke(target, null);
                 return value is bool && (bool)value;
             }
             catch (Exception) { return false; }
@@ -3266,21 +3852,54 @@ namespace KspMcp
             try
             {
                 Type type = target.GetType();
-                FieldInfo field = type.GetField(name, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                FieldInfo field = FindField(type, name);
                 if (field != null)
                 {
-                    if (field.FieldType == typeof(float)) field.SetValue(target, Convert.ToSingle(value));
-                    else if (field.FieldType == typeof(bool)) field.SetValue(target, Convert.ToBoolean(value));
+                    field.SetValue(target, ConvertMemberValue(value, field.FieldType));
                     return;
                 }
-                PropertyInfo property = type.GetProperty(name, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                PropertyInfo property = FindProperty(type, name);
                 if (property != null && property.CanWrite)
                 {
-                    if (property.PropertyType == typeof(float)) property.SetValue(target, Convert.ToSingle(value), null);
-                    else if (property.PropertyType == typeof(bool)) property.SetValue(target, Convert.ToBoolean(value), null);
+                    property.SetValue(target, ConvertMemberValue(value, property.PropertyType), null);
                 }
             }
             catch (Exception) { }
+        }
+
+        private static FieldInfo FindField(Type type, string name)
+        {
+            if (type == null || string.IsNullOrEmpty(name)) return null;
+            const BindingFlags flags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
+            FieldInfo exact = type.GetField(name, flags);
+            if (exact != null) return exact;
+            foreach (FieldInfo field in type.GetFields(flags))
+            {
+                if (string.Equals(field.Name, name, StringComparison.OrdinalIgnoreCase)) return field;
+            }
+            return null;
+        }
+
+        private static PropertyInfo FindProperty(Type type, string name)
+        {
+            if (type == null || string.IsNullOrEmpty(name)) return null;
+            const BindingFlags flags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
+            PropertyInfo exact = type.GetProperty(name, flags);
+            if (exact != null) return exact;
+            foreach (PropertyInfo property in type.GetProperties(flags))
+            {
+                if (string.Equals(property.Name, name, StringComparison.OrdinalIgnoreCase)) return property;
+            }
+            return null;
+        }
+
+        private static object ConvertMemberValue(object value, Type targetType)
+        {
+            if (targetType == typeof(float)) return Convert.ToSingle(value);
+            if (targetType == typeof(double)) return Convert.ToDouble(value);
+            if (targetType == typeof(int)) return Convert.ToInt32(value);
+            if (targetType == typeof(bool)) return Convert.ToBoolean(value);
+            return value;
         }
 
         private static float Clamp(float value, float min, float max)
@@ -3294,3 +3913,4 @@ namespace KspMcp
         }
     }
 }
+

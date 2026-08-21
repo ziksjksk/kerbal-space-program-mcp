@@ -8,4 +8,9 @@ ksp-plugin/bin/
 ksp-plugin/obj/
 ksp-plugin/GameData/KspMcp/Plugins/*.dll
 ksp-plugin/GameData/KspMcp/Plugins/*.pdb
+KSP.log
+work/
+%SystemDrive%/
+outputs/*.zip
+outputs/*.craft
 

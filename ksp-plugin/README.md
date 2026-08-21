@@ -82,7 +82,7 @@ GET http://127.0.0.1:8765/api/v1/telemetry?since=0&limit=256&include_events=true
 
 实时任务可以通过 editor.cancel_job 停止，已经生成的部件会保留，便于无视觉客户端先检查当前结构再决定清空或继续。flight.maneuver_burn_start 是节点执行层：它根据原生节点的 Δv、实时质量和估算可用推力计算有限燃烧窗口，在 OnFlyByWire 中依次执行对准、点火和燃烧阶段；调用方应继续读取 telemetry，完成后使用 flight.guidance_stop 释放控制。
 
-### 游戏帧内指导器（可由人接管）
+### 游戏帧内指导器（AI-only，无视觉依赖）
 
 ```json
 {
@@ -96,7 +96,7 @@ GET http://127.0.0.1:8765/api/v1/telemetry?since=0&limit=256&include_events=true
 }
 ```
 
-指导器在 `OnFlyByWire` 回调中刷新杆量，`flight.guidance_status` 返回阶段和最后控制输出；`flight.guidance_stop` 会清除指导器和手动控制租约。它只使用 KSP 的状态和轨道数据，不需要截图。
+指导器在 `OnFlyByWire` 回调中刷新杆量，`flight.guidance_status` 返回阶段、最后控制输出、减轨状态、自动点火保持窗口和剩余时间；`flight.guidance_stop` 会清除指导器和手动控制租约。它只使用 KSP 的状态和轨道数据，不需要截图，也不需要模型逐帧发送油门或姿态。
 
 启动指导器时会先返回并记录 `preflight`：当前飞船是否可控、质量、可用分级推力、局部重力、TWR、当前阶段、发动机数量和逐级发动机/分离器报告。`ascent`/`orbit` 在发射台或已着陆状态下如果估算 TWR 低于 1.02 会被拒绝，避免无视觉客户端把无法离地的飞船交给自动控制；上升段还会按约 1.35–1.75 的目标 TWR 调节油门，姿态回路会对角速度做阻尼。已经运行的指导计划可以通过 `flight.guidance_update`（MCP 工具名 `ksp_flight_guidance_update`）在线更新目标和安全选项，不必释放控制再重启。
 
@@ -104,8 +104,9 @@ GET http://127.0.0.1:8765/api/v1/telemetry?since=0&limit=256&include_events=true
 
 `flight.bodies` 读取 KSP 的星体参数和 patched-conic 轨道；MCP 端的 `ksp_flight_transfer_plan` 会用这些数据计算透明的圆共面 Hohmann 估算。`flight.maneuver_nodes` 读取原生节点，`flight.add_maneuver_node` 和 `flight.clear_maneuver_nodes` 都要求确认参数，避免把规划误变成执行。节点 Δv 使用 radial-plus、normal-plus、prograde 坐标，单位为 m/s。
 
-`profile=orbit` 会在尚未入轨时使用上升制导，获得目标远点后在远点抬升近点；若近点高于目标，则在近点执行逆行降轨。`profile=landing` 会先执行简单脱轨决策，再使用相对地表速度、制动距离、局部重力、地形高度和垂直速度调节油门；进入低空后会自动发送齿轮下放命令，也可以传 `target_latitude`、`target_longitude` 让水平速度向指定地点收敛。两者是可停止、可在线调整的游戏内闭环，不会把近似轨道模型误报成完整的 Duna 任务保证；完整转移窗口搜索、再入气动模型和地形避障仍需模型逐段检查。指导器不是权限锁，用户可以随时在 KSP 中手动控制，停止指导后由原生界面继续飞行。
+`profile=orbit` 会在尚未入轨时使用上升制导，获得目标远点后在远点抬升近点；若近点高于目标，则在近点执行逆行降轨。`profile=landing` 会先执行脱轨决策，再使用相对地表速度、`height_agl`、制动距离、局部重力和垂直速度调节油门；进入低空后会自动发送齿轮下放命令，也可以传 `target_latitude`、`target_longitude` 让水平速度向指定地点收敛。不同 KSP 版本可能把点火状态暴露为 `EngineIgnited` 或大小写不同的成员，插件会兼容读取；自定义分级后会保持正油门并刷新发动机节流，直到遥测确认 `ignited=true` 和推进剂下降。两者是可停止、可在线调整的游戏内闭环，不会把近似轨道模型误报成完整的 Duna 任务保证；完整转移窗口搜索、再入气动模型和地形避障仍需模型逐段检查。指导运行期间 `flight.warp` 只允许 `rate_index=0`，确保每个游戏物理帧都有机会执行无视觉控制回调；远点之后会使用下降速度门限持续制动，避免在 `coast_to_entry_burn` 与满油门之间振荡。
 
-月球软着陆使用 `ksp_moon_landing_plan` 和 `ksp_flight_moon_soft_landing_start` 两个 MCP 工具：前者只读当前星体/卫星数据，后者要求 `confirm=true` 且要求活动飞船已经位于目标月球。空间站使用 `ksp_station_build` 生成可继续对接的 10 部件核心；它不是封闭的一体化模型，便于人直接补太阳能板、实验舱和推进模块。
+月球软着陆使用 `ksp_moon_landing_plan` 和 `ksp_flight_moon_soft_landing_start` 两个 MCP 工具：前者只读当前星体/卫星数据，后者要求 `confirm=true` 且要求活动飞船已经位于目标月球。AI 应以 `flight.ignition.hold_started`、`flight.engine.state.changed`、`flight.landing.gear_commanded`、`flight.landing.deorbit_burn_completed` 和 `flight.touchdown` 作为状态边界，并用 `height_agl` 判断离地高度；不能只凭接口返回的 `ok=true` 宣布着陆。空间站使用 `ksp_station_build` 生成可继续对接的 10 部件核心；它不是封闭的一体化模型，便于后续 MCP 调用添加太阳能板、实验舱、推进模块。
 
 编辑器建造请求支持 `snap_to_node`。默认值为 `true`，会按父子 AttachNode 自动对齐位置和方向；若要保留传入的世界坐标和四元数，可以显式传 `false`。对称复制不依赖游戏当前的 UI 对称模式：MCP 文档中的每个零件都是显式实例，因此插件会在生成单个零件时暂时关闭 UI 对称，避免多出未登记的零件。
+

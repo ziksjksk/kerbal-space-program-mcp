@@ -634,7 +634,7 @@ namespace KspMcp
             return new Dictionary<string, object>
             {
                 { "bridge", "ksp-mcp" },
-                { "bridge_version", "0.4.0" },
+                { "bridge_version", "0.4.9" },
                 { "scene", SceneName() },
                 { "endpoint", "http://" + _host + ":" + _port },
                 { "verbose_logging", _verboseLogging },
@@ -760,7 +760,7 @@ namespace KspMcp
             Dictionary<string, object> nextCache = new Dictionary<string, object>
             {
                 { "sequence", _telemetrySequence },
-                { "bridge_version", "0.4.0" },
+                { "bridge_version", "0.4.9" },
                 { "captured_at", SafeUniversalTime() },
                 { "scene", SceneName() },
                 { "editor", _craft.CompactStatus() },
@@ -861,3 +861,4 @@ namespace KspMcp
         }
     }
 }
+

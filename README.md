@@ -7,7 +7,7 @@
 
 建造链路支持从空白编辑器开始创建火箭，也支持一次性提交完整的部件树；粒度较细的工具可以继续增删零件、移动/旋转、重新连接、设置阶段和动作组。飞行链路支持发射后的状态读取、油门和姿态控制、SAS/RCS、分级、时间加速、单部件动作、紧急中止和回收。
 
-0.4.0 是当前可用的人机协同版本：在低延迟 HTTP 复用、紧凑遥测和事件游标、分帧异步建造、真实零件性能分析、星体模型、原生轨道节点和有限燃烧控制之上，补齐了真实 KSP 存档加载、`.craft` 反射加载兼容、编辑器根部件同步、显式控制核心检查和实时建造事件。默认建造速度为每个 Unity 帧 4 个部件，`fast` 可提高到 16，`visible` 可降到 1；`/api/v1/telemetry` 直接读取线程安全缓存，`ksp_wait_for_event` 使用桥内短暂条件等待。无视觉模型可以通过事件游标观察“哪个零件刚生成、当前阶段、发动机/资源状态和飞行事件”，人仍可在 KSP 画面中随时接管油门、姿态、分级和节点操作。此版本还提供月球软着陆规划/启动接口和可扩展的空间站核心蓝图。
+0.4.9 是 AI-first、无视觉依赖的版本：AI 通过 MCP 工具完成编辑器建造、规则校验、发射确认、游戏内分级、油门/姿态闭环、轨道节点燃烧和月球软着陆；人不需要点击 KSP 界面，只有在用户明确要求时才作为可选安全接管者。新增了发动机字段跨 KSP 版本兼容、自动点火保持窗口、直接节流刷新、明确的离地高度（AGL）遥测、远点事件边界处理、使用轨道惯性速度的可靠减轨方向、受控下降速度、包含水平速度的停止距离、对准闸门、低速径向下降和锁存动力制动窗口，以及指导器运行期间只允许实时物理帧的时间加速安全上限。0.4.9 进一步修复了低速垂直下降交接的状态滞回、落地后的自动分级锁定，以及 SAS 不可接合时错误吞掉 MCP 自有姿态回退的问题；原生自动驾驶只有在遥测确认实际启用且模式匹配时才接管，否则由 MCP 的 PD 闭环继续控制。默认建造速度为每个 Unity 帧 4 个部件，`fast` 可提高到 16，`visible` 可降到 1；`/api/v1/telemetry` 直接读取线程安全缓存，`ksp_wait_for_event` 使用桥内短暂条件等待。无视觉模型可以只依赖状态、事件游标、阶段报告、发动机/资源摘要和轨道数据完成闭环决策。此版本还提供月球软着陆规划/执行接口和可扩展的空间站核心蓝图。
 
 当前目标平台是 KSP 1.12.x（KSP 1.x 的 `Assembly-CSharp.dll` API）。KSP 2 使用另一套 API，不能直接使用这个插件。
 
@@ -19,7 +19,7 @@ tests/                  不需要启动 KSP 的协议和数据模型测试
 ksp-plugin/src/         KSP 游戏侧 C# 插件源码
 ksp-plugin/GameData/    可直接复制到 KSP 根目录的插件目录和配置
 examples/               MCP 客户端配置示例
-releases/               可直接下载的完整安装包
+outputs/                本机生成的发布 ZIP 和 SHA-256 校验文件（不提交源码仓库）
 ```
 
 ## 安装
@@ -70,7 +70,19 @@ $env:KSP_MCP_URL = 'http://127.0.0.1:8765'
 python -m server
 ```
 
-如果 MCP 客户端从其他工作目录启动，请把项目绝对路径放入 `PYTHONPATH`，或者在配置里把 `cwd` 设置为本项目根目录。示例配置见 `examples/mcp.json`。
+如果 MCP 客户端从其他工作目录启动，请把项目绝对路径放入 `PYTHONPATH`，或者在配置里把 `cwd` 设置为本项目根目录。也可以在 PowerShell 中直接运行发布包里的 `.\start-server.ps1`，它会自动设置项目根目录和 `PYTHONPATH`。示例配置见 `examples/mcp.json`。
+
+### 在另一台设备上运行
+
+优先下载 GitHub Release 中的 `ksp-mcp-0.4.9.zip` 和对应的 `.sha256` 文件。解压到任意没有中文或空格要求的目录，先关闭 KSP，再运行：
+
+```powershell
+Get-FileHash .\ksp-mcp-0.4.9.zip -Algorithm SHA256
+powershell -ExecutionPolicy Bypass -File .\install.ps1 -KspRoot 'D:\Games\Kerbal Space Program'
+.\start-server.ps1
+```
+
+另一台设备只需要安装 KSP 1.12.x、Python 3.10+ 和一个支持 stdio MCP 的客户端；不需要 Visual Studio、Unity、KSP 源码或额外 Python 包。发布 ZIP 已经包含可运行的游戏插件 DLL；只有开发者要重新编译插件时，才需要在该设备上运行 `ksp-plugin\build.ps1`，因为编译必须引用那台设备自己的 KSP/Unity 程序集。把 `examples\mcp.json` 的 `cwd` 改成解压目录即可。
 
 ## 推荐的建造流程
 
@@ -91,13 +103,25 @@ VAB 中插件会把生成的根零件自动放到安全高度（默认 `y=50`）
 
 ### 无视觉实时状态
 
-`ksp_realtime_state` 返回缓存的紧凑状态，避免每次读取都序列化完整部件树。它包含场景、建造任务、当前飞船、位置/速度、海拔、地形高度、垂直速度、质量、级号、姿态、轨道根数和 MCP 控制租约；`events` 使用单调递增的 `event_cursor`，模型可以把上次游标传入 `since`，只接收增量事件。
+`ksp_realtime_state` 返回缓存的紧凑状态，避免每次读取都序列化完整部件树。它包含场景、建造任务、当前飞船、位置/速度、绝对海拔、地形海拔、明确的 `height_agl`（离当地地形高度）、垂直速度、质量、级号、姿态、轨道根数和 MCP 控制租约；`events` 使用单调递增的 `event_cursor`，模型可以把上次游标传入 `since`，只接收增量事件。无视觉模型进行着陆、齿轮和制动判断时必须使用 `height_agl`，不能把 `altitude` 当作离地高度。
 
 `ksp_wait_for_event` 是低延迟的事件等待接口：模型传入上一次的 `since` 游标，MCP 通过 `wait_ms` 把等待交给游戏桥的后台 HTTP 监听线程；收到部件生成、点火、分级、升空、远点、近点或着陆事件后立即返回，没有事件才会在有界超时后返回。它不会阻塞 KSP Unity 主线程，也不会让 MCP 进程以固定间隔制造大量 HTTP 请求，适合在实时飞行控制循环中替代较长的固定时间 `ksp_watch`。需要显式控制等待时，`ksp_realtime_state` 也支持 `wait_ms`（0–1000）。
 
 `ksp_watch` 会在一个有界时间段内连续采样这些状态，适合无视觉模型观察“部件逐个出现、加载稳定、发射、点火、分级、远点/近点变化和着陆”。为避免一次 MCP 响应积累几千个样本拖慢模型，`ksp_watch` 默认最多返回 120 个样本，也可传 `max_samples`（1–240）调整；`event_limit` 默认 256，用于覆盖高速分帧建造的一整个轮询窗口。遥测还会返回 `oldest_event_cursor`、`events_lost`、`events_truncated` 和 `next_since`；当一个响应装不下所有事件时，客户端必须沿 `next_since` 继续，而不是直接跳到生产者的 `event_cursor`。`ksp_batch` 把多个安全命令放在一次 HTTP 往返里；发射、Abort 和回收仍必须使用各自的确认工具，不能隐藏在批处理中。
 
 `ksp_realtime_state` 的摘要是轻量的：编辑器只返回当前部件数、任务进度和事件；飞行侧返回位置/速度、轨道根数、阶段、指导阶段、发动机点火/故障汇总和资源总量，不遍历完整部件树。默认遥测间隔为 50 ms，可在 `GameData/KspMcp/PluginData/config.cfg` 用 `telemetryIntervalMs` 调整（25–1000）；要检查连接节点、模块、资源和详细验证结果时再调用 `ksp_editor_get_craft`、`ksp_editor_validate` 或 `ksp_editor_analyze`。如果需要排查游戏侧问题，可以临时设置 `verboseLogging = true`，正常使用应保持 `false`。
+
+### AI-only 无视觉控制协议
+
+下面的协议是给没有截图/多模态能力的模型使用的；每一步都以 MCP 返回的状态或事件为准，不依赖 KSP 界面文字，也不把“命令已接受”当成“游戏动作已完成”：
+
+1. 建造前调用 `ksp_status`、`ksp_parts_list`，然后用 `ksp_editor_new` 和 `ksp_editor_apply_craft`。持续使用 `ksp_editor_job_status`、`ksp_wait_for_event`、`ksp_realtime_state`，直到任务状态是 `completed`，部件计数稳定，且 `editor.build.completed` 已出现。
+2. 发射前同时调用 `ksp_editor_validate` 和 `ksp_editor_analyze`。至少确认 `valid=true`、存在 `ModuleCommand`、每个需要工作的发动机级有推进剂和正 TWR；只有用户授权后调用 `ksp_editor_launch(confirm=true)`。
+3. 场景进入 `FLIGHT` 后先读取 `ksp_flight_state`，确认 `commandable=true`、`situation` 和 `body`，再调用 `ksp_flight_guidance_start(confirm=true)`。指导器会在游戏帧内自己刷新控制，不需要模型每一帧发送杆量。
+4. 指导运行期间只使用 `ksp_flight_warp(rate_index=0)`；任何时间加速都会被桥拒绝，因为 KSP 可能在加速时推进轨道而跳过可靠的飞控回调、点火、分级、远点或触地事件。每次收到 `flight.ignition.hold_started`、`flight.engine.state.changed`、`flight.stage.changed`、`flight.apoapsis.reached` 或 `flight.periapsis.reached`，都用 `ksp_realtime_state` 读取新摘要并沿 `next_since` 继续。
+5. 判断自动点火成功时，必须同时看到 `engine_summary.ignited>0` 或详细发动机 `ignited=true`、`requested_throttle>0`、推进剂数量下降；只有 `flight.ignition.automatic` 不能单独证明发动机已经工作。
+6. 判断软着陆成功时，必须收到 `flight.touchdown`，并再次读取 `situation=LANDED` 或用户允许的 `SPLASHED`、`height_agl` 接近 0、`surface_speed` 和 `vertical_speed` 在安全范围。任务超时、燃料耗尽、`commandability_lost`、`vessel_lost` 或 `flameout` 都是失败状态，模型应先停止指导并报告原因。
+7. 事件缓冲出现 `events_lost`/`resync_required` 时，立即用当前摘要重新同步，不得猜测中间动作；`events_truncated=true` 时沿 `next_since` 继续，不得直接跳到 `event_cursor`。
 
 示例观察循环：
 
@@ -123,14 +147,14 @@ ksp_editor_apply_craft(...)
 
 例如，模型可以先调用 `ksp_flight_transfer_plan(destination_body="Duna")`，核对相位角和推进剂余量，再根据用户确认调用节点工具，最后调用 `ksp_flight_maneuver_burn_start`。节点的 Δv 坐标使用 KSP 原生约定：`radial` 为径向外侧正、`normal` 为法向正、`prograde` 为顺行正，单位是 m/s。燃烧控制会根据节点 Δv、实时质量和可用推力估算对称点火时刻，并在游戏帧内对准燃烧向量；它仍然需要实时监控，不会把近似的有限燃烧误报成任务保证。规划器明确忽略了非共面修正、发射/转向损失、大气阻力、真实相位误差和目标星体地形。
 
-`ksp_flight_guidance_start(profile="orbit")` 会先完成上升，在远点等待并抬升近点，或在近点执行降轨修正，直到目标远点/近点容差内；`profile="landing"` 会先尝试把正近点降到与星体相交，再使用相对地表速度、制动距离和局部重力控制下降。两个 profile 仍属于可停止的基础闭环，用户应持续读取遥测，在进入 Duna 转移、捕获、再入和着陆前逐段确认。
+`ksp_flight_guidance_start(profile="orbit")` 会先完成上升，在远点等待并抬升近点，或在近点执行降轨修正，直到目标远点/近点容差内；`profile="landing"` 会先尝试把正近点降到与星体相交，再使用相对地表速度、制动距离和局部重力控制下降。指导器属于游戏侧闭环，模型只需按事件协议监督，不需要逐帧发送控制量；它会拒绝指导期间的时间加速，在远点跨周期后仍能进入减轨燃烧，并在发动机自动分级后保持正油门直到遥测确认点火。
 
 ### 月球软着陆与空间站核心
 
 月球能力拆成“规划”和“执行”两个明确步骤，适合没有视觉输入的模型：
 
 - `ksp_moon_landing_plan` 读取当前 `flight.state` 和 `flight.bodies`，对当前星体到目标卫星（默认 Mun）给出透明的转移估算、停车轨道、捕获和下降参数。它是只读规划器，不会自动点火、创建节点或改变飞船。
-- 当飞船已经处于目标月球附近并且用户允许执行时，调用 `ksp_flight_moon_soft_landing_start(confirm=true)`。它启动可停止的 `landing` 指导，并通过 `ksp_wait_for_event` / `ksp_realtime_state` 返回阶段、速度、海拔、油门、分级和着陆事件；人可以随时调用 `ksp_flight_guidance_stop` 或使用 KSP 原生界面接管。转移窗口、捕获和地形避障仍应由模型逐段核对，不能把规划估算当作任务成功保证。
+- 当飞船已经处于目标月球附近并且用户允许执行时，调用 `ksp_flight_moon_soft_landing_start(confirm=true)`。它启动游戏侧 `landing` 指导，并通过 `ksp_wait_for_event` / `ksp_realtime_state` 返回阶段、绝对海拔、`height_agl`、速度、油门、分级和着陆事件；无视觉模型可以完全依赖这些数据监督执行，`ksp_flight_guidance_stop` 只作为失败/接管时的安全出口。转移窗口、捕获和地形避障仍应由模型逐段核对，不能把规划估算当作任务成功保证。
 - `ksp_station_build` 在真实 VAB 中生成一个连通的 10 部件空间站核心：探测器控制核心、`stationHub`、四个侧向对接口、服务燃料箱、电池、乘员舱和轴向对接口。核心故意保留对接口，便于人或后续 MCP 调用继续添加太阳能板、实验舱、推进模块和更多对接段；示例文件是 `examples/space_station_core.json`。
 
 ### 分级和游戏规则检查
@@ -142,7 +166,7 @@ ksp_editor_apply_craft(...)
 - `stage 0` 可以作为最终载荷/分离动作，因此允许没有发动机；但 `stage > 0` 如果含有分离器却没有后续发动机，会被拒绝。
 - KSP 原生对舱体、适配器和油箱等被动零件使用 `inverseStage=-1` 是正常状态，不会被误判成非法分级；真正带发动机或分离动作的零件仍必须有有效阶段号。
 
-大型火箭可以从 `examples/duna_interplanetary.json` 开始：它包含显式 `probeCoreOcto2.v2` 控制源、化学助推级、核热转移级、末端着陆推进级和有效分离链。安装 0.4.0 后应先通过 `ksp_editor_validate`、`ksp_editor_analyze`、`ksp_wait_for_event` 和 `ksp_realtime_state` 做游戏内烟测。本机已经验证该蓝图可以被 MCP 分帧构建、校验、保存并重新加载为 28 个部件；飞行指导会负责可观测的点火、分级和基础姿态/轨道闭环，但长时间上升、转移、再入和着陆仍是可停止的人机协同流程，发射后建议由 MCP 持续读取遥测并允许人接管。
+大型火箭可以从 `examples/duna_interplanetary.json` 开始：它包含显式 `probeCoreOcto2.v2` 控制源、化学助推级、核热转移级、末端着陆推进级和有效分离链。安装 0.4.9 后应先通过 `ksp_editor_validate`、`ksp_editor_analyze`、`ksp_wait_for_event` 和 `ksp_realtime_state` 做游戏内烟测。本机已经验证该蓝图可以被 MCP 分帧构建、校验、保存并重新加载为 28 个部件；飞行指导负责可观测的点火、分级和基础姿态/轨道闭环，AI 应按事件协议逐段执行上升、转移、捕获、再入和着陆，并在任何失败状态自动停机/回收，而不是依赖人一直盯着画面。
 
 完整部件格式如下：
 
@@ -185,13 +209,13 @@ ksp_editor_apply_craft(...)
 
 Δv 是工程估算，不是完整的飞行仿真：它明确排除了阻力、转向损失、节流曲线、跨级供料变化和大气变化。真正发射前仍要同时通过 `ksp_editor_analyze` 和 `ksp_editor_validate`，并用遥测观察实际 TWR、垂直速度、燃料和级号。
 
-### 实时飞行指导（人机协同）
+### 实时飞行指导（AI-only，无视觉依赖）
 
-新增的 `ksp_flight_guidance_start` 在游戏帧内运行闭环指导，支持 `ascent`、`orbit`、`landing` 和 `node_burn` 四种 profile；`ksp_flight_guidance_stop` 立即释放控制，`ksp_flight_guidance_status` 返回当前阶段、目标、控制输出和剩余时间。启动必须传 `confirm=true`，默认允许自动分级，但不会绕过发射工具的确认门槛。
+新增的 `ksp_flight_guidance_start` 在游戏帧内运行闭环指导，支持 `ascent`、`orbit`、`landing` 和 `node_burn` 四种 profile；`ksp_flight_guidance_stop` 立即释放控制，`ksp_flight_guidance_status` 返回当前阶段、目标、控制输出、点火保持、减轨状态和剩余时间。启动必须传 `confirm=true`，默认允许自动分级，但不会绕过发射工具的确认门槛。运行指导器不需要截图或手动点击。
 
-当前指导器的职责是提供可观测、可停止的基础闭环：上升阶段按海拔执行重力转弯并以目标远点收油，轨道阶段按远点/近点和原生轨道遥测执行圆化修正，节点燃烧阶段根据原生节点向量进行对准和有限燃烧，着陆阶段先把正近点降到与星体相交，再按相对地表反向速度、制动距离和垂直速度控制下降。它不是全任务级别的“保证成功”黑盒；去 Duna 的转移窗口精确求解、跨影响球捕获、再入热/气动控制和地形避障仍需要模型逐段规划。模型应持续调用 `ksp_realtime_state`，发现燃料、姿态或垂直速度异常时先停止指导或 Abort；任何阶段都可以由人使用 KSP 原生界面接管。
+当前指导器的职责是提供可观测、可停止的游戏侧闭环：上升阶段按海拔执行重力转弯并以目标远点收油，轨道阶段按远点/近点和原生轨道遥测执行圆化修正，节点燃烧阶段根据原生节点向量进行对准和有限燃烧，着陆阶段先把正近点降到与星体相交，再按相对地表反向速度、`height_agl`、制动距离和垂直速度控制下降。自动分级会兼容不同 KSP 版本的点火字段，并在确认发动机点火前保持油门。它不是全任务级别的“保证成功”黑盒；去 Duna 的转移窗口精确求解、跨影响球捕获、再入热/气动控制和地形避障仍需要模型逐段规划。模型应持续调用 `ksp_realtime_state`，发现燃料、姿态、命令能力或垂直速度异常时先停止指导或 Abort；默认不要求人操作画面。
 
-推荐把飞行控制当作“自动化操作员”而不是不可观察的黑盒：MCP 负责状态读取、点火/分级时机、有限燃烧和事件记录，人负责在姿态异常、地形未知或燃料余量不可靠时接管。`ksp_flight_set_controls` 不能和指导器同时抢控制权；接管前先调用 `ksp_flight_guidance_stop`，接管后仍可用 `ksp_realtime_state` 观察结果。
+推荐把飞行控制当作“状态驱动的 AI 任务执行器”，而不是需要人盯屏的黑盒：MCP 负责状态读取、点火/分级时机、有限燃烧、时间加速约束和事件记录；模型负责按成功/失败条件推进任务。`ksp_flight_set_controls` 不能和指导器同时抢控制权；只有要人工接管时才先调用 `ksp_flight_guidance_stop`，接管后仍可用 `ksp_realtime_state` 观察结果。
 
 ## 重要边界
 
@@ -201,7 +225,7 @@ ksp_editor_apply_craft(...)
 - `ksp_flight_guidance_start` 要求 `confirm: true`；`ksp_flight_set_controls` 与指导器互斥，避免两个控制回路互相抢杆。
 - 工具不会替模型猜测不存在的零件名称；零件名、节点名和已解锁状态来自当前运行的游戏实例。
 - 更新 `GameData/KspMcp/Plugins/KspMcpBridge.dll` 后必须重启 KSP，已经运行的 Unity 进程不会热加载新 DLL。
-- 本地没有 KSP 安装时，可以运行全部 Python 测试，但无法在这里替你启动真实游戏验证 Unity 行为；编译和游戏内烟测需要在安装了 KSP 的机器上完成。
+- 本地没有 KSP 安装时，可以运行全部 Python 协议/模型测试，但无法验证 Unity 行为；发布包中的 DLL 可以直接安装，若要重新编译则必须在安装了同版本 KSP 的机器上完成。
 
 ## 验证
 
@@ -215,3 +239,4 @@ python -m server --self-test
 ## API 依据
 
 插件使用 KSP 1.x 的 `EditorLogic`、`ShipConstruct`、`Part`、`AttachNode`、`Vessel` 和 `FlightCtrlState` 接口。火箭设计和轨道流程参考 KSP 官方 [KSPedia 手册](https://www.kerbalspaceprogram.com/files/KSPedia-XB1.pdf)；控制器的“导航/制导/控制分层”和上升/着陆状态机参考 NASA 的 [Guidance, Navigation & Control](https://www.nasa.gov/reference/jsc-guidance-navigation-control-subsystems/) 以及 [Rocket Control](https://www1.grc.nasa.gov/beginners-guide-to-aeronautics/rocket-control/)。KSP API 的公开文档可参考 [KSPDocsSite](https://kspmoddinglibs.github.io/KSPDocsSite/) 以及 [XML Documentation for the KSP API](https://anatid.github.io/XML-Documentation-for-the-KSP-API/)。
+

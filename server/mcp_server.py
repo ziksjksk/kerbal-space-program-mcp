@@ -65,10 +65,10 @@ def _tool(name: str, description: str, properties: dict[str, Any] | None = None,
 
 
 TOOLS: list[dict[str, Any]] = [
-    _tool("ksp_status", "Read the current KSP scene, editor craft summary, flight telemetry, and bridge capabilities."),
+    _tool("ksp_status", "Read the current KSP scene, editor craft summary, compact flight telemetry, no-visual control capabilities, and bridge version."),
     _tool(
         "ksp_realtime_state",
-        "Read compact cached no-visual telemetry and incremental KSP events. Prefer this over ksp_status while building or flying.",
+        "Read compact cached no-visual telemetry and incremental KSP events. Prefer this over ksp_status while building or flying; use height_agl for local terrain clearance and follow next_since when events are truncated.",
         {
             "since": {"type": "integer", "minimum": 0},
             "limit": {"type": "integer", "minimum": 1, "maximum": 256},
@@ -78,7 +78,7 @@ TOOLS: list[dict[str, Any]] = [
     ),
     _tool(
         "ksp_wait_for_event",
-        "Wait for the next KSP telemetry event and return immediately when the event cursor advances; useful for low-latency no-visual construction and flight control.",
+        "Wait for the next KSP telemetry event and return immediately when the event cursor advances; this is the primary event-driven primitive for an AI without vision to observe construction, ignition, staging, orbit crossings, and touchdown.",
         {
             "since": {"type": "integer", "minimum": 0},
             "timeout": {"type": "number", "minimum": 0.05, "maximum": 30},
@@ -89,7 +89,7 @@ TOOLS: list[dict[str, Any]] = [
     ),
     _tool(
         "ksp_watch",
-        "Sample compact telemetry for a bounded interval so a model without vision can observe construction, staging, ascent, orbit, or landing in real time.",
+        "Sample compact telemetry for a bounded interval so a model without vision can observe construction, staging, ascent, orbit, or landing in real time. Treat timeout, flameout, commandability loss, and vessel loss as explicit failures.",
         {
             "duration": {"type": "number", "minimum": 0.1, "maximum": 60},
             "interval": {"type": "number", "minimum": 0.05, "maximum": 2},
@@ -264,7 +264,7 @@ TOOLS: list[dict[str, Any]] = [
     _tool("ksp_editor_clear", "Clear every part from the current editor craft."),
     _tool(
         "ksp_editor_launch",
-        "Launch the current validated editor craft. Requires confirm=true. By default, MCP also clears occupied launch pads through KSP's stock recovery callback; set auto_clear_launchpad=false to leave the stock dialog open.",
+        "Launch the current validated editor craft through KSP's native path. Requires confirm=true. By default, MCP also clears occupied launch pads through KSP's stock recovery callback; set auto_clear_launchpad=false to leave the stock dialog open. The command returns a request, so a no-visual AI must wait for FLIGHT and verify the first telemetry state before starting guidance.",
         {
             "confirm": {"type": "boolean"},
             "auto_clear_launchpad": {"type": "boolean"},
@@ -324,7 +324,7 @@ TOOLS: list[dict[str, Any]] = [
     ),
     _tool(
         "ksp_flight_guidance_start",
-        "Start a game-side closed-loop guidance plan. It continuously refreshes controls in KSP frames; confirm=true is required. Profiles are ascent, orbit, landing, and node_burn.",
+        "Start a game-side closed-loop guidance plan controlled entirely through KSP state, without screenshots. It continuously refreshes controls in KSP frames, owns the fly-by-wire lease, reports preflight/ignition/staging state, and requires confirm=true. Profiles are ascent, orbit, landing, and node_burn.",
         {
             "profile": {"type": "string", "enum": ["ascent", "orbit", "landing", "node_burn"]},
             "target_apoapsis": {"type": "number", "minimum": 1000},
@@ -338,7 +338,7 @@ TOOLS: list[dict[str, Any]] = [
     ),
     _tool(
         "ksp_flight_moon_soft_landing_start",
-        "Start the game-side Mun powered-descent controller after the vessel is at Mun. It checks the active body, then reuses the observable landing guidance loop; confirm=true is required.",
+        "Start the game-side Mun powered-descent controller after the vessel is at Mun. It checks the active body, performs observable deorbit and powered descent, automatically stages/ignites compatible engines, exposes height_agl and touchdown events, and requires confirm=true. No visual UI interaction is required.",
         {
             "target_body": {"type": "string", "description": "Defaults to Mun."},
             "target_latitude": {"type": "number", "minimum": -90, "maximum": 90},
@@ -362,8 +362,8 @@ TOOLS: list[dict[str, Any]] = [
         },
         ["confirm"],
     ),
-    _tool("ksp_flight_guidance_stop", "Stop the active closed-loop guidance plan and release MCP control."),
-    _tool("ksp_flight_guidance_status", "Read the active guidance profile, phase, target, control output, and remaining time."),
+    _tool("ksp_flight_guidance_stop", "Stop the active closed-loop guidance plan and release MCP control. Use this as the AI safety exit on timeout, flameout, commandability loss, or an explicit human takeover."),
+    _tool("ksp_flight_guidance_status", "Read the active guidance profile, phase, target, control output, automatic ignition hold, deorbit completion, preflight report, and remaining time."),
     _tool(
         "ksp_flight_guidance_update",
         "Update targets and safety options on the active game-side guidance plan without releasing MCP control; useful for a no-visual real-time mission loop.",
@@ -413,7 +413,7 @@ TOOLS: list[dict[str, Any]] = [
     ),
     _tool(
         "ksp_flight_warp",
-        "Set the stock time-warp rate index. Use zero for real time.",
+        "Set the stock time-warp rate index. Guidance allows only zero (real time); any time warp is rejected while a no-visual AI guidance plan is active because KSP can advance orbital state without running a reliable fly-by-wire callback for every physics step.",
         {"rate_index": {"type": "integer", "minimum": 0, "maximum": 20}},
         ["rate_index"],
     ),
@@ -808,7 +808,7 @@ def handle_message(app: KspMcpApplication, message: dict[str, Any]) -> dict[str,
             {
                 "protocolVersion": str(params.get("protocolVersion", "2024-11-05")),
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "kerbal-space-program", "version": "0.4.0"},
+                "serverInfo": {"name": "kerbal-space-program", "version": "0.4.9"},
                 "instructions": (
                     "Use ksp_realtime_state for compact no-visual state. Build in VAB/SPH with "
                     "ksp_editor_new and live ksp_editor_apply_craft, then poll "
@@ -888,3 +888,4 @@ def main(argv: list[str] | None = None) -> None:
     if args.self_test:
         raise SystemExit(_self_test())
     run_stdio()
+

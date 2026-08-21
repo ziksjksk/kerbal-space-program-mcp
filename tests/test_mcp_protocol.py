@@ -235,7 +235,7 @@ class McpProtocolTests(unittest.TestCase):
             self.app,
             {"jsonrpc": "2.0", "id": 12, "method": "initialize", "params": {}},
         )
-        self.assertEqual(response["result"]["serverInfo"]["version"], "0.4.0")
+        self.assertEqual(response["result"]["serverInfo"]["version"], "0.4.9")
 
     def test_moon_landing_command_needs_confirmation(self):
         response = handle_message(
@@ -396,3 +396,4 @@ class McpProtocolTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

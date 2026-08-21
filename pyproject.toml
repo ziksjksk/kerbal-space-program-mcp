@@ -1,9 +1,13 @@
+Import-Clixml: Unexpected end of file has occurred. The following elements are not closed: En, DCT, Obj, En, DCT, Obj, En, DCT, Obj,
+Objs. Line 701, position 11.
+InvalidOperation: Index operation failed; the array index evaluated to null.
 [project]
 name = "kerbal-space-program-mcp"
-version = "0.4.0"
-description = "MCP server and KSP 1.x bridge for building and flying rockets"
+version = "0.4.9"
+description = "AI-first, no-vision MCP server and KSP 1.x bridge for building and flying rockets"
 requires-python = ">=3.10"
 dependencies = []
 
 [tool.ksp-mcp]
 default-url = "http://127.0.0.1:8765"
+

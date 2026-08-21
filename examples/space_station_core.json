@@ -1,3 +1,5 @@
+Import-Clixml: N attribute was expected. Line 1125, position 28.
+InvalidOperation: Index operation failed; the array index evaluated to null.
 {
   "name": "MCP Orbital Station Core",
   "description": "Stock KSP modular orbital station core with an explicit probe control source, six-way station hub, four lateral docking ports, service tank, battery, crew cabin, and axial docking port.",
@@ -100,3 +102,4 @@
     }
   ]
 }
+

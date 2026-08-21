@@ -1,3 +1,5 @@
+Import-Clixml: Unexpected end of file has occurred. The following elements are not closed: S, En, DCT, Obj, En, DCT, Obj, En, DCT,
+Obj, Objs. Line 123, position 38.
 """Small mission helpers built on top of the live KSP bridge.
 
 The plugin remains the source of truth for loaded parts, vessel state, and
@@ -281,3 +283,4 @@ def build_space_station(*, name: str = "MCP Orbital Station Core", template: str
             ],
         },
     }
+
