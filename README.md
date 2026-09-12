@@ -236,6 +236,10 @@ python -m server --self-test
 
 `--self-test` 只检查 MCP 初始化、工具列表和参数路由，不要求 KSP 在线。
 
+测试还会验证 Python 源码、示例飞船 JSON 及连接结构、C# 项目 XML 和 PowerShell 脚本语法，并检查源码中是否混入了终端错误输出。TOML 解析检查需要 Python 3.11 及以上；PowerShell 语法检查需要安装 `pwsh` 或 `powershell`，仅解析脚本，不执行安装或构建。
+
+GitHub Actions 在 Windows/Linux 和 Python 3.10/3.12 上运行这些检查。游戏插件的编译仍需本地 KSP 程序集；自动测试通过不代表已验证实际建造或飞行。
+
 ## API 依据
 
 插件使用 KSP 1.x 的 `EditorLogic`、`ShipConstruct`、`Part`、`AttachNode`、`Vessel` 和 `FlightCtrlState` 接口。火箭设计和轨道流程参考 KSP 官方 [KSPedia 手册](https://www.kerbalspaceprogram.com/files/KSPedia-XB1.pdf)；控制器的“导航/制导/控制分层”和上升/着陆状态机参考 NASA 的 [Guidance, Navigation & Control](https://www.nasa.gov/reference/jsc-guidance-navigation-control-subsystems/) 以及 [Rocket Control](https://www1.grc.nasa.gov/beginners-guide-to-aeronautics/rocket-control/)。KSP API 的公开文档可参考 [KSPDocsSite](https://kspmoddinglibs.github.io/KSPDocsSite/) 以及 [XML Documentation for the KSP API](https://anatid.github.io/XML-Documentation-for-the-KSP-API/)。

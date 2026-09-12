@@ -1,9 +1,3 @@
-Import-Clixml: Unexpected end of file has occurred. The following elements are not closed: En, DCT, Obj, En, DCT, Obj, En, DCT, Obj,
-Objs. Line 536, position 15.
-InvalidOperation: Index operation failed; the array index evaluated to null.
-Import-Clixml: N attribute was expected. Line 1133, position 20.
-InvalidOperation: Index operation failed; the array index evaluated to null.
-InvalidOperation: Index operation failed; the array index evaluated to null.
 param(
     [string]$OutputPath = (Join-Path $PSScriptRoot 'outputs\ksp-mcp-0.4.9.zip')
 )

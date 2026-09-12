@@ -1,5 +1,3 @@
-Import-Clixml: N attribute was expected. Line 1125, position 28.
-InvalidOperation: Index operation failed; the array index evaluated to null.
 {
   "name": "MCP Minimal Rocket",
   "description": "A four-part stock KSP test rocket built entirely through the MCP, with an explicit probe core so it is controllable without relying on crew assignment.",
