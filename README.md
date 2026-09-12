@@ -229,12 +229,41 @@ ksp_editor_apply_craft(...)
 
 ## 验证
 
+### MCP 效率与并发
+
+- MCP 观察工具（`ksp_watch`、`ksp_wait_for_event`、`ksp_realtime_state`、`ksp_wait_for_scene`）使用独立调度队列；长时间观察期间仍可处理 `ping` 和控制请求。其余工具由单个工作线程按接收顺序执行，避免建造、分级和控制操作相互超车。观察最多允许 4 个在途请求、2 个执行线程，命令最多 32 个在途请求；超出上限返回 `server busy`。
+- Python 客户端为遥测与控制分别复用 HTTP 连接。场景等待轮询轻量缓存，确认目标场景后再取一次详细状态；事件长轮询已经等待足够时间时，不再额外休眠。
+- 游戏端 HTTP 接收线程不执行长轮询或等待命令完成，控制与遥测分别有 8 / 4 个工作配额，其中长轮询最多占 2 个。游戏对象访问仍在 Unity 主线程；主线程将命令结果冻结成 JSON 字节，网络写出交给 HTTP 工作线程。
+- 游戏端 `commandTimeBudgetMs` 和 `buildTimeBudgetMs` 默认各为 4 毫秒，可在 `config.cfg` 设置为 0.5–50 毫秒。预算分别在命令之间、零件创建之间检查；`maxRequestsPerFrame` 和 `parts_per_frame` 仍作为数量上限。单个原生操作、同步批量操作或序列化可能超过预算，不能把它理解为硬性帧时上限。
+- 事件历史使用容量为 2048 的环形缓冲区，保留 `next_since`、截断及事件丢失语义。飞船树校验以线性遍历检测环；飞行反射缓存只保存字段/属性元数据，实时值仍从当前对象读取。
+- MCP 文本结果采用紧凑 JSON，继续保留相同的 `structuredContent`，兼容只读取文本结果的客户端。
+
+`ksp_realtime_state`、`ksp_watch`、`ksp_wait_for_event` 可以传 `sections` 减少返回内容；省略时保持完整返回。示例：
+
+```json
+{"since": 42, "limit": 64, "sections": ["flight", "performance"]}
+```
+
+`sections` 支持 `editor`、`flight`、`performance`，传 `[]` 只获取场景、序列和事件元数据。事件内容仍由 `include_events` 控制。`performance` 包含命令队列长度、完成/过期计数、最近排队耗时、最近命令处理耗时（包含序列化）和帧预算；其刷新周期与遥测缓存相同。旧插件可能忽略 `sections`，游戏端并发、预算和投影功能需要重新编译并加载新 DLL。
+
+支持 MCP `notifications/cancelled`，可终止观察循环或跳过尚未发出的排队命令。取消会在下一个安全检查点生效，已经发出的 HTTP 请求可能要等到返回/超时；已经开始的游戏动作不会回滚。stdio 断开后停止观察并跳过未发送的命令。HTTP POST 不自动重试；收到超时应先读取当前状态，确认动作是否已经发生。游戏端过期的排队请求会被跳过，但已开始执行的请求仍可能完成。
+
+可复现的前后测量和范围说明见 [性能基准](benchmarks/README.md)。
+
 ```powershell
 python -m unittest discover -s tests -v
 python -m server --self-test
 ```
 
 `--self-test` 只检查 MCP 初始化、工具列表和参数路由，不要求 KSP 在线。
+
+可选：在本机先编译新插件，然后设置 `KSP_ROOT` 再执行测试，即可额外测试实际 DLL 的 HTTP、队列、超时和缓存唤醒路径。测试驱动注入快照并模拟主线程完成通知，不启动游戏，不执行飞行或建造动作。
+
+```powershell
+$env:KSP_ROOT = 'D:\steam\steamapps\common\Kerbal Space Program'
+& .\ksp-plugin\build.ps1 -KspRoot $env:KSP_ROOT -Configuration Release
+python -m unittest discover -s tests -v
+```
 
 测试还会验证 Python 源码、示例飞船 JSON 及连接结构、C# 项目 XML 和 PowerShell 脚本语法，并检查源码中是否混入了终端错误输出。TOML 解析检查需要 Python 3.11 及以上；PowerShell 语法检查需要安装 `pwsh` 或 `powershell`，仅解析脚本，不执行安装或构建。
 

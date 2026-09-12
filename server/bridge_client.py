@@ -10,6 +10,8 @@ import threading
 from urllib.parse import urlsplit, urlencode
 from typing import Any
 
+from .request_context import check_cancelled, pause
+
 
 class BridgeError(RuntimeError):
     """An error returned by, or while reaching, the game plugin."""
@@ -33,25 +35,31 @@ class BridgeClient:
         self._url = urlsplit(self.base_url)
         self._connection: http.client.HTTPConnection | http.client.HTTPSConnection | None = None
         self._connection_lock = threading.RLock()
+        # Observations must not hold the command connection during long-poll.
+        self._telemetry_connection = None
+        self._telemetry_lock = threading.RLock()
 
     def close(self) -> None:
         """Close the reusable bridge connection, if one exists."""
 
-        with self._connection_lock:
-            if self._connection is not None:
+        for attribute, lock in (("_connection", self._connection_lock),
+                                ("_telemetry_connection", self._telemetry_lock)):
+            with lock:
+                connection = getattr(self, attribute)
+                if connection is None:
+                    continue
                 try:
-                    self._connection.close()
+                    connection.close()
                 finally:
-                    self._connection = None
+                    setattr(self, attribute, None)
 
-    def _get_connection(self) -> http.client.HTTPConnection | http.client.HTTPSConnection:
-        if self._connection is not None:
-            return self._connection
-        if self._url.scheme == "https":
-            self._connection = http.client.HTTPSConnection(self._url.netloc, timeout=self.timeout)
-        else:
-            self._connection = http.client.HTTPConnection(self._url.netloc, timeout=self.timeout)
-        return self._connection
+    def _get_connection(self, attribute: str = "_connection") -> http.client.HTTPConnection | http.client.HTTPSConnection:
+        connection = getattr(self, attribute)
+        if connection is None:
+            factory = http.client.HTTPSConnection if self._url.scheme == "https" else http.client.HTTPConnection
+            connection = factory(self._url.netloc, timeout=self.timeout)
+            setattr(self, attribute, connection)
+        return connection
 
     def _path(self, path: str) -> str:
         prefix = self._url.path.rstrip("/")
@@ -59,23 +67,35 @@ class BridgeClient:
             path = "/" + path
         return (prefix + path) or "/"
 
-    def _request(self, method: str, path: str, payload: Any = None) -> Any:
+    def _request(self, method: str, path: str, payload: Any = None, *, telemetry: bool = False) -> Any:
+        check_cancelled()
         data = None if payload is None else json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         headers = {"Accept": "application/json", "Connection": "keep-alive"}
+        # Expire queued work before the socket timeout; never replay a POST
+        # whose response was lost, since the action may already have happened.
+        headers["X-KSP-MCP-Timeout-Ms"] = str(max(100, int(self.timeout * 1000) - 250))
         if self.token:
             headers["X-KSP-MCP-Token"] = self.token
         if data is not None:
             headers["Content-Type"] = "application/json; charset=utf-8"
 
-        with self._connection_lock:
+        lock = self._telemetry_lock if telemetry else self._connection_lock
+        attribute = "_telemetry_connection" if telemetry else "_connection"
+        with lock:
+            check_cancelled()
             try:
-                connection = self._get_connection()
+                connection = self._get_connection(attribute)
                 connection.request(method, self._path(path), body=data, headers=headers)
                 response = connection.getresponse()
                 raw = response.read().decode("utf-8", errors="replace")
                 status = response.status
             except (TimeoutError, OSError, http.client.HTTPException) as exc:
-                self.close()
+                # Reset this lane only. Acquiring the other lane's lock here
+                # would make a failed observation block controls (or deadlock).
+                connection = getattr(self, attribute)
+                if connection is not None:
+                    connection.close()
+                setattr(self, attribute, None)
                 raise BridgeError(
                     f"cannot reach KSP bridge at {self.base_url}: {exc}",
                     code="not_connected",
@@ -120,6 +140,7 @@ class BridgeClient:
         limit: int = 64,
         include_events: bool = True,
         wait_ms: int = 0,
+        sections: list[str] | None = None,
     ) -> Any:
         """Read compact cached state, optionally waiting for a new event.
 
@@ -128,15 +149,18 @@ class BridgeClient:
         same event-cursor semantics as an ordinary telemetry request.
         """
 
-        query = urlencode(
-            {
+        parameters = {
                 "since": max(0, int(since)),
                 "limit": max(1, min(256, int(limit))),
                 "include_events": "true" if include_events else "false",
                 "wait_ms": max(0, min(1000, int(wait_ms))),
             }
-        )
-        return self._request("GET", f"/api/v1/telemetry?{query}")
+        if sections is not None:
+            if not isinstance(sections, list) or any(not isinstance(section, str) or section not in {"editor", "flight", "performance"} for section in sections):
+                raise ValueError("sections must be a list of editor, flight, performance")
+            parameters["sections"] = ",".join(dict.fromkeys(sections))
+        query = urlencode(parameters)
+        return self._request("GET", f"/api/v1/telemetry?{query}", telemetry=True)
 
     def call(self, command: str, args: dict[str, Any] | None = None) -> Any:
         return self._request(
@@ -154,10 +178,14 @@ class BridgeClient:
         deadline = time.monotonic() + max(0.1, timeout)
         last_status: Any = None
         while time.monotonic() < deadline:
-            last_status = self.status()
+            check_cancelled()
+            # Poll the cached snapshot, then fetch the detailed result once.
+            last_status = self.telemetry(include_events=False, limit=1)
             if isinstance(last_status, dict) and str(last_status.get("scene", "")).upper() == scene.upper():
-                return last_status
-            time.sleep(min(max(0.05, poll_interval), 1.0))
+                detailed = self.status()
+                if isinstance(detailed, dict) and str(detailed.get("scene", "")).upper() == scene.upper():
+                    return detailed
+            pause(min(max(0.05, poll_interval), 1.0, max(0.0, deadline - time.monotonic())))
         raise BridgeError(
             f"timed out waiting for KSP scene {scene}",
             code="timeout",

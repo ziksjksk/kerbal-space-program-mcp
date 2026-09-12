@@ -6,6 +6,7 @@ using System.Reflection;
 using System.Text;
 using System.Threading;
 using System.Collections.Specialized;
+using Stopwatch = System.Diagnostics.Stopwatch;
 using UnityEngine;
 
 namespace KspMcp
@@ -32,11 +33,20 @@ namespace KspMcp
         private int _maxRequestsPerFrame = 8;
         private bool _verboseLogging;
         private float _telemetryIntervalSeconds = 0.05f;
-        private bool _stopping;
+        private volatile bool _stopping;
+        private readonly Semaphore _commandWorkers = new Semaphore(8, 8);
+        private readonly Semaphore _telemetryWorkers = new Semaphore(4, 4);
+        private readonly Semaphore _longPollWorkers = new Semaphore(2, 2);
+        private double _commandTimeBudgetMs = 4d;
+        internal double BuildTimeBudgetMs = 4d;
+        private long _completedRequests;
+        private long _expiredRequests;
+        private double _lastCommandMs;
+        private double _lastQueueWaitMs;
         private float _lastTelemetryAt = -1f;
         private long _telemetrySequence;
         private long _eventSequence;
-        private readonly List<Dictionary<string, object>> _events = new List<Dictionary<string, object>>();
+        private readonly KspMcpEventBuffer _events = new KspMcpEventBuffer(MaxTelemetryEvents);
         private Dictionary<string, object> _telemetryCache;
         // Keep enough history for a no-visual client that polls at a normal
         // MCP cadence while a fast, frame-sliced build is running. The
@@ -45,7 +55,11 @@ namespace KspMcp
 
         private sealed class PendingRequest
         {
-            public HttpListenerContext Context;
+            public readonly object Sync = new object();
+            public byte[] Response;
+            public bool Completed;
+            public bool Cancelled;
+            public long QueuedAt = Stopwatch.GetTimestamp();
             public string Command;
             public Dictionary<string, object> Args;
         }
@@ -75,10 +89,18 @@ namespace KspMcp
             _flight.Tick();
             UpdateTelemetryCache(false);
 
+            Stopwatch frameBudget = Stopwatch.StartNew();
             for (int index = 0; index < _maxRequestsPerFrame; index++)
             {
+                if (index > 0 && frameBudget.Elapsed.TotalMilliseconds >= _commandTimeBudgetMs) break;
                 PendingRequest request = DequeueRequest();
                 if (request == null) break;
+                lock (request.Sync)
+                {
+                    if (request.Cancelled) { _expiredRequests++; continue; }
+                }
+                _lastQueueWaitMs = (Stopwatch.GetTimestamp() - request.QueuedAt) * 1000d / Stopwatch.Frequency;
+                Stopwatch commandTimer = Stopwatch.StartNew();
 
                 Dictionary<string, object> envelope;
                 try
@@ -98,7 +120,19 @@ namespace KspMcp
                     envelope = Failure("game_exception", exception.Message, null);
                     RecordEvent("command.failed", new Dictionary<string, object> { { "command", request.Command }, { "code", "game_exception" } });
                 }
-                WriteResponse(request.Context, envelope, 200);
+                // Freeze the JSON while still on Unity's thread; command results
+                // can include live job dictionaries. Only byte I/O goes off-thread.
+                byte[] responseBytes;
+                try { responseBytes = Encoding.UTF8.GetBytes(McpJson.Serialize(envelope)); }
+                catch (Exception exception) { responseBytes = Encoding.UTF8.GetBytes(McpJson.Serialize(Failure("serialization_error", exception.Message, null))); }
+                lock (request.Sync)
+                {
+                    request.Response = responseBytes;
+                    request.Completed = true;
+                    Monitor.PulseAll(request.Sync);
+                }
+                _lastCommandMs = commandTimer.Elapsed.TotalMilliseconds;
+                _completedRequests++;
             }
             UpdateTelemetryCache(false);
         }
@@ -134,6 +168,11 @@ namespace KspMcp
                 {
                     _maxRequestsPerFrame = Math.Min(maxRequests, 32);
                 }
+                double budgetMs;
+                if (double.TryParse(node.GetValue("commandTimeBudgetMs"), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out budgetMs) && !double.IsNaN(budgetMs))
+                    _commandTimeBudgetMs = Math.Max(0.5d, Math.Min(50d, budgetMs));
+                if (double.TryParse(node.GetValue("buildTimeBudgetMs"), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out budgetMs) && !double.IsNaN(budgetMs))
+                    BuildTimeBudgetMs = Math.Max(0.5d, Math.Min(50d, budgetMs));
                 int telemetryIntervalMs;
                 if (int.TryParse(node.GetValue("telemetryIntervalMs"), out telemetryIntervalMs) && telemetryIntervalMs > 0)
                 {
@@ -181,94 +220,158 @@ namespace KspMcp
                 }
 
                 if (context == null) continue;
-                if (!IsAuthorized(context.Request))
+                bool telemetry = context.Request.Url != null && context.Request.Url.AbsolutePath.TrimEnd('/') == "/api/v1/telemetry";
+                Semaphore workers = telemetry ? _telemetryWorkers : _commandWorkers;
+                if (!workers.WaitOne(0))
                 {
-                    WriteResponse(context, Failure("unauthorized", "invalid or missing X-KSP-MCP-Token", null), 401);
+                    try { context.Response.StatusCode = 503; context.Response.Close(); } catch (Exception) { }
                     continue;
                 }
+                HttpListenerContext accepted = context;
+                ThreadPool.QueueUserWorkItem(delegate
+                {
+                    try { HandleContext(accepted); }
+                    catch (Exception exception) { WriteResponse(accepted, Failure("http_error", exception.Message, null), 500); }
+                    finally { workers.Release(); }
+                });
+            }
+        }
 
-                string path = context.Request.Url == null ? "" : context.Request.Url.AbsolutePath.TrimEnd('/');
-                if (string.IsNullOrEmpty(path)) path = "/";
+        private void HandleContext(HttpListenerContext context)
+        {
+            if (!IsAuthorized(context.Request))
+            {
+                WriteResponse(context, Failure("unauthorized", "invalid or missing X-KSP-MCP-Token", null), 401);
+                return;
+            }
 
-                if (context.Request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase) &&
-                    (path == "/api/v1/status" || path == "/api/v1/health"))
-                {
-                    Enqueue(context, "status", new Dictionary<string, object>());
-                    continue;
-                }
-                if (context.Request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase) && path == "/api/v1/telemetry")
-                {
-                    // Telemetry is deliberately served from the last cache on
-                    // the listener thread. A long editor snapshot/analyze
-                    // command must not make a high-rate visionless client
-                    // wait behind the Unity main-thread request queue.
-                    try
-                    {
-                        WriteResponse(context, Success(TelemetryFromCache(QueryArguments(context.Request))), 200);
-                    }
-                    catch (Exception exception)
-                    {
-                        WriteResponse(context, Failure("telemetry_unavailable", exception.Message, null), 503);
-                    }
-                    continue;
-                }
-                if (context.Request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase) && path == "/api/v1/parts")
-                {
-                    Enqueue(context, "parts.list", new Dictionary<string, object>());
-                    continue;
-                }
-                if (!context.Request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) || path != "/api/v1/command")
-                {
-                    WriteResponse(context, Failure("not_found", "endpoint not found", path), 404);
-                    continue;
-                }
+            string path = context.Request.Url == null ? "" : context.Request.Url.AbsolutePath.TrimEnd('/');
+            if (string.IsNullOrEmpty(path)) path = "/";
 
+            if (context.Request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase) &&
+                (path == "/api/v1/status" || path == "/api/v1/health"))
+            {
+                Enqueue(context, "status", new Dictionary<string, object>());
+                return;
+            }
+            if (context.Request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase) && path == "/api/v1/telemetry")
+            {
+                // Telemetry is deliberately served from the last cache on
+                // an HTTP worker. A long editor snapshot/analyze
+                // command must not make a high-rate visionless client
+                // wait behind the Unity main-thread request queue.
                 try
                 {
-                    string body;
-                    using (var reader = new StreamReader(context.Request.InputStream, context.Request.ContentEncoding ?? Encoding.UTF8))
+                    Dictionary<string, object> query = QueryArguments(context.Request);
+                    bool waiting = JsonUtil.Integer(query, "wait_ms", 0) > 0;
+                    if (waiting && !_longPollWorkers.WaitOne(0))
                     {
-                        body = reader.ReadToEnd();
+                        WriteResponse(context, Failure("busy", "too many event waits", null), 429);
+                        return;
                     }
-                    if (body.Length > 8 * 1024 * 1024)
-                    {
-                        WriteResponse(context, Failure("payload_too_large", "command payload exceeds 8 MiB", null), 413);
-                        continue;
-                    }
-
-                    Dictionary<string, object> commandObject = JsonUtil.Object(McpJson.Deserialize(body));
-                    if (commandObject == null)
-                    {
-                        WriteResponse(context, Failure("invalid_request", "request body must be a JSON object", null), 400);
-                        continue;
-                    }
-                    string command = JsonUtil.String(commandObject, "command", null);
-                    Dictionary<string, object> args = JsonUtil.Object(JsonUtil.Get(commandObject, "args"));
-                    if (string.IsNullOrEmpty(command))
-                    {
-                        WriteResponse(context, Failure("invalid_request", "request requires command", null), 400);
-                        continue;
-                    }
-                    Enqueue(context, command, args ?? new Dictionary<string, object>());
+                    try { WriteResponse(context, Success(TelemetryFromCache(query)), 200); }
+                    finally { if (waiting) _longPollWorkers.Release(); }
                 }
                 catch (Exception exception)
                 {
-                    WriteResponse(context, Failure("invalid_json", exception.Message, null), 400);
+                    WriteResponse(context, Failure("telemetry_unavailable", exception.Message, null), 503);
                 }
+                return;
+            }
+            if (context.Request.HttpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase) && path == "/api/v1/parts")
+            {
+                Enqueue(context, "parts.list", new Dictionary<string, object>());
+                return;
+            }
+            if (!context.Request.HttpMethod.Equals("POST", StringComparison.OrdinalIgnoreCase) || path != "/api/v1/command")
+            {
+                WriteResponse(context, Failure("not_found", "endpoint not found", path), 404);
+                return;
+            }
+
+            try
+            {
+                string body;
+                using (var reader = new StreamReader(context.Request.InputStream, context.Request.ContentEncoding ?? Encoding.UTF8))
+                {
+                    var buffer = new char[8192];
+                    var builder = new StringBuilder();
+                    int read;
+                    while ((read = reader.Read(buffer, 0, buffer.Length)) > 0)
+                    {
+                        if (builder.Length + read > 8 * 1024 * 1024)
+                        {
+                            WriteResponse(context, Failure("payload_too_large", "command payload exceeds limit", null), 413);
+                            return;
+                        }
+                        builder.Append(buffer, 0, read);
+                    }
+                    body = builder.ToString();
+                }
+                if (body.Length > 8 * 1024 * 1024)
+                {
+                    WriteResponse(context, Failure("payload_too_large", "command payload exceeds 8 MiB", null), 413);
+                    return;
+                }
+
+                Dictionary<string, object> commandObject = JsonUtil.Object(McpJson.Deserialize(body));
+                if (commandObject == null)
+                {
+                    WriteResponse(context, Failure("invalid_request", "request body must be a JSON object", null), 400);
+                    return;
+                }
+                string command = JsonUtil.String(commandObject, "command", null);
+                Dictionary<string, object> args = JsonUtil.Object(JsonUtil.Get(commandObject, "args"));
+                if (string.IsNullOrEmpty(command))
+                {
+                    WriteResponse(context, Failure("invalid_request", "request requires command", null), 400);
+                    return;
+                }
+                Enqueue(context, command, args ?? new Dictionary<string, object>());
+            }
+            catch (Exception exception)
+            {
+                WriteResponse(context, Failure("invalid_json", exception.Message, null), 400);
             }
         }
 
         private void Enqueue(HttpListenerContext context, string command, Dictionary<string, object> args)
         {
+            var request = new PendingRequest { Command = command, Args = args };
+            bool busy;
             lock (_queueLock)
             {
-                if (_requests.Count >= 64)
-                {
-                    WriteResponse(context, Failure("busy", "too many queued KSP commands", null), 429);
-                    return;
-                }
-                _requests.Enqueue(new PendingRequest { Context = context, Command = command, Args = args });
+                busy = _stopping || _requests.Count >= 64;
+                if (!busy) _requests.Enqueue(request);
             }
+            if (busy)
+            {
+                WriteResponse(context, Failure("busy", "too many queued KSP commands", null), 429);
+                return;
+            }
+            int timeoutMs;
+            if (!int.TryParse(context.Request.Headers["X-KSP-MCP-Timeout-Ms"], out timeoutMs)) timeoutMs = 10000;
+            timeoutMs = Math.Max(100, Math.Min(60000, timeoutMs));
+            Stopwatch elapsed = Stopwatch.StartNew();
+            byte[] response;
+            lock (request.Sync)
+            {
+                while (!request.Completed && !_stopping)
+                {
+                    int remaining = timeoutMs - (int)elapsed.ElapsedMilliseconds;
+                    if (remaining <= 0) break;
+                    Monitor.Wait(request.Sync, remaining);
+                }
+                if (!request.Completed)
+                {
+                    request.Cancelled = true;
+                    response = null;
+                }
+                else response = request.Response;
+            }
+            if (response == null)
+                WriteResponse(context, Failure("timeout", "command deadline elapsed; an already started action may have completed, inspect state before retrying", null), 504);
+            else WriteResponseBytes(context, response, 200);
         }
 
         private bool IsAuthorized(HttpListenerRequest request)
@@ -279,10 +382,14 @@ namespace KspMcp
 
         private static void WriteResponse(HttpListenerContext context, Dictionary<string, object> response, int statusCode)
         {
+            WriteResponseBytes(context, Encoding.UTF8.GetBytes(McpJson.Serialize(response)), statusCode);
+        }
+
+        private static void WriteResponseBytes(HttpListenerContext context, byte[] bytes, int statusCode)
+        {
             if (context == null) return;
             try
             {
-                byte[] bytes = Encoding.UTF8.GetBytes(McpJson.Serialize(response));
                 context.Response.StatusCode = statusCode;
                 context.Response.ContentType = "application/json; charset=utf-8";
                 context.Response.ContentEncoding = Encoding.UTF8;
@@ -596,7 +703,8 @@ namespace KspMcp
             if (commands == null || commands.Count == 0) throw new KspMcpException("invalid_batch", "batch requires at least one command", null);
             if (commands.Count > 32) throw new KspMcpException("invalid_batch", "batch accepts at most 32 commands", null);
 
-            var results = new List<object>();
+            // Validate the whole batch before executing its first action.
+            // A malformed later item must not leave an unexpected half-batch.
             foreach (object raw in commands)
             {
                 Dictionary<string, object> item = JsonUtil.Object(raw);
@@ -606,6 +714,15 @@ namespace KspMcp
                 {
                     throw new KspMcpException("unsafe_batch_command", command + " must use its dedicated command", null);
                 }
+                object rawArgs = JsonUtil.Get(item, "args");
+                if (rawArgs != null && JsonUtil.Object(rawArgs) == null)
+                    throw new KspMcpException("invalid_batch", "batch args must be an object", null);
+            }
+            var results = new List<object>(commands.Count);
+            foreach (object raw in commands)
+            {
+                Dictionary<string, object> item = JsonUtil.Object(raw);
+                string command = JsonUtil.RequiredString(item, "command");
                 Dictionary<string, object> commandArgs = JsonUtil.Object(JsonUtil.Get(item, "args")) ?? new Dictionary<string, object>();
                 try
                 {
@@ -639,6 +756,7 @@ namespace KspMcp
                 { "endpoint", "http://" + _host + ":" + _port },
                 { "verbose_logging", _verboseLogging },
                 { "telemetry_interval_ms", (int)(_telemetryIntervalSeconds * 1000f) },
+                { "performance", PerformanceSnapshot() },
                 { "editor", _craft.Status() },
                 { "flight", _flight.Snapshot() },
                 { "capabilities", new Dictionary<string, object>
@@ -669,23 +787,28 @@ namespace KspMcp
             // HTTP listener thread for low-latency polling.
             lock (_telemetryLock)
             {
-                Dictionary<string, object> cache = _telemetryCache ?? new Dictionary<string, object>();
                 long since = (long)Math.Max(0d, JsonUtil.Number(args, "since", 0d));
                 int limit = Math.Max(1, Math.Min(256, JsonUtil.Integer(args, "limit", 64)));
                 bool includeEvents = JsonUtil.Boolean(args, "include_events", true);
                 int waitMs = Math.Max(0, Math.Min(1000, JsonUtil.Integer(args, "wait_ms", 0)));
-                if (waitMs > 0 && since >= _eventSequence)
+                Stopwatch wait = Stopwatch.StartNew();
+                while (waitMs > 0 && since >= _eventSequence && !_stopping)
                 {
-                    // The listener thread may wait without touching Unity.
-                    // RecordEvent pulses this condition as soon as a build or
-                    // flight event is produced; a timeout simply returns the
-                    // latest compact cache.
-                    try { Monitor.Wait(_telemetryLock, waitMs); } catch (SynchronizationLockException) { }
+                    int remaining = waitMs - (int)wait.ElapsedMilliseconds;
+                    if (remaining <= 0) break;
+                    Monitor.Wait(_telemetryLock, remaining);
                 }
+                Dictionary<string, object> cache = _telemetryCache ?? new Dictionary<string, object>();
                 var result = new Dictionary<string, object>();
-                foreach (KeyValuePair<string, object> item in cache) result[item.Key] = item.Value;
+                string sections = JsonUtil.String(args, "sections", null);
+                HashSet<string> selected = sections == null ? null : new HashSet<string>(sections.Split(','), StringComparer.Ordinal);
+                foreach (KeyValuePair<string, object> item in cache)
+                {
+                    if (selected != null && (item.Key == "editor" || item.Key == "flight" || item.Key == "performance") && !selected.Contains(item.Key)) continue;
+                    result[item.Key] = item.Value;
+                }
                 result["event_cursor"] = _eventSequence;
-                long oldestEventCursor = _events.Count == 0 ? _eventSequence + 1 : (long)_events[0]["event_id"];
+                long oldestEventCursor = _events.Count == 0 ? _eventSequence + 1 : _events.OldestCursor;
                 long eventsLost = since < oldestEventCursor - 1 ? oldestEventCursor - 1 - since : 0;
                 result["oldest_event_cursor"] = oldestEventCursor;
                 result["events_lost"] = eventsLost;
@@ -712,16 +835,7 @@ namespace KspMcp
 
         private List<object> EventsSinceLocked(long since, int limit)
         {
-            var result = new List<object>();
-            for (int index = 0; index < _events.Count; index++)
-            {
-                Dictionary<string, object> item = _events[index];
-                long eventId = (long)item["event_id"];
-                if (eventId <= since) continue;
-                result.Add(item);
-                if (result.Count >= limit) break;
-            }
-            return result;
+            return _events.Since(since, limit);
         }
 
         /*
@@ -746,7 +860,6 @@ namespace KspMcp
                     { "type", type },
                     { "data", data }
                 });
-                if (_events.Count > MaxTelemetryEvents) _events.RemoveAt(0);
                 Monitor.PulseAll(_telemetryLock);
             }
         }
@@ -762,11 +875,28 @@ namespace KspMcp
                 { "sequence", _telemetrySequence },
                 { "bridge_version", "0.4.9" },
                 { "captured_at", SafeUniversalTime() },
+                { "performance", PerformanceSnapshot() },
                 { "scene", SceneName() },
                 { "editor", _craft.CompactStatus() },
                 { "flight", _flight.CompactSnapshot() }
             };
             lock (_telemetryLock) _telemetryCache = nextCache;
+        }
+
+        private Dictionary<string, object> PerformanceSnapshot()
+        {
+            int queued;
+            lock (_queueLock) queued = _requests.Count;
+            return new Dictionary<string, object>
+            {
+                { "queued_commands", queued },
+                { "completed_commands", _completedRequests },
+                { "expired_queued_commands", _expiredRequests },
+                { "last_queue_wait_ms", _lastQueueWaitMs },
+                { "last_command_ms", _lastCommandMs },
+                { "command_time_budget_ms", _commandTimeBudgetMs },
+                { "build_time_budget_ms", BuildTimeBudgetMs }
+            };
         }
 
         private static double SafeUniversalTime()
@@ -780,6 +910,7 @@ namespace KspMcp
             var result = new Dictionary<string, object>();
             NameValueCollection query = request == null ? null : request.QueryString;
             if (query == null) return result;
+            if (query["sections"] != null) result["sections"] = query["sections"];
             double number;
             if (double.TryParse(query["since"], out number)) result["since"] = number;
             int limit;
@@ -806,6 +937,15 @@ namespace KspMcp
         private void StopHttpServer()
         {
             _stopping = true;
+            lock (_telemetryLock) Monitor.PulseAll(_telemetryLock);
+            lock (_queueLock)
+            {
+                while (_requests.Count > 0)
+                {
+                    PendingRequest request = _requests.Dequeue();
+                    lock (request.Sync) { request.Cancelled = true; Monitor.PulseAll(request.Sync); }
+                }
+            }
             try
             {
                 if (_listener != null) _listener.Stop();

@@ -149,14 +149,19 @@ def validate_craft_document(
 
     # Detect parent cycles without assuming that parts arrive in tree order.
     parent_by_id = {part["id"]: part["parent_id"] for part in parts}
+    # Each resolved ancestry is visited once, including long chains and
+    # out-of-order trees. Do not recurse: real craft can exceed Python's
+    # recursion limit.
+    resolved: set[str] = set()
     for start in parent_by_id:
         seen: set[str] = set()
         cursor: str | None = start
-        while cursor is not None:
+        while cursor is not None and cursor not in resolved:
             if cursor in seen:
                 raise CraftValidationError(f"parent cycle detected at part {cursor}")
             seen.add(cursor)
             cursor = parent_by_id.get(cursor)
+        resolved.update(seen)
 
     warnings: list[str] = []
     for part in parts:
