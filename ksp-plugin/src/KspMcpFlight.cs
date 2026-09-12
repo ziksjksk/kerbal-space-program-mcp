@@ -3868,28 +3868,12 @@ namespace KspMcp
 
         private static FieldInfo FindField(Type type, string name)
         {
-            if (type == null || string.IsNullOrEmpty(name)) return null;
-            const BindingFlags flags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
-            FieldInfo exact = type.GetField(name, flags);
-            if (exact != null) return exact;
-            foreach (FieldInfo field in type.GetFields(flags))
-            {
-                if (string.Equals(field.Name, name, StringComparison.OrdinalIgnoreCase)) return field;
-            }
-            return null;
+            return KspMcpReflectionCache.FindField(type, name);
         }
 
         private static PropertyInfo FindProperty(Type type, string name)
         {
-            if (type == null || string.IsNullOrEmpty(name)) return null;
-            const BindingFlags flags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
-            PropertyInfo exact = type.GetProperty(name, flags);
-            if (exact != null) return exact;
-            foreach (PropertyInfo property in type.GetProperties(flags))
-            {
-                if (string.Equals(property.Name, name, StringComparison.OrdinalIgnoreCase)) return property;
-            }
-            return null;
+            return KspMcpReflectionCache.FindProperty(type, name);
         }
 
         private static object ConvertMemberValue(object value, Type targetType)

@@ -12,6 +12,7 @@ from .bridge_client import BridgeClient, BridgeError
 from .craft_model import CraftValidationError, normalise_part_spec, validate_craft_document
 from .missions import MissionPlanError, build_space_station, plan_moon_landing
 from .orbital import OrbitalPlanError, plan_circular_hohmann_transfer
+from .request_context import check_cancelled, pause
 
 
 def _object_schema(properties: dict[str, Any] | None = None, required: list[str] | None = None) -> dict[str, Any]:
@@ -25,6 +26,8 @@ def _object_schema(properties: dict[str, Any] | None = None, required: list[str]
 
 _VECTOR3 = {"type": "array", "items": {"type": "number"}, "minItems": 3, "maxItems": 3}
 _VECTOR4 = {"type": "array", "items": {"type": "number"}, "minItems": 4, "maxItems": 4}
+_SECTIONS = {"type": "array", "items": {"type": "string", "enum": ["editor", "flight", "performance"]},
+             "description": "Optional telemetry sections; omit for all, [] for event/scene metadata only."}
 
 
 CRAFT_SCHEMA = _object_schema(
@@ -74,6 +77,7 @@ TOOLS: list[dict[str, Any]] = [
             "limit": {"type": "integer", "minimum": 1, "maximum": 256},
             "include_events": {"type": "boolean"},
             "wait_ms": {"type": "integer", "minimum": 0, "maximum": 1000},
+            "sections": _SECTIONS,
         },
     ),
     _tool(
@@ -83,6 +87,7 @@ TOOLS: list[dict[str, Any]] = [
             "since": {"type": "integer", "minimum": 0},
             "timeout": {"type": "number", "minimum": 0.05, "maximum": 30},
             "poll_interval": {"type": "number", "minimum": 0.02, "maximum": 1},
+            "sections": _SECTIONS,
             "limit": {"type": "integer", "minimum": 1, "maximum": 256},
             "include_events": {"type": "boolean"},
         },
@@ -92,6 +97,7 @@ TOOLS: list[dict[str, Any]] = [
         "Sample compact telemetry for a bounded interval so a model without vision can observe construction, staging, ascent, orbit, or landing in real time. Treat timeout, flameout, commandability loss, and vessel loss as explicit failures.",
         {
             "duration": {"type": "number", "minimum": 0.1, "maximum": 60},
+            "sections": _SECTIONS,
             "interval": {"type": "number", "minimum": 0.05, "maximum": 2},
             "max_samples": {"type": "integer", "minimum": 1, "maximum": 240},
             "event_limit": {"type": "integer", "minimum": 1, "maximum": 256},
@@ -451,6 +457,9 @@ class KspMcpApplication:
         self.bridge = bridge or BridgeClient()
 
     def call_tool(self, name: str, arguments: dict[str, Any] | None) -> Any:
+        check_cancelled()
+        if arguments is not None and not isinstance(arguments, dict):
+            raise ValueError("tool arguments must be an object")
         args = arguments or {}
 
         if name == "ksp_status":
@@ -461,6 +470,7 @@ class KspMcpApplication:
                 limit=int(args.get("limit", 64)),
                 include_events=bool(args.get("include_events", True)),
                 wait_ms=int(args.get("wait_ms", 0)),
+                **({"sections": args["sections"]} if "sections" in args else {}),
             )
         if name == "ksp_wait_for_event":
             since = max(0, int(args.get("since", 0)))
@@ -473,6 +483,7 @@ class KspMcpApplication:
             triggered = False
             last_wait_ms = 0
             while True:
+                check_cancelled()
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     break
@@ -481,11 +492,13 @@ class KspMcpApplication:
                 # bounded request instead of a tight polling loop.
                 wait_ms = max(1, min(1000, int(remaining * 1000)))
                 last_wait_ms = wait_ms
+                request_started = time.monotonic()
                 latest = self.bridge.telemetry(
                     since=since,
                     limit=limit,
                     include_events=include_events,
                     wait_ms=wait_ms,
+                    **({"sections": args["sections"]} if "sections" in args else {}),
                 )
                 if isinstance(latest, dict):
                     cursor = latest.get("event_cursor")
@@ -498,7 +511,9 @@ class KspMcpApplication:
                         break
                 # Keep compatibility with bridges that do not implement the
                 # optional wait_ms query parameter and return immediately.
-                time.sleep(min(poll_interval, max(0.0, deadline - time.monotonic())))
+                # A bridge that already waited needs no additional sleep.
+                pause(min(max(0.0, poll_interval - (time.monotonic() - request_started)),
+                          max(0.0, deadline - time.monotonic())))
             return {
                 "since": since,
                 "timeout_seconds": timeout,
@@ -519,11 +534,14 @@ class KspMcpApplication:
             deadline = time.monotonic() + duration
             effective_interval = duration if max_samples <= 1 else max(interval, duration / float(max_samples - 1))
             while True:
+                check_cancelled()
+                sample_started = time.monotonic()
                 # A frame-sliced build can emit several part events per Unity
                 # frame.  Keep the watch path large enough to collect a full
                 # polling window, otherwise advancing the cursor after a
                 # truncated response silently loses the middle of the build.
-                sample = self.bridge.telemetry(since=since, limit=event_limit, include_events=include_events)
+                sample = self.bridge.telemetry(since=since, limit=event_limit, include_events=include_events,
+                                               **({"sections": args["sections"]} if "sections" in args else {}))
                 samples.append(sample)
                 if isinstance(sample, dict) and isinstance(sample.get("next_since"), (int, float)):
                     since = int(sample["next_since"])
@@ -534,7 +552,7 @@ class KspMcpApplication:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     break
-                time.sleep(min(effective_interval, remaining))
+                pause(min(max(0.0, effective_interval - (time.monotonic() - sample_started)), remaining))
             return {
                 "duration_seconds": duration,
                 "interval_seconds": interval,
@@ -551,11 +569,13 @@ class KspMcpApplication:
             if len(commands) > 32:
                 raise ValueError("ksp_batch accepts at most 32 commands")
             normalised: list[dict[str, Any]] = []
-            forbidden = {"editor.launch", "flight.abort", "flight.recover", "flight.maneuver_burn_start"}
+            forbidden = {"batch", "editor.launch", "flight.abort", "flight.recover", "flight.maneuver_burn_start"}
             for index, item in enumerate(commands):
                 if not isinstance(item, dict) or not isinstance(item.get("command"), str):
                     raise ValueError(f"commands[{index}] requires a command string")
                 command = item["command"]
+                if not command.strip() or not isinstance(item.get("args", {}), dict):
+                    raise ValueError(f"commands[{index}] requires a non-empty command and object args")
                 if command in forbidden:
                     raise ValueError(f"{command} must use its dedicated confirmation tool")
                 normalised.append({"command": command, "args": item.get("args") or {}})
@@ -793,10 +813,19 @@ def _error(request_id: Any, code: int, message: str, data: Any = None) -> dict[s
     return {"jsonrpc": "2.0", "id": request_id, "error": error}
 
 
-def handle_message(app: KspMcpApplication, message: dict[str, Any]) -> dict[str, Any] | None:
+def handle_message(app: KspMcpApplication, message: Any) -> dict[str, Any] | None:
+    if (not isinstance(message, dict) or message.get("jsonrpc") != "2.0"
+            or not isinstance(message.get("method"), str)):
+        return _error(None, -32600, "invalid JSON-RPC request")
+    if "id" in message and (isinstance(message["id"], bool) or not isinstance(message["id"], (str, int))):
+        return _error(None, -32600, "invalid request id")
+    if "id" not in message:
+        return None
     method = message.get("method")
     request_id = message.get("id")
-    params = message.get("params") or {}
+    params = message.get("params", {})
+    if not isinstance(params, dict):
+        return _error(request_id, -32602, "params must be an object")
 
     if method in ("notifications/initialized", "notifications/cancelled"):
         return None
@@ -824,7 +853,7 @@ def handle_message(app: KspMcpApplication, message: dict[str, Any]) -> dict[str,
             return _error(request_id, -32602, "tools/call requires params.name")
         try:
             result = app.call_tool(name, params.get("arguments"))
-            content = [{"type": "text", "text": json.dumps(result, ensure_ascii=False, indent=2)}]
+            content = [{"type": "text", "text": _json_line(result)}]
             return _success(request_id, {"content": content, "structuredContent": result, "isError": False})
         except (BridgeError, CraftValidationError, KeyError, TypeError, ValueError) as exc:
             details: dict[str, Any] = {"type": type(exc).__name__}
@@ -843,21 +872,8 @@ def handle_message(app: KspMcpApplication, message: dict[str, Any]) -> dict[str,
 
 
 def run_stdio(app: KspMcpApplication | None = None) -> None:
-    application = app or KspMcpApplication()
-    for line in sys.stdin:
-        if not line.strip():
-            continue
-        try:
-            message = json.loads(line)
-            if not isinstance(message, dict):
-                raise ValueError("JSON-RPC message must be an object")
-            response = handle_message(application, message)
-            if response is not None:
-                _send(response)
-        except json.JSONDecodeError as exc:
-            _send(_error(None, -32700, "parse error", str(exc)))
-        except Exception as exc:  # Keep the stdio protocol alive for one bad request.
-            _send(_error(None, -32603, "internal error", str(exc)))
+    from .stdio_runtime import serve
+    serve(app or KspMcpApplication(), handle_message, _send, _error)
 
 
 def _self_test() -> int:
@@ -882,6 +898,9 @@ def _self_test() -> int:
 
 
 def main(argv: list[str] | None = None) -> None:
+    for stream in (sys.stdin, sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8")
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--self-test", action="store_true", help="run local protocol checks and exit")
     args = parser.parse_args(argv)

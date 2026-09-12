@@ -172,10 +172,13 @@ namespace KspMcp
             _buildJob.State = "running";
             _buildJob.FrameIndex++;
             int budget = Math.Max(1, Math.Min(16, _buildJob.PartsPerFrame));
+            var frameTimer = System.Diagnostics.Stopwatch.StartNew();
+            double timeBudgetMs = KspMcpBridge.Instance == null ? 4d : KspMcpBridge.Instance.BuildTimeBudgetMs;
             try
             {
                 for (int step = 0; step < budget && _buildJob.Pending.Count > 0; step++)
                 {
+                    if (step > 0 && frameTimer.Elapsed.TotalMilliseconds >= timeBudgetMs) break;
                     bool progress = false;
                     for (int index = _buildJob.Pending.Count - 1; index >= 0; index--)
                     {
