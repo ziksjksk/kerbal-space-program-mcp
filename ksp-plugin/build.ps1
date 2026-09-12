@@ -1,5 +1,3 @@
-Import-Clixml: N attribute was expected. Line 1125, position 28.
-InvalidOperation: Index operation failed; the array index evaluated to null.
 param(
     [string]$KspRoot = $env:KSP_ROOT,
     [string]$Configuration = 'Release'
